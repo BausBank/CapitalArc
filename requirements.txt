@@ -1,0 +1,44 @@
+# ============================================================
+# CapitalArc - Python dependencies
+# Target: Python 3.11+
+# ============================================================
+
+# --- Core runtime ---
+python-dotenv==1.0.1
+pydantic==2.8.2
+pydantic-settings==2.4.0
+loguru==0.7.2
+apscheduler==3.10.4
+
+# --- HTTP & async ---
+httpx==0.27.2
+aiohttp==3.10.5
+tenacity==9.0.0
+
+# --- Chain / Web3 ---
+web3==6.20.1
+eth-account==0.11.3
+eth-abi==5.1.0
+
+# --- Data & signals (Level 1: technical rules) ---
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+ta==0.11.0
+
+# --- Level 2: Dune MCP / on-chain intelligence ---
+mcp==1.0.0
+dune-client==1.7.7
+
+# --- Level 3: Gemini 2.5 Flash (final arbiter) ---
+google-generativeai==0.8.3
+
+# --- Utilities ---
+rich==13.7.1
+typer==0.12.5
+
+# --- Dev / testing ---
+pytest==8.3.2
+pytest-asyncio==0.23.8
+ruff==0.6.2
+mypy==1.11.1
