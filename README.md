@@ -63,13 +63,14 @@ The aggregated score drives the **Risk-On / Risk-Off** switch, which then decide
 
 ```
 CapitalArc/
+├── main.py           # Entry point: --dry-run / --live, optional --loop
 ├── src/
-│   ├── core/         # Decision Engine + Level 1/2/3 classes
-│   ├── execution/    # Arc Perp DEX integration
-│   ├── allocation/   # Risk-On / Risk-Off router + USYC rotation
+│   ├── core/         # DecisionEngine + Level 1/2/3 + ExecutionDirective
+│   ├── execution/    # ArcPerpExecutor + CircleWallet (DCW + Paymaster)
+│   ├── allocation/   # AllocationRouter: directive -> on-chain action
 │   ├── llm/          # Gemini 2.5 Flash client (final arbiter)
-│   ├── agents/       # Top-level autonomous agent loop
-│   └── utils/        # Config, logging, retries, helpers
+│   ├── agents/       # Reserved for top-level orchestration helpers
+│   └── utils/        # Settings (pydantic), logging (loguru)
 ├── prompts/          # LLM prompt templates for the Level 3 arbiter
 ├── scripts/          # One-off scripts: deploy, seed, simulate, backtest
 ├── tests/            # Unit & integration tests
@@ -110,21 +111,33 @@ CapitalArc/
 
 ---
 
-## Current Status — Day 1 Completed
+## Current Status
 
-Day 1 delivered a clean, modular skeleton ready for Day 2 wiring:
+### Day 1 — Completed
 
 - Repository initialised, `.gitignore` and `.env.example` in place
 - Three-level architecture (L1 technical rules, L2 Dune MCP, L3 Gemini 2.5 Flash) reflected in code structure
 - Stub classes with stable public interfaces:
   - `DecisionEngine`, `Level1`, `Level2`, `Level3` in `src/core/`
   - `GeminiClient` in `src/llm/`
-  - `GeminiFinalArbiter` wiring inside `Level3`
-- Configuration loaded from `.env`, real hackathon keys plugged in for Arc RPC, Dune and Gemini
+- Secrets cleanly separated: real keys in local `.env`, only placeholders in `.env.example`
 - Twitter sentiment and xAI/Grok layers fully removed
-- AGENTS.md updated to the 3-level model
+- `AGENTS.md` updated to the 3-level model
 
-**Next (Day 2):** implement Level 1 rules on live Arc Perp OHLCV, wire the Dune MCP client for Level 2, and ship the first real Gemini arbitration call returning strict JSON.
+### Day 2 — In Progress
+
+Implementing the on-chain execution layer so the agent can actually trade:
+
+- **`ArcPerpExecutor`** (`src/execution/arc_perp_executor.py`) — `open_position`, `close_position`, `get_position`, `get_pnl`, `get_margin`, `get_account_info`.
+- **`CircleWallet`** (`src/execution/circle_wallet.py`) — async client over Circle Developer-Controlled Wallets REST API, with **Circle Paymaster** hook for gasless transactions.
+- **`AllocationRouter`** (`src/allocation/allocation_router.py`) — turns a `DecisionResult` into perp open/close (USYC rotation lands on Day 3).
+- **`DecisionEngine.decide()`** now returns a concrete `ExecutionDirective` (action, side, intensity, target size/leverage), not just a score.
+- **`main.py`** — full pipeline entry point with `--dry-run` (default) / `--live` and `--loop` modes; every level + plan + tx is logged through `loguru`.
+- Typed configuration via `src/utils/config.py` (`pydantic-settings`).
+
+**Default mode is `--dry-run`:** the pipeline runs end-to-end and logs the exact Circle DCW `contractExecution` payload it would have submitted (including Paymaster hints), without touching the chain. Flip to `--live` only once the Arc Perp router address, Circle `entitySecret` encryption and entity wallet are filled in.
+
+**Next (Day 3):** real Level 1 indicators on live OHLCV, Dune MCP client for Level 2, first real Gemini arbitration call returning strict JSON, and USYC rotation in the allocation router.
 
 ---
 
@@ -140,9 +153,16 @@ python -m venv .venv
 
 pip install -r requirements.txt
 cp .env.example .env
-# Review the keys in .env (Dune, Gemini, Circle test key are pre-filled).
+# Fill the keys in .env (Arc, Circle, Dune, Gemini).
 
-python -m src.agents             # entry point comes online on Day 2
+# Dry-run (no on-chain transactions, just logs the would-be calls):
+python main.py
+
+# Loop in dry-run mode at DECISION_INTERVAL_SECONDS:
+python main.py --loop
+
+# Live execution (only after the Arc Perp router + Circle creds are real):
+python main.py --live
 ```
 
 ---

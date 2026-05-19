@@ -1,24 +1,22 @@
-"""DecisionEngine - aggregates Level 1, Level 2 and Level 3 into a single action.
+"""DecisionEngine - aggregates Level 1, Level 2 and Level 3 into a directive.
 
-The engine is intentionally synchronous and side-effect free: it takes a
-`MarketContext`, asks each level for a score in `[0.0, 1.0]`, blends them
-with configured weights, and returns a `DecisionResult`. The allocation
-router is responsible for turning that result into on-chain transactions.
-
-This module is a Day 1 stub - method bodies will be filled in over the
-following days. The class shape, however, is the public contract that
-the rest of the system can already start coding against.
+The engine is intentionally side-effect free: it takes a `MarketContext`,
+asks each level for a `LevelScore`, blends them with configured weights,
+maps the final score to a concrete `ExecutionDirective`, and returns a
+`DecisionResult`. The `AllocationRouter` then turns that directive into
+on-chain transactions.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from src.core.level1 import Level1
 from src.core.level2 import Level2
-from src.core.level3 import Level3
+from src.core.level3 import ArbiterBriefing, Level3
 
 
 @dataclass
@@ -32,17 +30,34 @@ class LevelScore:
 
 
 @dataclass
+class ExecutionDirective:
+    """Concrete instruction the engine hands to the allocation router."""
+
+    action: str  # "risk_on" | "risk_off" | "hold"
+    side: str | None = None  # "long" | "short" | None
+    intensity: float = 0.0  # in [0, 1], how strong the conviction is
+    target_size_usd: Decimal | None = None
+    target_leverage: Decimal | None = None
+    rationale: str = ""
+
+
+@dataclass
 class DecisionResult:
     """Final aggregated decision produced by the engine."""
 
     final_score: float
-    action: str  # "risk_on" | "risk_off" | "hold"
-    regime: str  # human-readable label e.g. "risk-on", "transition", "chop"
+    regime: str
+    directive: ExecutionDirective
     level_scores: list[LevelScore]
     weights: dict[str, float]
     timestamp: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+    @property
+    def action(self) -> str:
+        """Convenience accessor matching the directive's action."""
+        return self.directive.action
 
 
 class DecisionEngine:
@@ -87,17 +102,30 @@ class DecisionEngine:
                 f"DecisionEngine weights must sum to 1.0, got {total:.4f}"
             )
 
-    def decide(self, context: dict[str, Any]) -> DecisionResult:
-        """Produce a `DecisionResult` for the given market context.
+    async def decide(self, context: dict[str, Any]) -> DecisionResult:
+        """Produce a `DecisionResult` for the given market context."""
+        l1 = await self.level1.score(context)
+        l2 = await self.level2.score(context)
 
-        Day 1 stub - real implementation will:
-        1. Query each level (potentially in parallel for L2/L3).
-        2. Apply hard overrides (drawdown, stale data).
-        3. Blend the scores with `self.weights`.
-        4. Map the final score to an action using the thresholds.
-        """
-        raise NotImplementedError(
-            "DecisionEngine.decide will be implemented on Day 2"
+        briefing = ArbiterBriefing(
+            level1_score=l1.score,
+            level1_rationale=l1.rationale,
+            level2_score=l2.score,
+            level2_rationale=l2.rationale,
+            market_snapshot=context,
+        )
+        l3 = await self.level3.score(briefing)
+
+        scores = [l1, l2, l3]
+        final_score = self._aggregate(scores)
+        directive = self._build_directive(final_score, scores)
+
+        return DecisionResult(
+            final_score=final_score,
+            regime=directive.action.replace("_", "-"),
+            directive=directive,
+            level_scores=scores,
+            weights=self.weights,
         )
 
     def _aggregate(self, scores: list[LevelScore]) -> float:
@@ -108,9 +136,39 @@ class DecisionEngine:
         }
         return sum(s.score * weights_by_level[s.level] for s in scores)
 
-    def _score_to_action(self, final_score: float) -> tuple[str, str]:
+    def _build_directive(
+        self, final_score: float, scores: list[LevelScore]
+    ) -> ExecutionDirective:
+        rationale = " | ".join(
+            f"L{s.level}={s.score:.2f} ({s.rationale})" for s in scores
+        )
         if final_score >= self.risk_on_threshold:
-            return "risk_on", "risk-on"
+            intensity = min(
+                1.0,
+                (final_score - self.risk_on_threshold)
+                / max(1e-6, 1.0 - self.risk_on_threshold),
+            )
+            return ExecutionDirective(
+                action="risk_on",
+                side="long",
+                intensity=intensity,
+                rationale=rationale,
+            )
         if final_score <= self.risk_off_threshold:
-            return "risk_off", "risk-off"
-        return "hold", "transition"
+            intensity = min(
+                1.0,
+                (self.risk_off_threshold - final_score)
+                / max(1e-6, self.risk_off_threshold),
+            )
+            return ExecutionDirective(
+                action="risk_off",
+                side=None,
+                intensity=intensity,
+                rationale=rationale,
+            )
+        return ExecutionDirective(
+            action="hold",
+            side=None,
+            intensity=0.0,
+            rationale=rationale,
+        )

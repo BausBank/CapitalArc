@@ -4,19 +4,20 @@ Level 3 receives the structured outputs of Level 1 and Level 2 plus a
 compact market briefing and asks Gemini 2.5 Flash to classify the
 current regime and emit a final risk score in `[0.0, 1.0]`.
 
-Gemini is the *arbiter*, not just another signal: it can overrule the
-naive blend by adjusting its score based on macro context, news, or
-inter-level inconsistencies it spots in the briefing.
-
-The Day 1 stub only fixes the public surface and the prompt contract.
+Day 2 keeps the arbiter as a deterministic neutral placeholder so the
+pipeline runs end-to-end without burning Gemini calls. Day 3 wires the
+real Gemini round-trip.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.llm.gemini_client import GeminiClient
+
+if TYPE_CHECKING:
+    from src.core.decision_engine import LevelScore
 
 
 @dataclass
@@ -51,45 +52,55 @@ class Level3:
 
     def __init__(
         self,
-        client: GeminiClient,
+        client: GeminiClient | None,
         config: Level3Config | None = None,
     ) -> None:
         self.config = config or Level3Config()
+        self.client = client
         self.arbiter = GeminiFinalArbiter(client=client, config=self.config)
 
-    async def score(self, briefing: ArbiterBriefing) -> float:
-        return await self.arbiter.arbitrate(briefing)
+    async def score(self, briefing: ArbiterBriefing) -> "LevelScore":
+        from src.core.decision_engine import LevelScore
 
-    async def explain(self, briefing: ArbiterBriefing) -> str:
-        return await self.arbiter.last_rationale()
+        score_value, rationale = await self.arbiter.arbitrate(briefing)
+        return LevelScore(
+            level=self.LEVEL,
+            score=score_value,
+            rationale=rationale,
+        )
 
 
 class GeminiFinalArbiter:
-    """The actual Gemini-backed arbiter.
+    """Gemini-backed final arbiter.
 
-    Day 1 stub only - on Day 2 this will:
+    Day 2 stub: produces a neutral 0.5 score with a clear placeholder
+    rationale. Day 3 will:
         1. Render `ArbiterBriefing` into the system+user prompt
            templates living in `prompts/`.
         2. Call Gemini 2.5 Flash with low temperature.
         3. Parse a strict JSON response shaped as
            `{"score": float, "regime": str, "rationale": str}`.
-        4. Cache the rationale for `explain()`.
     """
 
     def __init__(
         self,
-        client: GeminiClient,
+        client: GeminiClient | None,
         config: Level3Config,
     ) -> None:
         self.client = client
         self.config = config
         self._last_rationale: str = ""
 
-    async def arbitrate(self, briefing: ArbiterBriefing) -> float:
-        """Return a final risk-on score in `[0.0, 1.0]`."""
-        raise NotImplementedError(
-            "GeminiFinalArbiter.arbitrate will be implemented on Day 2"
+    async def arbitrate(self, briefing: ArbiterBriefing) -> tuple[float, str]:
+        """Return `(score, rationale)` for the given briefing."""
+        rationale = (
+            "L3 placeholder (Gemini 2.5 Flash not wired yet); "
+            f"echoed avg of L1({briefing.level1_score:.2f}) "
+            f"and L2({briefing.level2_score:.2f})"
         )
+        score = 0.5 * briefing.level1_score + 0.5 * briefing.level2_score
+        self._last_rationale = rationale
+        return score, rationale
 
     async def last_rationale(self) -> str:
         return self._last_rationale
