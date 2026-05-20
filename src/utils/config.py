@@ -29,6 +29,17 @@ class Settings(BaseSettings):
     APP_ENV: str = "dev"
     LOG_LEVEL: str = "INFO"
     DECISION_INTERVAL_SECONDS: int = 60
+    # When True, Level 2 caches Dune / Binance / on-chain results for
+    # DEMO_CACHE_TTL_SECONDS so a demo run is fast and idempotent.
+    DEMO_MODE: bool = True
+    DEMO_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
+
+    # ---------- Market data (Level 1 OHLCV proxy) ----------
+    # Arc Perp DEX uses off-chain matching; for Day 3 we proxy OHLCV/funding
+    # through Binance public perp API (no auth required, free).
+    BINANCE_FAPI_BASE_URL: str = "https://fapi.binance.com"
+    # Symbol mapping override (JSON). Empty / unset -> built-in defaults.
+    BINANCE_SYMBOL_MAP: str | None = None
 
     # ---------- Arc Chain ----------
     ARC_RPC_URL: str = "https://rpc.testnet.arc.network"
@@ -48,7 +59,7 @@ class Settings(BaseSettings):
     # Wiring lands on Day 3 once the matcher URL is published in #agora-hackers.
     ARC_PERP_MATCHER_URL: str | None = None
     ARC_PERP_MAX_LEVERAGE: int = 3
-    ARC_PERP_SYMBOLS: str = "BTC-PERP,ETH-PERP"
+    ARC_PERP_SYMBOLS: str = "BTC-PERP,ETH-PERP,SOL-PERP"
 
     # ---------- Circle DCW ----------
     CIRCLE_API_KEY: str | None = None
@@ -78,7 +89,24 @@ class Settings(BaseSettings):
     # ---------- Dune MCP (Level 2) ----------
     DUNE_API_KEY: str | None = None
     DUNE_MCP_URL: str = "https://mcp.dune.com/sse"
+    # Dune REST endpoint used to actually execute queries (the MCP SSE
+    # endpoint is the LLM-facing tool surface; the REST endpoint is the
+    # one we hit programmatically with the same DUNE_API_KEY).
+    DUNE_API_BASE_URL: str = "https://api.dune.com/api/v1"
     DUNE_CACHE_TTL_SECONDS: int = 300
+
+    # ---------- Level 1 thresholds (technical hard rules) ----------
+    L1_RSI_OVERBOUGHT: float = 70.0
+    L1_RSI_OVERSOLD: float = 30.0
+    L1_ATR_PCT_MIN: float = 0.15      # too quiet -> skip
+    L1_ATR_PCT_MAX: float = 6.0       # too wild -> skip
+    L1_EMA_FAST: int = 9
+    L1_EMA_SLOW: int = 21
+    L1_RSI_PERIOD: int = 14
+    L1_ATR_PERIOD: int = 14
+    L1_TIMEFRAMES: str = "15m,1h"
+    L1_KLINES_LIMIT: int = 150
+    L1_REQUIRE_TF_AGREEMENT: bool = True
 
     # ---------- Gemini (Level 3) ----------
     GEMINI_API_KEY: str | None = None
@@ -107,6 +135,33 @@ class Settings(BaseSettings):
     @property
     def perp_symbols(self) -> list[str]:
         return [s.strip() for s in self.ARC_PERP_SYMBOLS.split(",") if s.strip()]
+
+    @property
+    def l1_timeframes(self) -> list[str]:
+        return [t.strip() for t in self.L1_TIMEFRAMES.split(",") if t.strip()]
+
+    @property
+    def binance_symbol_map(self) -> dict[str, str]:
+        """Map Arc-Perp symbol -> Binance perp symbol.
+
+        Built-in defaults cover BTC/ETH/SOL; override with
+        `BINANCE_SYMBOL_MAP='{"FOO-PERP":"FOOUSDT"}'` in `.env`.
+        """
+        defaults = {
+            "BTC-PERP": "BTCUSDT",
+            "ETH-PERP": "ETHUSDT",
+            "SOL-PERP": "SOLUSDT",
+        }
+        if self.BINANCE_SYMBOL_MAP:
+            try:
+                import json
+
+                override = json.loads(self.BINANCE_SYMBOL_MAP)
+                if isinstance(override, dict):
+                    defaults.update({str(k): str(v) for k, v in override.items()})
+            except Exception:  # noqa: BLE001 - best-effort override
+                pass
+        return defaults
 
     @property
     def level_weights(self) -> dict[str, float]:

@@ -66,11 +66,12 @@ CapitalArc/
 ├── main.py           # Entry point: --dry-run / --live, optional --loop
 ├── src/
 │   ├── core/         # DecisionEngine + Level 1/2/3 + ExecutionDirective
+│   ├── data/         # BinanceClient, DuneMCPClient, ArcOnchainReader
 │   ├── execution/    # ArcPerpExecutor + CircleWallet (DCW + Paymaster)
 │   ├── allocation/   # AllocationRouter: directive -> on-chain action
 │   ├── llm/          # Gemini 2.5 Flash client (final arbiter)
 │   ├── agents/       # Reserved for top-level orchestration helpers
-│   └── utils/        # Settings (pydantic), logging (loguru)
+│   └── utils/        # Settings (pydantic), logging (loguru), rich panels
 ├── prompts/          # LLM prompt templates for the Level 3 arbiter
 ├── scripts/          # One-off scripts: deploy, seed, simulate, backtest
 ├── tests/            # Unit & integration tests
@@ -164,56 +165,151 @@ The agent can now move real capital on Arc Testnet through Circle DCW.
 the chain. Flip to `--live` once the Arc Testnet wallet is funded with
 USDC.
 
-### Day 3 — Planned
+### Day 3 — Completed
 
-Concrete checklist for the next session (so a fresh chat can pick up
-without re-discovering anything):
+Level 1 (technical hard rules) and Level 2 (on-chain intelligence)
+are both fully wired and feed a cascading `DecisionEngine`.
 
-- **Level 1 — real technical signals** (`src/core/level1.py`)
-  - Wire OHLCV ingestion (1m / 5m / 1h candles). Source TBD: public Arc
-    perp API if exposed, else fall back to a CEX proxy (Binance perp
-    BTC/ETH) for the demo.
-  - Implement EMA stack (e.g. 21 / 55 / 200), RSI(14), MACD, ATR(14),
-    realised vol. Return a `LevelScore` in `[0, 1]` with a short rationale.
+- **Level 1 — Technical hard rules** (`src/core/level1.py`)
+  - Real OHLCV ingestion for **BTC-PERP / ETH-PERP / SOL-PERP** on
+    `15m` and `1h` timeframes via the new **`BinanceClient`**
+    (`src/data/binance_client.py`). Binance USDT-M Perp is used as a
+    Day-3 OHLCV / funding / OI / LSR proxy until Arc Perp DEX exposes
+    a public market API; symbol mapping is `BTC-PERP → BTCUSDT`,
+    `ETH-PERP → ETHUSDT`, `SOL-PERP → SOLUSDT` and is overridable via
+    `BINANCE_SYMBOL_MAP`.
+  - Four hard rules ("защита от дурака") that can each veto a trade:
+    1. **Trend filter** — `close > EMA9 > EMA21` (or mirror down) must
+       hold on *both* 15m and 1h; otherwise `trend_mixed` blocks.
+    2. **RSI extreme** — `RSI(14) ≥ L1_RSI_OVERBOUGHT` (default 70) or
+       `≤ L1_RSI_OVERSOLD` (default 30) blocks the trade.
+    3. **Volatility band** — `ATR%` (ATR / price) must lie inside
+       `[L1_ATR_PCT_MIN, L1_ATR_PCT_MAX]` (defaults 0.15% / 6.00%).
+    4. **Account drawdown** — current `unrealized_pnl / margin`
+       breaching `MAX_DRAWDOWN_PCT` forces a flat outcome.
+  - `Level1Decision` carries a structured list of `Level1Reason`s
+    (`code`, `severity`, `message`, `symbol`, `timeframe`) plus a
+    per-symbol `SymbolReadout` with the latest indicator snapshot.
 
-- **Level 2 — Dune MCP client** (`src/core/level2.py`)
-  - Talk to the Dune MCP server using `DUNE_API_KEY`.
-  - Queries: stablecoin net flows on Arc, perp open-interest delta, DEX
-    volume regime, whale-wallet rotations, CCTP bridge volume.
-  - Aggregate into a `LevelScore` with structured rationale lines.
+- **Level 2 — On-chain intelligence** (`src/core/level2.py`)
+  - Combines three live sources:
+    - **Dune MCP** via the new `DuneMCPClient`
+      (`src/data/dune_mcp.py`) — speaks the same Bearer-authenticated
+      surface the Dune MCP server exposes to LLMs (`run_query`,
+      `latest_results`, `ping`), with a 30-min TTL cache in demo mode.
+    - **Binance perp public API** — funding rate history, premium /
+      mark price, open-interest history, 24h ticker, long/short
+      ratio.
+    - **Arc Testnet RPC** via `ArcOnchainReader`
+      (`src/data/arc_onchain.py`) — vault USDC TVL, agent's margin
+      balance, recent vault deposits / withdrawals from ERC-20
+      `Transfer` events.
+  - Per-symbol metrics: funding rate (current + 8h / 24h delta +
+    weighted average + annualised %), open interest (current +
+    1h / 4h / 24h deltas), volume + z-score spike detection, long/short
+    ratio with inferred bias, cumulative funding paid / received over
+    the recent 48h window, whale-activity flag derived from 1h OI
+    deltas.
+  - A market-wide **heat score** (0–1) aggregates all three symbols
+    and labels the regime as `risk_on` / `risk_off` / `neutral` /
+    `transition`. Arc vault net flow adds a small modifier to the
+    score so on-chain capital movement actually moves the needle.
+  - `DEMO_MODE` caches the full `Level2Intelligence` payload for
+    `DEMO_CACHE_TTL_SECONDS` (default 30 min) so demo loops are fast
+    and idempotent.
+
+- **DecisionEngine — cascading L1 → L2 with short-circuit**
+  (`src/core/decision_engine.py`)
+  - If Level 1 blocks (`Level1Decision.passes == False`), Level 2 is
+    **not** called and the engine emits `final_score = 0.0`,
+    `regime = "risk-off"`, `short_circuited = True` with the explicit
+    L1 block reason. The `AllocationRouter` now distinguishes a
+    short-circuit risk-off (legitimate close) from stale data
+    (denied).
+  - When L1 passes, L2 runs. Level 3 is left as a deterministic
+    placeholder (synthetic re-weight of L1 + L2) until Day 4 wires
+    Gemini 2.5 Flash as the final arbiter — the engine already
+    accepts a `Level3` instance and the briefing path is in place.
+  - Side inference: positive 24h price change on a majority of
+    symbols → `long`, negative → `short`.
+
+- **Rich visualisation** (`src/utils/console.py`, `main.py`)
+  - Every decision cycle prints six panels: **Market Context**,
+    **Level 1 — Technical Hard Rules**, **Level 2 — On-chain
+    Intelligence**, **Final Decision**, **Execution Plan** and
+    **On-chain Result**. Panels colour-code regime, trend, severity,
+    and tx state.
+
+- **Config & env**
+  - New settings: `DEMO_MODE`, `DEMO_CACHE_TTL_SECONDS`,
+    `BINANCE_FAPI_BASE_URL`, `BINANCE_SYMBOL_MAP`, `DUNE_API_BASE_URL`,
+    all `L1_*` thresholds. Default `ARC_PERP_SYMBOLS` now includes
+    `SOL-PERP`.
+
+### Day 4 — Planned
 
 - **Level 3 — real Gemini 2.5 Flash arbitration** (`src/core/level3.py`
   + `src/llm/gemini_client.py`)
   - Pin temperature low, force strict JSON: `{"score": float, "regime":
     str, "rationale": str}`.
-  - Feed `ArbiterBriefing { l1_score, l1_rationale, l2_score, l2_rationale,
-    market_snapshot }`.
+  - Feed `ArbiterBriefing { l1_score, l1_rationale, l2_score,
+    l2_rationale, market_snapshot }`.
 
 - **Trading wire-up** (`src/execution/arc_perp_executor.py`)
   - Set `ARC_PERP_MATCHER_URL` in `.env` once published in
     `#agora-hackers`.
   - Sign EIP-712 `OrderTypes.Order` with `eth-account`, POST signed
-    orders to the matcher. `open_position` / `close_position` then go
-    fully live.
-  - Decode `PositionLedger.getPosition` return tuple into the `Position`
-    dataclass (we already read it; only the decoder is missing).
+    orders to the matcher.
+  - Decode `PositionLedger.getPosition` into the `Position` dataclass.
 
 - **Risk-off leg — USYC rotation** (`src/allocation/allocation_router.py`)
   - On `risk_off`, withdraw USDC margin from the perp vault and route
-    into USYC (mint via Circle's USYC token contracts, addresses already
-    in `.env`).
-  - Reverse path on the next `risk_on`.
+    into USYC.
 
 - **Observability**
   - Persist every `DecisionResult` + `ExecutionPlan` to a local JSONL
     log so we can replay the agent's day.
-  - Optional: small CLI summary (`scripts/show_last_decisions.py`).
 
-**Definition of done for Day 3:** the agent runs end-to-end on real
-signals, opens / closes a real perp position on Arc Testnet on `--live`,
-and can rotate into USYC on a risk-off flip.
+**Definition of done for Day 4:** the agent runs end-to-end on real
+signals + Gemini arbitration, opens / closes a real perp position on
+Arc Testnet on `--live`, and rotates into USYC on a risk-off flip.
 
 ---
+
+## What a cycle looks like
+
+Every cycle prints six panels to the terminal:
+
+```
+─── CapitalArc  mode=DRY-RUN  env=dev ───
+
+┌── Market Context ──────────────────────┐
+│  Time, mode, symbols, RPC, agent       │
+│  wallet, account ID, L1 timeframes     │
+└────────────────────────────────────────┘
+┌── Level 1 - Technical Hard Rules ──────┐
+│  PASS / BLOCKED verdict, score,        │
+│  indicators table (EMA9/21, RSI, ATR%, │
+│  trend) and reasons table.             │
+└────────────────────────────────────────┘
+┌── Level 2 - On-chain Intelligence ─────┐
+│  regime, market heat, per-symbol       │
+│  funding / OI / volume / L-S /         │
+│  whales, vault TVL, Dune MCP health    │
+└────────────────────────────────────────┘
+┌── Final Decision ──────────────────────┐
+│  final score, regime, action, side,    │
+│  intensity, per-level breakdown        │
+└────────────────────────────────────────┘
+┌── Execution Plan ──────────────────────┐
+│  decision_id, action, symbol, size,    │
+│  leverage, rationale                   │
+└────────────────────────────────────────┘
+┌── On-chain Result ─────────────────────┐
+│  tx_id, state, hash, sponsored,        │
+│  Arcscan explorer link                 │
+└────────────────────────────────────────┘
+```
 
 ## Quick Start
 

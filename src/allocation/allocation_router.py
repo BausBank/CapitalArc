@@ -77,7 +77,10 @@ class AllocationRouter:
         decision_id = self._mk_decision_id(decision)
         directive = decision.directive
 
-        if self._stale_data(decision):
+        # Genuine stale data = all levels returned zero score *without*
+        # an explicit short-circuit by the engine. A short-circuit means
+        # the engine intentionally chose risk-off and we should honour it.
+        if not decision.short_circuited and self._stale_data(decision):
             return self._deny(
                 decision_id, "stale or incomplete data - forcing hold"
             )
@@ -95,9 +98,14 @@ class AllocationRouter:
                 decision_id, directive, account, reason=directive.rationale
             )
         if directive.action == "risk_off":
-            return await self._do_close(
-                decision_id, account, reason=directive.rationale
-            )
+            reason = directive.rationale
+            if decision.short_circuited:
+                reason = (
+                    f"L1 short-circuit ({decision.short_circuit_reason})"
+                    if decision.short_circuit_reason
+                    else "L1 short-circuit"
+                )
+            return await self._do_close(decision_id, account, reason=reason)
         return ExecutionPlan(
             decision_id=decision_id,
             action="hold",

@@ -45,7 +45,7 @@ htmlcov/
 # --- Logs & runtime data ---
 logs/
 *.log
-data/
+/data/
 runs/
 artifacts/
 checkpoints/

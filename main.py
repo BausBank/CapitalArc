@@ -2,7 +2,7 @@
 
 Wires the full pipeline:
 
-    Level 1 (TA) + Level 2 (Dune MCP) + Level 3 (Gemini)
+    Level 1 (TA) + Level 2 (Dune MCP + Binance + Arc RPC) [+ Level 3]
         -> DecisionEngine
             -> AllocationRouter
                 -> ArcPerpExecutor + CircleWallet (Arc Perp DEX, Paymaster)
@@ -29,17 +29,36 @@ from decimal import Decimal
 from typing import Any
 
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.rule import Rule
 
 from src.allocation.allocation_router import AllocationConfig, AllocationRouter
 from src.core.decision_engine import DecisionEngine
 from src.core.level1 import Level1, Level1Config
 from src.core.level2 import Level2, Level2Config
-from src.core.level3 import Level3, Level3Config
+from src.data.arc_onchain import ArcOnchainConfig, ArcOnchainReader
+from src.data.binance_client import BinanceClient, BinanceClientConfig
+from src.data.dune_mcp import DuneMCPClient, DuneMCPClientConfig
 from src.execution.arc_perp_executor import ArcPerpConfig, ArcPerpExecutor
 from src.execution.circle_wallet import CircleWallet, CircleWalletConfig
-from src.llm.gemini_client import GeminiClient, GeminiClientConfig
 from src.utils.config import Settings, get_settings
+from src.utils.console import (
+    execution_plan_panel,
+    final_decision_panel,
+    level1_panel,
+    level2_panel,
+    market_context_panel,
+    onchain_result_panel,
+)
 from src.utils.logging import configure_logging, logger
+
+
+console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Builders
+# ---------------------------------------------------------------------------
 
 
 def _build_circle_wallet(settings: Settings, dry_run: bool) -> CircleWallet:
@@ -69,45 +88,85 @@ def _build_executor(
     return ArcPerpExecutor(wallet=wallet, config=cfg, dry_run=dry_run)
 
 
-def _build_engine(settings: Settings) -> DecisionEngine:
-    level1 = Level1(Level1Config())
-    level2 = Level2(
-        Level2Config(
-            dune_mcp_url=settings.DUNE_MCP_URL,
-            dune_api_key=settings.DUNE_API_KEY or "",
-            cache_ttl_seconds=settings.DUNE_CACHE_TTL_SECONDS,
+def _build_binance(settings: Settings) -> BinanceClient:
+    return BinanceClient(
+        BinanceClientConfig(
+            base_url=settings.BINANCE_FAPI_BASE_URL,
+            symbol_map=settings.binance_symbol_map,
         )
     )
 
-    gemini_client: GeminiClient | None = None
-    if settings.GEMINI_API_KEY:
-        try:
-            gemini_client = GeminiClient(
-                GeminiClientConfig(
-                    api_key=settings.GEMINI_API_KEY,
-                    model=settings.GEMINI_MODEL,
-                    temperature=settings.GEMINI_TEMPERATURE,
-                    max_output_tokens=settings.GEMINI_MAX_OUTPUT_TOKENS,
-                    timeout_seconds=settings.GEMINI_TIMEOUT_SECONDS,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - we want a soft fallback
-            logger.warning("Gemini client init failed, using placeholder: {}", exc)
-            gemini_client = None
 
-    level3 = Level3(
-        client=gemini_client,
-        config=Level3Config(
-            model=settings.GEMINI_MODEL,
-            temperature=settings.GEMINI_TEMPERATURE,
-            max_output_tokens=settings.GEMINI_MAX_OUTPUT_TOKENS,
-            timeout_seconds=settings.GEMINI_TIMEOUT_SECONDS,
+def _build_dune(settings: Settings) -> DuneMCPClient | None:
+    if not settings.DUNE_API_KEY:
+        return None
+    return DuneMCPClient(
+        DuneMCPClientConfig(
+            api_key=settings.DUNE_API_KEY,
+            api_base_url=settings.DUNE_API_BASE_URL,
+            mcp_url=settings.DUNE_MCP_URL,
+            cache_ttl_seconds=(
+                settings.DEMO_CACHE_TTL_SECONDS
+                if settings.DEMO_MODE
+                else settings.DUNE_CACHE_TTL_SECONDS
+            ),
+        )
+    )
+
+
+def _build_arc_reader(settings: Settings) -> ArcOnchainReader:
+    return ArcOnchainReader(
+        ArcOnchainConfig(
+            rpc_url=settings.ARC_RPC_URL,
+            vault_address=settings.ARC_PERP_VAULT_ADDRESS,
+            usdc_address=settings.USDC_TOKEN_ADDRESS,
+            chain_id=settings.ARC_CHAIN_ID,
+        )
+    )
+
+
+def _build_engine(
+    settings: Settings,
+    binance: BinanceClient,
+    dune: DuneMCPClient | None,
+    onchain: ArcOnchainReader,
+) -> DecisionEngine:
+    level1 = Level1(
+        Level1Config(
+            timeframes=settings.l1_timeframes,
+            klines_limit=settings.L1_KLINES_LIMIT,
+            ema_fast=settings.L1_EMA_FAST,
+            ema_slow=settings.L1_EMA_SLOW,
+            rsi_period=settings.L1_RSI_PERIOD,
+            atr_period=settings.L1_ATR_PERIOD,
+            rsi_overbought=settings.L1_RSI_OVERBOUGHT,
+            rsi_oversold=settings.L1_RSI_OVERSOLD,
+            atr_pct_min=settings.L1_ATR_PCT_MIN,
+            atr_pct_max=settings.L1_ATR_PCT_MAX,
+            max_drawdown_pct=settings.MAX_DRAWDOWN_PCT,
+            require_tf_agreement=settings.L1_REQUIRE_TF_AGREEMENT,
         ),
+        binance=binance,
+    )
+    level2 = Level2(
+        Level2Config(
+            symbols=settings.perp_symbols or ["BTC-PERP", "ETH-PERP", "SOL-PERP"],
+            cache_ttl_seconds=(
+                settings.DEMO_CACHE_TTL_SECONDS
+                if settings.DEMO_MODE
+                else settings.DUNE_CACHE_TTL_SECONDS
+            ),
+            demo_mode=settings.DEMO_MODE,
+            dune_enabled=dune is not None,
+        ),
+        binance=binance,
+        dune=dune,
+        onchain=onchain,
     )
     return DecisionEngine(
         level1=level1,
         level2=level2,
-        level3=level3,
+        level3=None,  # Level 3 (Gemini final arbiter) lands on Day 4
         weights=settings.level_weights,
         risk_on_threshold=settings.RISK_ON_THRESHOLD,
         risk_off_threshold=settings.RISK_OFF_THRESHOLD,
@@ -129,19 +188,12 @@ def _build_router(
     return AllocationRouter(executor=executor, config=cfg, dry_run=dry_run)
 
 
-def _build_market_context(settings: Settings) -> dict[str, Any]:
-    """Minimal market context for Day 2. Day 3 hydrates this from real feeds."""
-    return {
-        "symbol": (settings.perp_symbols or ["BTC-PERP"])[0],
-        "rpc_url": settings.ARC_RPC_URL,
-        "ohlcv": None,  # placeholder, wired in Day 3
-        "funding_rate": None,
-        "open_interest": None,
-    }
+# ---------------------------------------------------------------------------
+# Pre-flight & helpers
+# ---------------------------------------------------------------------------
 
 
 def _preflight_live(settings: Settings) -> list[str]:
-    """Return a list of missing fields that block --live. Empty list = OK."""
     required = {
         "CIRCLE_API_KEY": settings.CIRCLE_API_KEY,
         "CIRCLE_ENTITY_SECRET": settings.CIRCLE_ENTITY_SECRET,
@@ -159,10 +211,49 @@ def _explorer_link(settings: Settings, tx_hash: str | None) -> str | None:
     return f"{base}/tx/{tx_hash}"
 
 
+async def _build_market_context(
+    settings: Settings,
+    executor: ArcPerpExecutor,
+    wallet: CircleWallet,
+) -> dict[str, Any]:
+    """Assemble the decision-engine context (symbols, RPC, account, drawdown)."""
+    addr = await wallet.get_address()
+    if addr:
+        executor.set_account_address(addr)
+    account_id: str | None = None
+    try:
+        account_id = executor._account_id() if addr else None
+    except Exception:  # noqa: BLE001 - address may be empty in dry-run
+        account_id = None
+    margin = await executor.get_margin()
+    pnl = await executor.get_pnl()
+    drawdown_pct = 0.0
+    if margin > 0 and pnl < 0:
+        drawdown_pct = float(-pnl / margin * 100)
+    return {
+        "symbols": settings.perp_symbols,
+        "symbol": (settings.perp_symbols or ["BTC-PERP"])[0],
+        "rpc_url": settings.ARC_RPC_URL,
+        "account_address": addr,
+        "account_id": account_id,
+        "account_margin_usdc": float(margin),
+        "account_unrealized_pnl_usdc": float(pnl),
+        "account_drawdown_pct": drawdown_pct,
+        "l1_timeframes": settings.l1_timeframes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cycle
+# ---------------------------------------------------------------------------
+
+
 async def run_once(dry_run: bool) -> None:
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
     mode = "DRY-RUN" if dry_run else "LIVE"
+
+    console.print(Rule(f"[bold cyan]CapitalArc[/]  mode={mode}  env={settings.APP_ENV}"))
     logger.info("CapitalArc starting | mode={} env={}", mode, settings.APP_ENV)
 
     if not dry_run:
@@ -178,52 +269,44 @@ async def run_once(dry_run: bool) -> None:
 
     wallet = _build_circle_wallet(settings, dry_run=dry_run)
     executor = _build_executor(settings, wallet=wallet, dry_run=dry_run)
-    engine = _build_engine(settings)
+    binance = _build_binance(settings)
+    dune = _build_dune(settings)
+    onchain = _build_arc_reader(settings)
+    engine = _build_engine(settings, binance=binance, dune=dune, onchain=onchain)
     router = _build_router(settings, executor=executor, dry_run=dry_run)
 
     try:
-        # Best-effort: discover the agent's EVM address so accountId derivation
-        # works (live reads & writes). In dry-run we tolerate missing creds.
-        addr = await wallet.get_address()
-        if addr:
-            executor.set_account_address(addr)
-            logger.info("Agent wallet address: {}", addr)
-        else:
-            logger.debug("Wallet address not resolved (read-only fallback).")
+        # Probe Dune MCP once so the panel shows accurate health.
+        await engine.level2.connect()
 
-        context = _build_market_context(settings)
-        logger.info("Market context: {}", context)
+        context = await _build_market_context(settings, executor, wallet)
+        console.print(
+            market_context_panel(
+                context, mode=mode, app_env=settings.APP_ENV
+            )
+        )
 
         decision = await engine.decide(context)
-        logger.info(
-            "Decision | score={:.3f} regime={} action={} side={} intensity={:.2f}",
-            decision.final_score,
-            decision.regime,
-            decision.directive.action,
-            decision.directive.side,
-            decision.directive.intensity,
-        )
-        for s in decision.level_scores:
-            logger.info("  L{} score={:.3f} :: {}", s.level, s.score, s.rationale)
+
+        l1_raw = decision.level_score(1).raw.get("l1", {}) if decision.level_score(1) else {}
+        l2_raw = decision.level_score(2).raw.get("l2", {}) if decision.level_score(2) else {}
+        console.print(level1_panel(l1_raw, decision.level_score(1).score))
+        console.print(level2_panel(l2_raw, decision.level_score(2).score))
+        console.print(final_decision_panel(decision))
 
         plan = await router.route(decision)
-        logger.info(
-            "ExecutionPlan | id={} action={} symbol={} size_usd={} leverage={}",
-            plan.decision_id,
-            plan.action,
-            plan.symbol,
-            plan.size_usd,
-            plan.leverage,
+        console.print(execution_plan_panel(plan))
+        console.print(
+            onchain_result_panel(
+                plan.tx_results,
+                explorer=lambda h: _explorer_link(settings, h),
+            )
         )
 
-        for tx in plan.tx_results:
-            link = _explorer_link(settings, tx.tx_hash)
-            logger.info(
-                "  tx | id={} state={} hash={} sponsored={} {}",
-                tx.tx_id, tx.state, tx.tx_hash, tx.sponsored,
-                f"explorer={link}" if link else "",
-            )
-            if not dry_run and tx.state not in {"DRY_RUN", "FAILED", "DENIED"}:
+        if not dry_run:
+            for tx in plan.tx_results:
+                if tx.state in {"DRY_RUN", "FAILED", "DENIED"}:
+                    continue
                 final = await wallet.wait_for_tx(tx.tx_id, poll_seconds=3.0)
                 link = _explorer_link(settings, final.tx_hash)
                 logger.info(
@@ -231,8 +314,13 @@ async def run_once(dry_run: bool) -> None:
                     final.tx_id, final.state, final.tx_hash,
                     f"explorer={link}" if link else "",
                 )
+
+        console.print(Rule(f"[green]cycle done[/]  score={decision.final_score:.3f}  action={decision.directive.action}"))
     finally:
         await wallet.aclose()
+        await binance.aclose()
+        if dune is not None:
+            await dune.aclose()
 
 
 async def run_loop(dry_run: bool) -> None:
@@ -268,7 +356,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    dry_run = not args.live  # default to dry-run unless --live is explicit
+    dry_run = not args.live
 
     if args.loop:
         asyncio.run(run_loop(dry_run=dry_run))
