@@ -59,6 +59,11 @@ def _build_executor(
 ) -> ArcPerpExecutor:
     cfg = ArcPerpConfig(
         router_address=settings.ARC_PERP_ROUTER_ADDRESS,
+        vault_address=settings.ARC_PERP_VAULT_ADDRESS,
+        market_registry_address=settings.ARC_PERP_MARKET_REGISTRY_ADDRESS,
+        position_ledger_address=settings.ARC_PERP_POSITION_LEDGER_ADDRESS,
+        matcher_url=settings.ARC_PERP_MATCHER_URL,
+        rpc_url=settings.ARC_RPC_URL,
         max_leverage=settings.ARC_PERP_MAX_LEVERAGE,
     )
     return ArcPerpExecutor(wallet=wallet, config=cfg, dry_run=dry_run)
@@ -135,11 +140,41 @@ def _build_market_context(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _preflight_live(settings: Settings) -> list[str]:
+    """Return a list of missing fields that block --live. Empty list = OK."""
+    required = {
+        "CIRCLE_API_KEY": settings.CIRCLE_API_KEY,
+        "CIRCLE_ENTITY_SECRET": settings.CIRCLE_ENTITY_SECRET,
+        "CIRCLE_AGENT_WALLET_ID": settings.CIRCLE_AGENT_WALLET_ID,
+        "ARC_PERP_ROUTER_ADDRESS": settings.ARC_PERP_ROUTER_ADDRESS,
+        "ARC_PERP_VAULT_ADDRESS": settings.ARC_PERP_VAULT_ADDRESS,
+    }
+    return [name for name, value in required.items() if not value]
+
+
+def _explorer_link(settings: Settings, tx_hash: str | None) -> str | None:
+    if not (tx_hash and settings.ARC_EXPLORER_URL):
+        return None
+    base = settings.ARC_EXPLORER_URL.rstrip("/")
+    return f"{base}/tx/{tx_hash}"
+
+
 async def run_once(dry_run: bool) -> None:
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
     mode = "DRY-RUN" if dry_run else "LIVE"
     logger.info("CapitalArc starting | mode={} env={}", mode, settings.APP_ENV)
+
+    if not dry_run:
+        missing = _preflight_live(settings)
+        if missing:
+            logger.error(
+                "Cannot start --live: missing env values: {}", ", ".join(missing)
+            )
+            raise SystemExit(2)
+        logger.warning(
+            "LIVE mode: real on-chain transactions will be submitted via Circle DCW."
+        )
 
     wallet = _build_circle_wallet(settings, dry_run=dry_run)
     executor = _build_executor(settings, wallet=wallet, dry_run=dry_run)
@@ -147,6 +182,15 @@ async def run_once(dry_run: bool) -> None:
     router = _build_router(settings, executor=executor, dry_run=dry_run)
 
     try:
+        # Best-effort: discover the agent's EVM address so accountId derivation
+        # works (live reads & writes). In dry-run we tolerate missing creds.
+        addr = await wallet.get_address()
+        if addr:
+            executor.set_account_address(addr)
+            logger.info("Agent wallet address: {}", addr)
+        else:
+            logger.debug("Wallet address not resolved (read-only fallback).")
+
         context = _build_market_context(settings)
         logger.info("Market context: {}", context)
 
@@ -171,11 +215,22 @@ async def run_once(dry_run: bool) -> None:
             plan.size_usd,
             plan.leverage,
         )
+
         for tx in plan.tx_results:
+            link = _explorer_link(settings, tx.tx_hash)
             logger.info(
-                "  tx | id={} state={} hash={} sponsored={}",
+                "  tx | id={} state={} hash={} sponsored={} {}",
                 tx.tx_id, tx.state, tx.tx_hash, tx.sponsored,
+                f"explorer={link}" if link else "",
             )
+            if not dry_run and tx.state not in {"DRY_RUN", "FAILED", "DENIED"}:
+                final = await wallet.wait_for_tx(tx.tx_id, poll_seconds=3.0)
+                link = _explorer_link(settings, final.tx_hash)
+                logger.info(
+                    "  tx settled | id={} state={} hash={} {}",
+                    final.tx_id, final.state, final.tx_hash,
+                    f"explorer={link}" if link else "",
+                )
     finally:
         await wallet.aclose()
 

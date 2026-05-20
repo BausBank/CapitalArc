@@ -36,7 +36,17 @@ class Settings(BaseSettings):
     ARC_EXPLORER_URL: str | None = None
 
     # ---------- Arc Perp DEX ----------
+    # ClearingHouse - entry contract for batch settlement (settleBatch).
     ARC_PERP_ROUTER_ADDRESS: str | None = None
+    # USDCCollateralVault - holds USDC margin (deposit / withdraw).
+    ARC_PERP_VAULT_ADDRESS: str | None = None
+    # MarketRegistry - market id <-> spec mapping (getMarket).
+    ARC_PERP_MARKET_REGISTRY_ADDRESS: str | None = None
+    # PositionLedger - per-(accountId, marketId) position state (getPosition).
+    ARC_PERP_POSITION_LEDGER_ADDRESS: str | None = None
+    # Off-chain matching engine endpoint for EIP-712 OrderTypes.Order POSTs.
+    # Wiring lands on Day 3 once the matcher URL is published in #agora-hackers.
+    ARC_PERP_MATCHER_URL: str | None = None
     ARC_PERP_MAX_LEVERAGE: int = 3
     ARC_PERP_SYMBOLS: str = "BTC-PERP,ETH-PERP"
 

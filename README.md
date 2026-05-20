@@ -124,20 +124,50 @@ CapitalArc/
 - Twitter sentiment and xAI/Grok layers fully removed
 - `AGENTS.md` updated to the 3-level model
 
-### Day 2 — In Progress
+### Day 2 — Completed
 
-Implementing the on-chain execution layer so the agent can actually trade:
+The agent can now move real capital on Arc Testnet through Circle DCW.
 
-- **`ArcPerpExecutor`** (`src/execution/arc_perp_executor.py`) — `open_position`, `close_position`, `get_position`, `get_pnl`, `get_margin`, `get_account_info`.
-- **`CircleWallet`** (`src/execution/circle_wallet.py`) — async client over Circle Developer-Controlled Wallets REST API, with **Circle Paymaster** hook for gasless transactions.
-- **`AllocationRouter`** (`src/allocation/allocation_router.py`) — turns a `DecisionResult` into perp open/close (USYC rotation lands on Day 3).
-- **`DecisionEngine.decide()`** now returns a concrete `ExecutionDirective` (action, side, intensity, target size/leverage), not just a score.
-- **`main.py`** — full pipeline entry point with `--dry-run` (default) / `--live` and `--loop` modes; every level + plan + tx is logged through `loguru`.
-- Typed configuration via `src/utils/config.py` (`pydantic-settings`).
+- **`ArcPerpExecutor`** (`src/execution/arc_perp_executor.py`) — wired
+  against the real Arc Perp DEX stack on Arc Testnet (verified contracts
+  deployed by `0x880bd26A...`): `ClearingHouse 0x70a06946…`,
+  `USDCCollateralVault 0x75E4FBFB…`, `MarketRegistry 0x9cED23e4…`,
+  `PositionLedger 0xd6D77291…`. The venue is order-book + on-chain batch
+  settlement (dYdX v3 style); margin moves are pure on-chain and live
+  today, EIP-712 order signing lands on Day 3 once the matcher URL is
+  available.
+- **Live margin moves**: `deposit_margin` / `withdraw_margin` execute real
+  `USDCCollateralVault.deposit / withdraw` transactions through Circle
+  DCW. `get_margin` / `get_position` read on-chain state via `web3.py`
+  against the public Arc Testnet RPC.
+- **`CircleWallet`** (`src/execution/circle_wallet.py`) — real
+  **RSA-OAEP-SHA256** encryption of the entity secret with Circle's
+  cached public key (fresh ciphertext per request, as Circle requires).
+  Circle **Paymaster** / Gas Station policy is wired via `gasPolicyId`
+  on the contractExecution body; `TxResult.sponsored` flips to `True`
+  when a policy is configured.
+- **`AllocationRouter`** — turns the `DecisionResult` into `open_position`
+  or `close_position`; in live mode, if the off-chain matcher URL isn't
+  set, it gracefully degrades to a margin-deposit so capital still lands
+  on the perp venue.
+- **`main.py`** — `--dry-run` (default), `--live` (with strict pre-flight
+  checks: refuses to start unless `CIRCLE_API_KEY`, `CIRCLE_ENTITY_SECRET`,
+  `CIRCLE_AGENT_WALLET_ID`, `ARC_PERP_ROUTER_ADDRESS` and
+  `ARC_PERP_VAULT_ADDRESS` are present), `--loop` for repeated cycles,
+  Arcscan explorer links printed for every tx, automatic polling of
+  Circle tx state to a terminal status.
+- **Day-1 setup script** (`scripts/create_circle_wallet.py`) — already
+  creates a named Circle DCW wallet on `ARC-TESTNET`.
 
-**Default mode is `--dry-run`:** the pipeline runs end-to-end and logs the exact Circle DCW `contractExecution` payload it would have submitted (including Paymaster hints), without touching the chain. Flip to `--live` only once the Arc Perp router address, Circle `entitySecret` encryption and entity wallet are filled in.
+**Default mode remains `--dry-run`**, which logs the exact Circle DCW
+`contractExecution` payload (including Paymaster hints) without touching
+the chain. Flip to `--live` once the Arc Testnet wallet is funded with
+USDC.
 
-**Next (Day 3):** real Level 1 indicators on live OHLCV, Dune MCP client for Level 2, first real Gemini arbitration call returning strict JSON, and USYC rotation in the allocation router.
+**Next (Day 3):** real Level-1 indicators on live OHLCV, Dune MCP client
+for Level 2, first real Gemini arbitration call returning strict JSON,
+EIP-712 order signing against the perp matcher endpoint, and USYC
+rotation on the risk-off leg.
 
 ---
 

@@ -130,14 +130,39 @@ class AllocationRouter:
             leverage=leverage,
             rationale=reason or "risk-on directive",
         )
-        result = await self.executor.open_position(
-            symbol=self.config.perp_symbol,
-            side=side,
-            size_usd=size_usd,
-            leverage=leverage,
-            decision_id=decision_id,
-        )
-        plan.tx_results.append(result)
+
+        # In live mode, full perp open requires matcher URL (Day 3). If it's
+        # not configured, gracefully fall back to just allocating margin into
+        # the perp vault so capital is on-venue and ready for Day-3 trading.
+        executor_matcher = getattr(self.executor.config, "matcher_url", None)
+        live = not self.dry_run
+
+        try:
+            result = await self.executor.open_position(
+                symbol=self.config.perp_symbol,
+                side=side,
+                size_usd=size_usd,
+                leverage=leverage,
+                decision_id=decision_id,
+            )
+            plan.tx_results.append(result)
+        except NotImplementedError as exc:
+            if not live or executor_matcher:
+                raise
+            logger.warning(
+                "Perp open not yet wired (matcher URL missing); "
+                "falling back to margin deposit. Reason: {}",
+                exc,
+            )
+            margin = max(Decimal("1"), size_usd / max(leverage, Decimal("1")))
+            margin = margin.quantize(Decimal("0.000001"))
+            plan.action = "deposit_margin"
+            plan.size_usd = margin
+            plan.extra["fallback_reason"] = str(exc)
+            deposit_res = await self.executor.deposit_margin(
+                amount_usd=margin, decision_id=decision_id
+            )
+            plan.tx_results.append(deposit_res)
         return plan
 
     async def _do_close(

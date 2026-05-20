@@ -20,6 +20,12 @@ web3==6.20.1
 eth-account==0.11.3
 eth-abi==5.1.0
 
+# --- Circle Developer-Controlled Wallets SDK (scripts/setup) ---
+circle-developer-controlled-wallets==9.0.0
+
+# --- Crypto (RSA-OAEP encryption of Circle entity secret) ---
+cryptography==43.0.1
+
 # --- Data & signals (Level 1: technical rules) ---
 numpy==1.26.4
 pandas==2.2.2
