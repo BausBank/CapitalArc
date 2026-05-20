@@ -1,64 +1,81 @@
 -- CapitalArc / Level 2 / volume
 -- ----------------------------------------------------------------
--- Returns last price, 24h price change, 24h volume and 1h volume per
--- symbol. Level 2 uses the (1h vs 24h) ratio to detect volume spikes.
+-- Per-symbol spot-DEX volume snapshot (1h + 24h) plus last price and
+-- 24h price change. Level 2 uses the (1h vs 24h-mean) ratio to detect
+-- volume spikes.
+--
+-- Data source
+-- -----------
+-- `dex.trades` (Dune multichain spot DEX trades). Until Arc is
+-- indexed, this is the most reliable, highest-liquidity feed for
+-- BTC / ETH / SOL.
 --
 -- Parameters
 -- ----------
---   {{chain}}            text
---   {{lookback_hours}}   number
---   {{symbols}}          text   - comma-separated list of perp symbols
+--   {{chain}}              text   - 'ethereum' / 'base' / 'arbitrum'
+--   {{lookback_hours}}     number - rolling window
+--   {{btc_token_address}}  text
+--   {{eth_token_address}}  text
+--   {{sol_token_address}}  text
 --
--- Schema expectation: `{{chain}}_perp_dex.fills` rows of
--- (symbol, fill_time, price, size, notional_usd).
+-- Output (one row per symbol)
+-- ---------------------------
+--   symbol                BTC-PERP / ETH-PERP / SOL-PERP
+--   last_price            most recent trade price (USD)
+--   price_change_pct_24h  % change over the lookback window
+--   volume_24h_usd        sum of `amount_usd` over the window
+--   volume_1h_usd         sum of `amount_usd` in the latest 1h
 
 WITH symbols AS (
-    SELECT trim(value) AS symbol
-    FROM unnest(split('{{symbols}}', ',')) AS t(value)
+    SELECT 'BTC-PERP'                            AS symbol,
+           lower('{{btc_token_address}}')        AS token_address
+    UNION ALL
+    SELECT 'ETH-PERP', lower('{{eth_token_address}}')
+    UNION ALL
+    SELECT 'SOL-PERP', lower('{{sol_token_address}}')
 ),
 window AS (
     SELECT
-        f.symbol,
-        f.fill_time,
-        f.price,
-        f.notional_usd
-    FROM {{chain}}_perp_dex.fills AS f
-    INNER JOIN symbols USING (symbol)
-    WHERE f.fill_time
-          >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+        s.symbol,
+        t.block_time,
+        t.amount_usd,
+        CASE
+            WHEN lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+                THEN t.amount_usd / NULLIF(t.token_bought_amount, 0)
+            ELSE t.amount_usd / NULLIF(t.token_sold_amount, 0)
+        END AS price
+    FROM dex.trades AS t
+    INNER JOIN symbols AS s
+        ON (
+            lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+         OR lower(CAST(t.token_sold_address   AS varchar)) = s.token_address
+        )
+    WHERE t.blockchain = '{{chain}}'
+      AND t.block_time >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+      AND t.amount_usd >= 100
+      AND (
+        lower(CAST(t.token_bought_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+        OR lower(CAST(t.token_sold_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+      )
 ),
 agg AS (
     SELECT
         symbol,
-        MAX(fill_time)                                                AS last_fill_time,
-        SUM(notional_usd)                                             AS volume_24h_usd,
-        SUM(CASE WHEN fill_time >= NOW() - INTERVAL '1' HOUR
-                 THEN notional_usd ELSE 0 END)                        AS volume_1h_usd
+        SUM(amount_usd)                                                AS volume_24h_usd,
+        SUM(CASE WHEN block_time >= NOW() - INTERVAL '1' HOUR
+                 THEN amount_usd ELSE 0 END)                           AS volume_1h_usd,
+        MAX_BY(price, block_time)                                      AS last_price,
+        MIN_BY(price, block_time)                                      AS first_price
     FROM window
     GROUP BY symbol
-),
-last_price_per_symbol AS (
-    SELECT DISTINCT ON (symbol)
-        symbol,
-        price
-    FROM window
-    ORDER BY symbol, fill_time DESC
-),
-oldest_price_per_symbol AS (
-    SELECT DISTINCT ON (symbol)
-        symbol,
-        price
-    FROM window
-    ORDER BY symbol, fill_time ASC
 )
 SELECT
-    s.symbol                                                              AS symbol,
-    lp.price                                                              AS last_price,
-    100.0 * (lp.price - op.price) / NULLIF(op.price, 0)                   AS price_change_pct_24h,
-    a.volume_24h_usd                                                      AS volume_24h_usd,
-    a.volume_1h_usd                                                       AS volume_1h_usd
+    s.symbol                                                           AS symbol,
+    COALESCE(a.last_price, 0)                                          AS last_price,
+    COALESCE(100.0 * (a.last_price - a.first_price)
+             / NULLIF(a.first_price, 0), 0)                            AS price_change_pct_24h,
+    COALESCE(a.volume_24h_usd, 0)                                      AS volume_24h_usd,
+    COALESCE(a.volume_1h_usd, 0)                                       AS volume_1h_usd
 FROM symbols AS s
 LEFT JOIN agg AS a USING (symbol)
-LEFT JOIN last_price_per_symbol AS lp USING (symbol)
-LEFT JOIN oldest_price_per_symbol AS op USING (symbol)
 ORDER BY s.symbol;

@@ -1,59 +1,110 @@
--- CapitalArc / Level 2 / funding_rates
+-- CapitalArc / Level 2 / funding_rates  (spot-derived proxy)
 -- ----------------------------------------------------------------
--- Returns the latest funding rate snapshot for each Arc Perp DEX
--- symbol the agent trades (BTC-PERP, ETH-PERP, SOL-PERP).
+-- Spot DEXes (Uniswap / Aerodrome / Sushiswap) don't pay periodic
+-- funding the way perp venues do, but they expose the same *demand
+-- imbalance* signal that a funding rate captures: when one side of
+-- the market is aggressively paying through, the next periodic
+-- settlement on a perp would charge them. We compute that imbalance
+-- directly from `dex.trades`:
+--
+--   imbalance(window) = (buy_usd - sell_usd) / total_usd
+--
+--   "buy_usd"  = trades where the asset (WBTC / WETH / SOL) was the
+--                token_bought   (i.e. takers paid USD to receive it)
+--   "sell_usd" = trades where the asset was the token_sold
+--                (takers paid the asset to receive USD)
+--
+-- We then scale the imbalance into a per-8h "funding-equivalent" rate
+-- using a fixed coefficient. Output schema matches the perp version
+-- one-for-one so Level 2 can keep its existing extractor:
+--
+--   symbol, current_rate, rate_8h_change, rate_24h_change,
+--   weighted_average_24h, annualised_pct
 --
 -- Parameters
 -- ----------
---   {{chain}}            text   - Dune chain tag, e.g. 'arc' / 'arc_testnet'
---   {{lookback_hours}}   number - rolling window for the 24h aggregates
---   {{symbols}}          text   - comma-separated list of perp symbols
---
--- Notes
--- -----
--- The `prices.minute` / `dex.trades`-style tables used below assume
--- Arc's perp DEX is indexed under the `{{chain}}_perp_dex` namespace
--- on Dune. Until Arc lands in the official Dune data catalog, save
--- this query with placeholder data so the agent's "metric configured"
--- branch fires and you can iterate on the rest of the pipeline.
+--   {{chain}}              text
+--   {{lookback_hours}}     number   - main window (24h typical)
+--   {{btc_token_address}}  text
+--   {{eth_token_address}}  text
+--   {{sol_token_address}}  text
 
 WITH symbols AS (
-    SELECT trim(value) AS symbol
-    FROM unnest(split('{{symbols}}', ',')) AS t(value)
+    SELECT 'BTC-PERP'                            AS symbol,
+           lower('{{btc_token_address}}')        AS token_address
+    UNION ALL
+    SELECT 'ETH-PERP', lower('{{eth_token_address}}')
+    UNION ALL
+    SELECT 'SOL-PERP', lower('{{sol_token_address}}')
 ),
-events AS (
+flows AS (
     SELECT
-        ev.symbol                         AS symbol,
-        ev.funding_rate                   AS rate,
-        ev.funding_time                   AS funding_time,
-        ev.notional_usd                   AS notional_usd
-    FROM {{chain}}_perp_dex.funding_events AS ev
-    INNER JOIN symbols USING (symbol)
-    WHERE ev.funding_time
-          >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+        s.symbol,
+        t.block_time,
+        CASE
+            WHEN lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+                THEN t.amount_usd
+            ELSE -t.amount_usd
+        END AS signed_usd,
+        t.amount_usd AS gross_usd
+    FROM dex.trades AS t
+    INNER JOIN symbols AS s
+        ON (
+            lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+         OR lower(CAST(t.token_sold_address   AS varchar)) = s.token_address
+        )
+    WHERE t.blockchain = '{{chain}}'
+      AND t.block_time >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+      AND t.amount_usd >= 500
+      AND (
+        lower(CAST(t.token_bought_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+        OR lower(CAST(t.token_sold_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+      )
 ),
-ranked AS (
+imbalance AS (
     SELECT
         symbol,
-        rate,
-        funding_time,
-        notional_usd,
-        ROW_NUMBER() OVER (
-            PARTITION BY symbol
-            ORDER BY funding_time DESC
-        ) AS rn
-    FROM events
+        -- per-8h imbalance (current bucket)
+        COALESCE(
+            SUM(CASE WHEN block_time >= NOW() - INTERVAL '8'  HOUR THEN signed_usd END)
+            / NULLIF(SUM(CASE WHEN block_time >= NOW() - INTERVAL '8' HOUR THEN gross_usd END), 0),
+            0
+        ) AS imb_now,
+        COALESCE(
+            SUM(CASE WHEN block_time >= NOW() - INTERVAL '16' HOUR
+                      AND block_time <  NOW() - INTERVAL '8'  HOUR THEN signed_usd END)
+            / NULLIF(SUM(CASE WHEN block_time >= NOW() - INTERVAL '16' HOUR
+                                AND block_time <  NOW() - INTERVAL '8'  HOUR
+                              THEN gross_usd END), 0),
+            0
+        ) AS imb_prev_8h,
+        COALESCE(
+            SUM(CASE WHEN block_time >= NOW() - INTERVAL '24' HOUR
+                      AND block_time <  NOW() - INTERVAL '16' HOUR THEN signed_usd END)
+            / NULLIF(SUM(CASE WHEN block_time >= NOW() - INTERVAL '24' HOUR
+                                AND block_time <  NOW() - INTERVAL '16' HOUR
+                              THEN gross_usd END), 0),
+            0
+        ) AS imb_prev_24h,
+        COALESCE(
+            SUM(signed_usd) / NULLIF(SUM(gross_usd), 0),
+            0
+        ) AS imb_24h_avg
+    FROM flows
+    GROUP BY symbol
 )
 SELECT
-    s.symbol                                                  AS symbol,
-    MAX(CASE WHEN r.rn = 1 THEN r.rate END)                   AS current_rate,
-    MAX(CASE WHEN r.rn = 1 THEN r.rate END)
-        - MAX(CASE WHEN r.rn = 2 THEN r.rate END)             AS rate_8h_change,
-    MAX(CASE WHEN r.rn = 1 THEN r.rate END)
-        - MAX(CASE WHEN r.rn = 4 THEN r.rate END)             AS rate_24h_change,
-    AVG(CASE WHEN r.rn <= 3 THEN r.rate END)                  AS weighted_average_24h,
-    MAX(CASE WHEN r.rn = 1 THEN r.rate END) * 3 * 365 * 100   AS annualised_pct
+    s.symbol                                                              AS symbol,
+    -- Map imbalance into a per-8h funding-rate scale. 1.0 of imbalance
+    -- -> 0.05% per 8h (≈ 54.75% APR), which roughly matches the upper
+    -- bound of CEX perp funding in extreme regimes.
+    COALESCE(i.imb_now,        0) * 0.0005                                AS current_rate,
+    COALESCE(i.imb_now,        0) * 0.0005
+        - COALESCE(i.imb_prev_8h,  0) * 0.0005                            AS rate_8h_change,
+    COALESCE(i.imb_now,        0) * 0.0005
+        - COALESCE(i.imb_prev_24h, 0) * 0.0005                            AS rate_24h_change,
+    COALESCE(i.imb_24h_avg,    0) * 0.0005                                AS weighted_average_24h,
+    COALESCE(i.imb_now,        0) * 0.0005 * 3 * 365 * 100                AS annualised_pct
 FROM symbols AS s
-LEFT JOIN ranked AS r USING (symbol)
-GROUP BY s.symbol
+LEFT JOIN imbalance AS i USING (symbol)
 ORDER BY s.symbol;

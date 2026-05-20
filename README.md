@@ -98,7 +98,7 @@ CapitalArc/
 - **USYC** — yield-bearing tokenized USDC (risk-off leg)
 
 **Intelligence & Data**
-- **Dune MCP** — the **single source of truth** for both Level 1 (OHLCV / TA) and Level 2 (on-chain intelligence)
+- **Dune MCP** — the **single source of truth** for both Level 1 (OHLCV / TA) and Level 2 (on-chain intelligence). Queries currently target a live, high-liquidity EVM chain (`DUNE_CHAIN=ethereum` by default; `base` / `arbitrum` selectable) because Arc Testnet isn't indexed by Dune yet.
 - **Arc RPC** — used **only** for non-trading account state (wallet, vault TVL, agent margin); never feeds trading signals
 - **Gemini 2.5 Flash** (Google AI Studio) — LLM final arbiter (Level 3)
 
@@ -179,9 +179,20 @@ queries. Arc RPC is still used, but **only** for non-trading account
 state (wallet, vault TVL, agent margin) - it never feeds the
 decision engine.
 
+> **Data path:** Arc Testnet is not yet indexed by Dune Analytics, so
+> the saved queries point at a live, high-liquidity EVM chain
+> (`DUNE_CHAIN=ethereum` by default; `base` and `arbitrum` are wired
+> out of the box). The agent's symbols (`BTC-PERP / ETH-PERP /
+> SOL-PERP`) map to the canonical on-chain wraps of BTC / ETH / SOL
+> on that chain (WBTC or cbBTC, WETH, Wormhole-SOL). Switching chains
+> is a one-line `.env` change because every SQL template is
+> parameterised by chain + token addresses. When Arc lands on Dune,
+> flip `DUNE_CHAIN=arc` and the rest of the pipeline is unchanged.
+
 - **Level 1 — Technical hard rules** (`src/core/level1.py`)
   - OHLCV for **BTC-PERP / ETH-PERP / SOL-PERP** on `15m` and `1h`
-    is fetched through the new **`DuneMarketData`** adapter
+    is reconstructed from Dune's multichain `dex.trades` table
+    through the **`DuneMarketData`** adapter
     (`src/data/dune_market_data.py`), which wraps `DuneMCPClient`
     and runs the `ohlcv` saved query (`dune/queries/ohlcv.sql`).
     The adapter executes one Dune call per cycle for *every*
@@ -219,8 +230,18 @@ decision engine.
     1h / 4h / 24h deltas), volume + 1h-vs-24h spike detection,
     long/short ratio with inferred bias, cumulative funding paid /
     received over the window, whale-activity flag with rationale.
-  - Vault-level metrics: `USDCCollateralVault` TVL and net deposits
-    / withdrawals over the recent window.
+    `volume`, `whale_activity`, `vault_flows`, `market_sentiment`
+    are computed straight from `dex.trades` and
+    `erc20_<chain>.evt_Transfer`. `funding_rates`, `open_interest`,
+    `long_short_ratio` and `cum_funding` are clearly labelled
+    **spot-derived proxies** that capture the same structural signal
+    (buy-vs-sell imbalance, rolling-USD volume, unique-wallet ratio,
+    signed aggressor flow). When a real perp-DEX schema lands on
+    Dune for Arc / Base, the underlying source swaps without
+    touching the rest of the pipeline.
+  - Vault-level metrics: TVL + net deposits / withdrawals over the
+    recent window for the configurable `DUNE_PERP_VAULT_ADDRESS`
+    (defaults to `ARC_PERP_VAULT_ADDRESS`).
   - A market-wide **heat score** in `[0, 1]` labels the regime as
     `risk_on` / `risk_off` / `neutral` / `transition`. When the
     `market_sentiment` Dune query is configured, its `heat` is used
@@ -267,12 +288,17 @@ decision engine.
     and tx state.
 
 - **Config & env**
-  - New settings: `OHLCV_LOOKBACK_HOURS`, `DUNE_CHAIN_TAG`,
-    `DUNE_LOOKBACK_HOURS`, and one `DUNE_QUERY_*_ID` per metric
-    (now including `DUNE_QUERY_OHLCV_ID` for Level 1). Removed:
-    all `BINANCE_*` settings and the `ARC_PERP_TRADE_EVENT_SIG /
-    ARC_PERP_*_DECIMALS / ARC_PERP_OHLCV_LOOKBACK_BLOCKS` family
-    (no more direct Arc-RPC OHLCV scraping).
+  - New settings: `OHLCV_LOOKBACK_HOURS`, `DUNE_CHAIN`
+    (`ethereum` / `base` / `arbitrum`), `DUNE_LOOKBACK_HOURS`,
+    `DUNE_TOKEN_{BTC,ETH,SOL,USDC}_ADDRESS` (overrides for the
+    built-in chain map), `DUNE_PERP_VAULT_ADDRESS` (vault watched
+    by `vault_flows`), `DUNE_WHALE_MIN_USD`, and one
+    `DUNE_QUERY_*_ID` per metric (now including `DUNE_QUERY_OHLCV_ID`
+    for Level 1). Removed: all `BINANCE_*` settings, the
+    `ARC_PERP_TRADE_EVENT_SIG / ARC_PERP_*_DECIMALS /
+    ARC_PERP_OHLCV_LOOKBACK_BLOCKS` family (no more direct Arc-RPC
+    OHLCV scraping), and the old `DUNE_CHAIN_TAG=arc` default
+    (replaced by `DUNE_CHAIN=ethereum`).
 
 ### Day 4 — Planned
 

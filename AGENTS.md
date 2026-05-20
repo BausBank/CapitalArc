@@ -51,10 +51,19 @@ The engine evaluates levels **cascadingly**, not in parallel:
 - **Inputs:** OHLCV on `15m` and `1h` for `BTC-PERP / ETH-PERP /
   SOL-PERP`, fetched through `DuneMarketData`
   (`src/data/dune_market_data.py`) which executes the `ohlcv` saved
-  Dune query (`dune/queries/ohlcv.sql`). **There is no other market
-  data path:** no CEX feed, no Arc-RPC scrape. If Dune returns no
-  rows (or `DUNE_QUERY_OHLCV_ID` is unset), the rule returns
+  Dune query (`dune/queries/ohlcv.sql`) against Dune's multichain
+  `dex.trades` table. **There is no other market data path:** no CEX
+  feed, no Arc-RPC scrape. If Dune returns no rows (or
+  `DUNE_QUERY_OHLCV_ID` is unset), the rule returns
   `ohlcv_unavailable` and the agent refuses to trade.
+- **Chain:** the Arc Testnet isn't yet indexed by Dune, so the SQL
+  template targets a live high-liquidity EVM chain selectable via
+  `DUNE_CHAIN` (default `ethereum`; `base` and `arbitrum` are wired
+  out of the box). The agent's three symbols map to the canonical
+  on-chain wraps of BTC / ETH / SOL on that chain (WBTC or cbBTC,
+  WETH, Wormhole-SOL) - the token map lives in
+  `src/utils/config.py::_DEFAULT_TOKEN_ADDRESSES` and is overridable
+  via `DUNE_TOKEN_*` env vars.
 - **Hard rules:**
   - Trend filter: `close > EMA9 > EMA21` (or mirrored down) on *both*
     timeframes; otherwise `trend_mixed` blocks.
@@ -82,14 +91,31 @@ The engine evaluates levels **cascadingly**, not in parallel:
   no direct RPC reads. This is intentional: by routing every metric
   through Dune we keep the on-chain analytics path consistent,
   cacheable, and shareable as a Dune dashboard.
+- **Chain:** same `DUNE_CHAIN` switch as Level 1. Every SQL template
+  is chain-agnostic and parameterised by the BTC / ETH / SOL token
+  addresses on that chain.
 - **Per-symbol metrics:** funding (current + 8h / 24h delta +
   weighted average + annualised %), open interest (current +
   1h / 4h / 24h deltas), volume + 1h-vs-24h spike detection,
   long/short ratio with inferred bias, cumulative funding paid /
   received over the window, whale-activity flag with rationale.
-- **Vault-level metrics:** `USDCCollateralVault` TVL + net deposits /
-  withdrawals over the recent window, served by the same Dune
-  `vault_flows` query.
+  Because the underlying tape is spot (`dex.trades`), every "perp"
+  metric is a clearly labelled spot-derived proxy that captures the
+  same structural signal:
+  - Funding rate = buy-vs-sell USD imbalance over 8h, scaled to a
+    per-8h funding-equivalent (0.05% / 1.0 of imbalance).
+  - Open interest = rolling-USD volume + 1h/4h/24h deltas.
+  - Long/short ratio = `sum(buy_usd) / sum(sell_usd)` with unique-
+    wallet counts for the account-ratio columns.
+  - Cumulative funding = net signed aggressor flow scaled across the
+    lookback window.
+  When a real perp-DEX schema lands on Dune (Arc, Synthetix V3 perps,
+  etc.) we swap the `dex.trades` source for the perp's `fills` /
+  `funding_events` table and the rest of the pipeline is unchanged.
+- **Vault-level metrics:** TVL + net deposits / withdrawals over the
+  recent window for the address configured in `DUNE_PERP_VAULT_ADDRESS`
+  (defaults to `ARC_PERP_VAULT_ADDRESS`; repoint at any vault on the
+  active chain - e.g. a Synthetix V3 collateral vault on Base).
 - **Aggregation:** Dune `market_sentiment` returns a `heat` in
   `[0, 1]` that Level 2 uses verbatim. When the query isn't
   configured, the engine falls back to a heuristic blend of funding,
@@ -193,12 +219,13 @@ All execution is idempotent: every action is keyed by an internal
 
 1. **On-chain by default.** If an action can happen on Arc through Circle primitives, it must.
 2. **Dune MCP is the single source of truth.** Every market signal - OHLCV (L1) and on-chain intelligence (L2) - reads through a saved Dune query. No CEX feed, no direct RPC market-data scrape. Arc RPC is used **only** for account state (wallet balance, vault TVL, agent margin).
-3. **Deterministic decisions.** Same inputs -> same score -> same action. Gemini is pinned to low temperature and strict JSON output.
-4. **Safety over alpha.** Drawdown guard and stale-data guard always win over signals. L1 hard rules veto trades; they are never softened by L2 / L3.
-5. **Cascade, don't average.** Levels are *gates*, not weighted blobs. If L1 says no, the engine doesn't call L2 / L3 and never produces a false-positive risk-on.
-6. **Honest provenance.** Every metric (L1 OHLCV included) reports its Dune query id (or `n/a` with a clear note) so users always know whether a number is on-chain truth or a placeholder.
-7. **Observable.** Every decision logs its inputs, level scores, final score, action and tx hash. The CLI renders a six-panel rich report on each cycle.
-8. **Modular.** Each level is replaceable; the router does not care how a score was computed.
+3. **Chain-portable, not chain-coupled.** The decision engine reads from whatever chain `DUNE_CHAIN` points at (`ethereum` / `base` / `arbitrum` shipped today). Switching is a one-line `.env` change because every SQL template is parameterised by chain + token addresses.
+4. **Deterministic decisions.** Same inputs -> same score -> same action. Gemini is pinned to low temperature and strict JSON output.
+5. **Safety over alpha.** Drawdown guard and stale-data guard always win over signals. L1 hard rules veto trades; they are never softened by L2 / L3.
+6. **Cascade, don't average.** Levels are *gates*, not weighted blobs. If L1 says no, the engine doesn't call L2 / L3 and never produces a false-positive risk-on.
+7. **Honest provenance.** Every metric (L1 OHLCV included) reports its Dune query id (or `n/a` with a clear note) so users always know whether a number is on-chain truth or a placeholder. Spot-derived "perp" proxies (funding / OI / L-S / cum funding) are labelled as such in the SQL header comments.
+8. **Observable.** Every decision logs its inputs, level scores, final score, action and tx hash. The CLI renders a six-panel rich report on each cycle.
+9. **Modular.** Each level is replaceable; the router does not care how a score was computed.
 
 ---
 
@@ -208,5 +235,5 @@ All execution is idempotent: every action is keyed by an internal
 |-----|-------------|------------------------------------------------------------------------------------|
 | 1   | ✅ Done     | Repository scaffolding, three-level stubs, secret hygiene.                         |
 | 2   | ✅ Done     | Live Arc Perp DEX margin moves through Circle DCW + Paymaster + RSA encryption.    |
-| 3   | ✅ Done     | Level 1 + Level 2 fully implemented with **Dune MCP as the single source of truth** (OHLCV via `DuneMarketData` + 8 on-chain metrics, all carrying per-query provenance, SQL templates in `dune/queries/`). Cascading engine with short-circuit. Rich-panel CLI. Arc RPC kept only for account state. |
+| 3   | ✅ Done     | Level 1 + Level 2 fully implemented with **Dune MCP as the single source of truth** on live Ethereum / Base / Arbitrum data (Arc Testnet isn't indexed by Dune yet). OHLCV via `DuneMarketData` on `dex.trades` + 8 on-chain metrics (volume / whale flows are real; funding / OI / L-S / cum funding are spot-derived proxies clearly labelled in the SQL). All metrics carry per-query provenance; SQL templates in `dune/queries/`. Chain is one-line switchable via `DUNE_CHAIN`. Cascading engine with short-circuit. Rich-panel CLI. Arc RPC kept only for account state. |
 | 4   | 🚧 Planned  | Real Gemini 2.5 Flash arbiter (L3), EIP-712 order signing for `open_position`, USYC rotation on risk-off, JSONL decision log. |

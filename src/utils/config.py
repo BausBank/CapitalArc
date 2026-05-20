@@ -86,7 +86,17 @@ class Settings(BaseSettings):
     # ---------- USDC ----------
     USDC_TOKEN_ADDRESS: str | None = None
 
-    # ---------- Dune MCP (Level 2 - the only L2 data source) ----------
+    # ---------- Dune MCP (single source of truth for L1 + L2) ----------
+    # Day-3 (post-Arc): the Dune Analytics catalogue does not yet
+    # index Arc Testnet, so all market signals are sourced from a
+    # live, high-liquidity EVM chain (Ethereum mainnet by default,
+    # Base / Arbitrum trivially switchable). The agent's symbols
+    # (BTC-PERP / ETH-PERP / SOL-PERP) map to the canonical on-chain
+    # representations of those assets (WBTC / WETH / Wormhole-SOL on
+    # Ethereum; cbBTC / WETH / Wormhole-SOL on Base). Spot DEX trades
+    # (`dex.trades`) feed both Level 1 OHLCV and the Level 2 metrics;
+    # ERC-20 `Transfer` events (`erc20_<chain>.evt_Transfer`) drive
+    # the whale-activity and vault-flow queries.
     DUNE_API_KEY: str | None = None
     DUNE_MCP_URL: str = "https://mcp.dune.com/sse"
     # Dune REST endpoint used to actually execute queries (the MCP SSE
@@ -94,9 +104,30 @@ class Settings(BaseSettings):
     # one we hit programmatically with the same DUNE_API_KEY).
     DUNE_API_BASE_URL: str = "https://api.dune.com/api/v1"
     DUNE_CACHE_TTL_SECONDS: int = 300
-    # Chain tag passed to the Dune SQL templates (see dune/queries/*.sql).
-    DUNE_CHAIN_TAG: str = "arc"
+    # Active chain that Level 1 / Level 2 read from. Must match the
+    # value of the `blockchain` column on Dune's `dex.trades` (and the
+    # `erc20_<chain>` schema name). Supported out of the box:
+    # `ethereum`, `base`, `arbitrum`. Pin one and the agent uses it
+    # for *every* signal - SQL templates are chain-agnostic.
+    DUNE_CHAIN: str = "ethereum"
     DUNE_LOOKBACK_HOURS: int = 24
+
+    # ---------- Per-symbol token addresses (resolved against DUNE_CHAIN) ----------
+    # If left blank, defaults from `_DEFAULT_TOKEN_ADDRESSES` are used.
+    # Override via .env when you point at a chain we haven't pre-mapped
+    # or want to track a different wrapping (e.g. cbBTC vs WBTC on Base).
+    DUNE_TOKEN_BTC_ADDRESS: str | None = None
+    DUNE_TOKEN_ETH_ADDRESS: str | None = None
+    DUNE_TOKEN_SOL_ADDRESS: str | None = None
+    DUNE_TOKEN_USDC_ADDRESS: str | None = None
+    # Address watched by `vault_flows.sql` for USDC deposits /
+    # withdrawals. Defaults to a placeholder of the Arc Perp DEX
+    # collateral vault; users can repoint to any address they want
+    # to monitor (e.g. an Aave / GMX vault on the chosen chain).
+    DUNE_PERP_VAULT_ADDRESS: str | None = None
+    # USD threshold above which a single ERC-20 transfer counts as
+    # "whale activity" in `whale_activity.sql`.
+    DUNE_WHALE_MIN_USD: float = 250_000.0
 
     # Per-metric saved Dune query ids. Leave any of these unset and
     # the corresponding metric is reported as `n/a` (no fake zeros).
@@ -158,6 +189,41 @@ class Settings(BaseSettings):
         return [t.strip() for t in self.L1_TIMEFRAMES.split(",") if t.strip()]
 
     @property
+    def dune_chain(self) -> str:
+        """Active chain tag (always lower-case to match Dune's column)."""
+        return (self.DUNE_CHAIN or "ethereum").strip().lower()
+
+    @property
+    def dune_token_addresses(self) -> dict[str, str]:
+        """Per-symbol token addresses resolved against `DUNE_CHAIN`.
+
+        Returns a `{"BTC-PERP": "0x..", "ETH-PERP": "0x..", ...}`
+        mapping that the Dune SQL templates use to filter
+        `dex.trades` / `erc20_<chain>.evt_Transfer` to the assets the
+        agent tracks. `.env` overrides win over the built-in chain map
+        so you can repoint to any token (e.g. cbBTC instead of WBTC).
+        """
+        chain_defaults = _DEFAULT_TOKEN_ADDRESSES.get(self.dune_chain, {})
+        resolved = {
+            "BTC-PERP": (
+                self.DUNE_TOKEN_BTC_ADDRESS or chain_defaults.get("BTC")
+            ),
+            "ETH-PERP": (
+                self.DUNE_TOKEN_ETH_ADDRESS or chain_defaults.get("ETH")
+            ),
+            "SOL-PERP": (
+                self.DUNE_TOKEN_SOL_ADDRESS or chain_defaults.get("SOL")
+            ),
+        }
+        return {sym: addr for sym, addr in resolved.items() if addr}
+
+    @property
+    def dune_usdc_address(self) -> str | None:
+        """Resolved USDC address on `DUNE_CHAIN` (env override > default)."""
+        chain_defaults = _DEFAULT_TOKEN_ADDRESSES.get(self.dune_chain, {})
+        return self.DUNE_TOKEN_USDC_ADDRESS or chain_defaults.get("USDC")
+
+    @property
     def dune_query_ids(self) -> dict[str, int]:
         """Per-metric saved Dune query ids, keyed by metric name.
 
@@ -184,6 +250,47 @@ class Settings(BaseSettings):
             "level2": self.WEIGHT_LEVEL2,
             "level3": self.WEIGHT_LEVEL3,
         }
+
+
+# ---------------------------------------------------------------------------
+# Chain -> token-address map
+# ---------------------------------------------------------------------------
+# Canonical on-chain representations of BTC / ETH / SOL on each EVM chain
+# we support. Used to resolve `dune_token_addresses` when the .env doesn't
+# override the address explicitly. Always lower-cased.
+
+_DEFAULT_TOKEN_ADDRESSES: dict[str, dict[str, str]] = {
+    "ethereum": {
+        # WBTC - canonical Bitcoin wrap on Ethereum mainnet.
+        "BTC": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+        # WETH - canonical Ether wrap on Ethereum mainnet.
+        "ETH": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        # Wormhole-wrapped SOL on Ethereum mainnet.
+        "SOL": "0xd31a59c85ae9d8edefec411d448f90841571b89c",
+        # Circle USDC on Ethereum mainnet.
+        "USDC": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    },
+    "base": {
+        # Coinbase-wrapped BTC on Base (cbBTC, the dominant BTC token).
+        "BTC": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+        # Canonical Base WETH (predeploy).
+        "ETH": "0x4200000000000000000000000000000000000006",
+        # Wormhole-wrapped SOL on Base.
+        "SOL": "0x1c61629598e4a901136a81bc138e5828dc150d67",
+        # Native USDC on Base.
+        "USDC": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    },
+    "arbitrum": {
+        # WBTC on Arbitrum One.
+        "BTC": "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f",
+        # WETH on Arbitrum One.
+        "ETH": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        # Wormhole-wrapped SOL on Arbitrum One.
+        "SOL": "0x2bcc6d6cdbbdc0a4071e48bb3b969b06b3330c07",
+        # Native USDC on Arbitrum One.
+        "USDC": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+    },
+}
 
 
 @lru_cache(maxsize=1)

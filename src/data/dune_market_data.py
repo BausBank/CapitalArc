@@ -6,6 +6,21 @@ scanning Arc Perp DEX trade events through Arc RPC; that path is now
 replaced by a single Dune saved query whose SQL template lives at
 `dune/queries/ohlcv.sql`.
 
+Chain & data source
+-------------------
+The Arc Testnet isn't indexed by Dune yet, so the saved query
+reconstructs OHLCV from `dex.trades` on a live, high-liquidity EVM
+chain (`ethereum` by default; `base` / `arbitrum` are trivially
+selectable via `DuneMarketDataConfig.chain`). The agent's three
+symbols map to the canonical on-chain wraps of BTC / ETH / SOL:
+
+    BTC-PERP -> WBTC  on ethereum / cbBTC on base
+    ETH-PERP -> WETH  on every chain
+    SOL-PERP -> Wormhole-wrapped SOL on every chain
+
+The token-address mapping is supplied here at runtime so the SQL
+template stays chain-agnostic.
+
 Architecture
 ------------
 `DuneMarketData` wraps a `DuneMCPClient` and exposes a small surface
@@ -60,7 +75,7 @@ from src.utils.logging import logger
 class DuneMarketDataConfig:
     """Configuration for the Dune-backed OHLCV adapter."""
 
-    chain: str = "arc"
+    chain: str = "ethereum"
     symbols: list[str] = field(
         default_factory=lambda: ["BTC-PERP", "ETH-PERP", "SOL-PERP"]
     )
@@ -71,6 +86,12 @@ class DuneMarketDataConfig:
     # reading the cached `latest_results`. Use sparingly - executions
     # consume Dune query credits.
     execute_each_cycle: bool = False
+    # Per-symbol token addresses on `chain` (e.g. WBTC / WETH / SOL
+    # wraps). The OHLCV SQL filters `dex.trades` to rows touching
+    # these addresses. Empty values get treated as "metric n/a" so
+    # the agent honestly blocks on `ohlcv_unavailable`.
+    token_addresses: dict[str, str] = field(default_factory=dict)
+    min_trade_usd: float = 1000.0
 
 
 @dataclass
@@ -165,11 +186,18 @@ class DuneMarketData:
             )
             return
 
+        token_map = {
+            k.upper(): v for k, v in (self.config.token_addresses or {}).items()
+        }
         params = {
             "chain": self.config.chain,
             "symbols": ",".join(self.config.symbols),
             "intervals": ",".join(self.config.intervals),
             "lookback_hours": self.config.lookback_hours,
+            "btc_token_address": token_map.get("BTC-PERP", ""),
+            "eth_token_address": token_map.get("ETH-PERP", ""),
+            "sol_token_address": token_map.get("SOL-PERP", ""),
+            "min_trade_usd": self.config.min_trade_usd,
         }
         try:
             fetch = await self.dune.fetch_metric(

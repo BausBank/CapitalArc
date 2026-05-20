@@ -6,21 +6,35 @@ Bearer-authenticated REST API) - and aggregates the result into a
 structured, actionable on-chain read for the three perp symbols we
 trade (`BTC-PERP`, `ETH-PERP`, `SOL-PERP`).
 
+Chain & data source
+-------------------
+The Arc Testnet isn't yet indexed by Dune, so every Level 2 metric
+is computed against a live, high-liquidity EVM chain (`ethereum`
+by default; `base` / `arbitrum` selectable via `Level2Config.chain`).
+The SQL templates target `dex.trades` (multichain spot DEX trades)
+and `erc20_<chain>.evt_Transfer`, with the BTC / ETH / SOL token
+addresses passed in as Dune query parameters. The structural
+signal Level 2 cares about (buy/sell imbalance, volume, whale
+flows, sentiment heat) translates 1:1 from spot to perp.
+
 What Level 2 measures
 ---------------------
 Per symbol:
 
-    * Funding rates       - current + 8h / 24h change, weighted average
-    * Open interest       - total + 1h / 4h / 24h deltas
-    * Trading volume      - 1h / 24h totals + 24h spike flag
-    * Long/short ratio    - account ratio or inferred from OI + price
-    * Whale activity      - large position / OI moves in the last hour
-    * Cumulative funding  - longs paid vs shorts paid over the window
+    * Funding rates       - spot-derived imbalance proxy (current +
+                            8h / 24h delta, weighted average,
+                            annualised %).
+    * Open interest       - rolling-USD-volume proxy (total +
+                            1h / 4h / 24h deltas).
+    * Trading volume      - 1h / 24h spot DEX totals + spike flag.
+    * Long/short ratio    - inferred from buy-vs-sell USD volume.
+    * Whale activity      - large spot trades + ERC-20 transfers.
+    * Cumulative funding  - scaled net aggressor flow over window.
 
 Vault-level:
 
-    * Perp Vault TVL      - USDC sitting in `USDCCollateralVault`
-    * Net deposits/withdrawals into the vault over the recent window
+    * Vault TVL           - USDC balance of `DUNE_PERP_VAULT_ADDRESS`
+    * Net deposits/withdrawals into that vault over the window.
 
 Market-wide:
 
@@ -70,12 +84,20 @@ class Level2Config:
     symbols: list[str] = field(
         default_factory=lambda: ["BTC-PERP", "ETH-PERP", "SOL-PERP"]
     )
-    chain: str = "arc"               # Dune chain tag used as a query param
+    chain: str = "ethereum"              # Dune chain tag used as a query param
     lookback_hours: int = 24
     cache_ttl_seconds: int = 1800
     demo_mode: bool = True
     whale_oi_delta_pct: float = 5.0
     volume_spike_z: float = 1.5
+    whale_min_usd: float = 250_000.0
+    # Per-symbol token addresses on `chain`. The Level 2 queries
+    # filter `dex.trades` to rows touching these addresses.
+    token_addresses: dict[str, str] = field(default_factory=dict)
+    # USDC token address on `chain` (used by vault_flows).
+    usdc_address: str | None = None
+    # Address watched by `vault_flows` for USDC deposits / withdrawals.
+    vault_address: str | None = None
     # Used by the heuristic regime classifier when the Dune-side
     # `market_sentiment` query is not configured.
     risk_on_heat: float = 0.62
@@ -349,10 +371,19 @@ class Level2:
         self, symbols: list[str]
     ) -> dict[str, MetricFetch]:
         """Run every named metric query in parallel."""
-        common_params = {
+        token_map = {
+            k.upper(): v for k, v in (self.config.token_addresses or {}).items()
+        }
+        common_params: dict[str, Any] = {
             "chain": self.config.chain,
             "lookback_hours": self.config.lookback_hours,
             "symbols": ",".join(symbols),
+            "btc_token_address": token_map.get("BTC-PERP", ""),
+            "eth_token_address": token_map.get("ETH-PERP", ""),
+            "sol_token_address": token_map.get("SOL-PERP", ""),
+            "whale_min_usd": self.config.whale_min_usd,
+            "vault_address": self.config.vault_address or "",
+            "usdc_address": self.config.usdc_address or "",
         }
         metric_names = (
             "funding_rates",

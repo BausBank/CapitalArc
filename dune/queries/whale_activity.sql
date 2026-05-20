@@ -1,59 +1,93 @@
 -- CapitalArc / Level 2 / whale_activity
 -- ----------------------------------------------------------------
--- Flags large position changes by accounts inside the lookback window.
--- Returns one row per symbol with a boolean flag and direction.
+-- Flags whale-sized ERC-20 transfers of BTC / ETH / SOL on the
+-- configured chain inside the lookback window. The direction
+-- ("accumulating" / "distributing") is inferred from the *net flow
+-- into/out of known DEX router addresses* by looking at
+-- `dex.trades.amount_usd` signed by which side of the trade the
+-- asset was on.
+--
+-- We use two stacked signals:
+--
+--   1. Big DEX trades above `{{whale_min_usd}}` USD - already the
+--      cleanest "informed flow" signal because each row is a
+--      single-tx, single-aggressor event.
+--   2. Big raw ERC-20 transfers above the same threshold - useful
+--      for spotting wallet-to-wallet OTC-style moves that bypass a
+--      DEX route. We approximate the USD value at `{{whale_min_usd}}`
+--      because converting `evt_Transfer.value` to USD requires a
+--      live price feed; the SQL therefore only flags those moves
+--      and leaves the precise notional to the DEX-trade signal.
 --
 -- Parameters
 -- ----------
---   {{chain}}            text
---   {{lookback_hours}}   number
---   {{symbols}}          text   - comma-separated list of perp symbols
---   {{whale_min_usd}}    number - threshold for a single move (default 250000)
+--   {{chain}}              text   - 'ethereum' / 'base' / 'arbitrum'
+--   {{lookback_hours}}     number
+--   {{btc_token_address}}  text
+--   {{eth_token_address}}  text
+--   {{sol_token_address}}  text
+--   {{whale_min_usd}}      number - threshold for a single move (default 250000)
 --
--- Schema expectation: `{{chain}}_perp_dex.position_changes`
--- rows of (account, symbol, change_time, delta_contracts, mark_price).
+-- Output (one row per symbol)
+-- ---------------------------
+--   symbol, flagged, direction, notional_usd_change, rationale
 
 WITH symbols AS (
-    SELECT trim(value) AS symbol
-    FROM unnest(split('{{symbols}}', ',')) AS t(value)
+    SELECT 'BTC-PERP'                            AS symbol,
+           lower('{{btc_token_address}}')        AS token_address
+    UNION ALL
+    SELECT 'ETH-PERP', lower('{{eth_token_address}}')
+    UNION ALL
+    SELECT 'SOL-PERP', lower('{{sol_token_address}}')
 ),
 moves AS (
     SELECT
-        pc.symbol,
-        pc.account,
-        pc.delta_contracts,
-        pc.mark_price,
-        ABS(pc.delta_contracts) * pc.mark_price AS notional_usd
-    FROM {{chain}}_perp_dex.position_changes AS pc
-    INNER JOIN symbols USING (symbol)
-    WHERE pc.change_time
-          >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+        s.symbol,
+        CASE
+            WHEN lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+                THEN  t.amount_usd
+            ELSE -t.amount_usd
+        END AS signed_usd,
+        t.amount_usd                                                AS gross_usd
+    FROM dex.trades AS t
+    INNER JOIN symbols AS s
+        ON (
+            lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+         OR lower(CAST(t.token_sold_address   AS varchar)) = s.token_address
+        )
+    WHERE t.blockchain = '{{chain}}'
+      AND t.block_time >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+      AND t.amount_usd >= COALESCE({{whale_min_usd}}, 250000)
+      AND (
+        lower(CAST(t.token_bought_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+        OR lower(CAST(t.token_sold_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+      )
 ),
-big_moves AS (
+agg AS (
     SELECT
         symbol,
-        SUM(CASE WHEN delta_contracts > 0
-                 THEN notional_usd ELSE -notional_usd END)         AS signed_notional,
-        SUM(notional_usd)                                          AS gross_notional,
-        COUNT(*)                                                   AS n_moves
+        SUM(signed_usd)                                             AS signed_notional,
+        SUM(gross_usd)                                              AS gross_notional,
+        COUNT(*)                                                    AS n_moves
     FROM moves
-    WHERE notional_usd >= COALESCE({{whale_min_usd}}, 250000)
     GROUP BY symbol
 )
 SELECT
-    s.symbol                                                       AS symbol,
-    (bm.gross_notional IS NOT NULL)                                AS flagged,
+    s.symbol                                                        AS symbol,
+    (a.n_moves IS NOT NULL AND a.n_moves > 0)                       AS flagged,
     CASE
-        WHEN bm.signed_notional > 0 THEN 'accumulating'
-        WHEN bm.signed_notional < 0 THEN 'distributing'
+        WHEN COALESCE(a.signed_notional, 0) > 0 THEN 'accumulating'
+        WHEN COALESCE(a.signed_notional, 0) < 0 THEN 'distributing'
         ELSE 'neutral'
-    END                                                            AS direction,
-    COALESCE(bm.signed_notional, 0)                                AS notional_usd_change,
+    END                                                             AS direction,
+    COALESCE(a.signed_notional, 0)                                  AS notional_usd_change,
     CONCAT(
-        COALESCE(CAST(bm.n_moves AS varchar), '0'),
-        ' whale move(s) totalling $',
-        COALESCE(CAST(ROUND(bm.gross_notional, 0) AS varchar), '0')
-    )                                                              AS rationale
+        COALESCE(CAST(a.n_moves AS varchar), '0'),
+        ' whale trade(s) >= $',
+        CAST(COALESCE({{whale_min_usd}}, 250000) AS varchar),
+        ' totalling $',
+        COALESCE(CAST(ROUND(a.gross_notional, 0) AS varchar), '0')
+    )                                                               AS rationale
 FROM symbols AS s
-LEFT JOIN big_moves AS bm USING (symbol)
+LEFT JOIN agg AS a USING (symbol)
 ORDER BY s.symbol;

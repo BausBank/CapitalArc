@@ -108,7 +108,16 @@ def market_context_panel(
     table.add_row("Time (UTC)", ts.strftime("%Y-%m-%d %H:%M:%S"))
     table.add_row("Mode", f"[bold]{mode}[/] (env={app_env})")
     table.add_row("Symbols", ", ".join(context.get("symbols", []) or []))
-    table.add_row("RPC", context.get("rpc_url", "-"))
+    table.add_row("RPC (account state)", context.get("rpc_url", "-"))
+    dune_chain = context.get("dune_chain")
+    if dune_chain:
+        table.add_row("Dune chain", f"[bold]{dune_chain}[/] (dex.trades)")
+    dune_tokens = context.get("dune_tokens") or {}
+    if dune_tokens:
+        short = ", ".join(
+            f"{sym.split('-')[0]}={addr[:6]}.." for sym, addr in dune_tokens.items()
+        )
+        table.add_row("Token map", short)
     if account := context.get("account_address"):
         table.add_row("Agent wallet", account)
     if account_id := context.get("account_id"):

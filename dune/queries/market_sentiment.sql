@@ -1,71 +1,76 @@
 -- CapitalArc / Level 2 / market_sentiment
 -- ----------------------------------------------------------------
--- Single-row result that gives Level 2 a market-wide "heat" score
--- across the three perp symbols (BTC, ETH, SOL). When this query is
--- configured, the agent uses its `heat` directly; otherwise the
--- engine falls back to the per-symbol heuristic.
+-- Single-row "market heat" score in [0, 1] that aggregates the spot
+-- DEX signals across all three perp symbols. When this query is
+-- configured, Level 2 uses its `heat` directly; otherwise the engine
+-- falls back to the per-symbol heuristic baked into `Level2`.
+--
+-- Construction
+-- ------------
+--   1. For each symbol, compute the 24h *imbalance* (buy_usd - sell_usd)
+--      / total_usd, in [-1, 1] (positive = buying pressure).
+--   2. Compute the 24h *price change* (last_price - first_price)
+--      / first_price, clipped to [-0.25, 0.25] (no single asset can
+--      move the score more than ±0.25 from neutral).
+--   3. heat = 0.5 + 0.25 * mean(imbalance)
+--                + 0.5  * clip(mean(price_change), -0.25, 0.25)
+--      clipped to [0, 1].
 --
 -- Parameters
 -- ----------
---   {{chain}}            text
---   {{lookback_hours}}   number
---   {{symbols}}          text
---
--- A reasonable implementation aggregates funding sign, OI 1h delta,
--- 24h price change, long/short ratio and volume into a unit-bounded
--- score; the example below blends OI delta and 24h price change.
+--   {{chain}}              text   - 'ethereum' / 'base' / 'arbitrum'
+--   {{lookback_hours}}     number
+--   {{btc_token_address}}  text
+--   {{eth_token_address}}  text
+--   {{sol_token_address}}  text
 
 WITH symbols AS (
-    SELECT trim(value) AS symbol
-    FROM unnest(split('{{symbols}}', ',')) AS t(value)
+    SELECT 'BTC-PERP'                            AS symbol,
+           lower('{{btc_token_address}}')        AS token_address
+    UNION ALL
+    SELECT 'ETH-PERP', lower('{{eth_token_address}}')
+    UNION ALL
+    SELECT 'SOL-PERP', lower('{{sol_token_address}}')
 ),
-oi_recent AS (
+trades AS (
     SELECT
-        oi.symbol,
-        FIRST_VALUE(oi.contracts) OVER (
-            PARTITION BY oi.symbol
-            ORDER BY oi.snapshot_time DESC
-        ) AS current_contracts,
-        FIRST_VALUE(oi.contracts) OVER (
-            PARTITION BY oi.symbol
-            ORDER BY oi.snapshot_time ASC
-        ) AS earliest_contracts
-    FROM {{chain}}_perp_dex.oi_snapshots AS oi
-    INNER JOIN symbols USING (symbol)
-    WHERE oi.snapshot_time
-          >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
-),
-price_recent AS (
-    SELECT
-        f.symbol,
-        FIRST_VALUE(f.price) OVER (
-            PARTITION BY f.symbol
-            ORDER BY f.fill_time DESC
-        ) AS last_price,
-        FIRST_VALUE(f.price) OVER (
-            PARTITION BY f.symbol
-            ORDER BY f.fill_time ASC
-        ) AS first_price
-    FROM {{chain}}_perp_dex.fills AS f
-    INNER JOIN symbols USING (symbol)
-    WHERE f.fill_time
-          >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+        s.symbol,
+        t.block_time,
+        t.amount_usd,
+        CASE
+            WHEN lower(CAST(t.token_bought_address AS varchar)) = s.token_address THEN t.amount_usd
+            ELSE -t.amount_usd
+        END AS signed_usd,
+        CASE
+            WHEN lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+                THEN t.amount_usd / NULLIF(t.token_bought_amount, 0)
+            ELSE t.amount_usd / NULLIF(t.token_sold_amount, 0)
+        END AS price
+    FROM dex.trades AS t
+    INNER JOIN symbols AS s
+        ON (
+            lower(CAST(t.token_bought_address AS varchar)) = s.token_address
+         OR lower(CAST(t.token_sold_address   AS varchar)) = s.token_address
+        )
+    WHERE t.blockchain = '{{chain}}'
+      AND t.block_time >= NOW() - INTERVAL '{{lookback_hours}}' HOUR
+      AND t.amount_usd >= 500
+      AND (
+        lower(CAST(t.token_bought_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+        OR lower(CAST(t.token_sold_symbol AS varchar)) IN ('usdc', 'usdt', 'dai', 'usdc.e', 'usdbc')
+      )
 ),
 per_symbol AS (
     SELECT
-        s.symbol,
+        symbol,
+        COALESCE(SUM(signed_usd) / NULLIF(SUM(amount_usd), 0), 0)         AS imbalance,
         COALESCE(
-            (o.current_contracts - o.earliest_contracts)
-            / NULLIF(o.earliest_contracts, 0),
+            (MAX_BY(price, block_time) - MIN_BY(price, block_time))
+            / NULLIF(MIN_BY(price, block_time), 0),
             0
-        )                                                              AS oi_change,
-        COALESCE(
-            (p.last_price - p.first_price) / NULLIF(p.first_price, 0),
-            0
-        )                                                              AS price_change
-    FROM symbols AS s
-    LEFT JOIN oi_recent    AS o USING (symbol)
-    LEFT JOIN price_recent AS p USING (symbol)
+        )                                                                 AS price_change
+    FROM trades
+    GROUP BY symbol
 )
 SELECT
     LEAST(
@@ -73,10 +78,16 @@ SELECT
         GREATEST(
             0,
             0.5
-            + AVG(0.5 * oi_change)
-            + AVG(0.5 * price_change)
+            + 0.25 * AVG(imbalance)
+            + 0.5  * AVG(
+                CASE
+                    WHEN price_change >  0.25 THEN  0.25
+                    WHEN price_change < -0.25 THEN -0.25
+                    ELSE price_change
+                END
+            )
         )
-    )                                                                  AS heat,
-    'derived'                                                          AS regime,
-    'heat = 0.5 + mean(0.5*OI_delta + 0.5*price_change_24h) clipped'   AS rationale
+    )                                                                     AS heat,
+    'spot-derived'                                                        AS regime,
+    'heat = 0.5 + 0.25*mean(buy-sell imbalance) + 0.5*clip(mean(24h price change), ±0.25)' AS rationale
 FROM per_symbol;

@@ -104,7 +104,7 @@ def _build_dune_market_data(
     return DuneMarketData(
         dune=dune,
         config=DuneMarketDataConfig(
-            chain=settings.DUNE_CHAIN_TAG,
+            chain=settings.dune_chain,
             symbols=settings.perp_symbols or ["BTC-PERP", "ETH-PERP", "SOL-PERP"],
             intervals=settings.l1_timeframes,
             lookback_hours=settings.OHLCV_LOOKBACK_HOURS,
@@ -113,6 +113,7 @@ def _build_dune_market_data(
                 if settings.DEMO_MODE
                 else settings.DUNE_CACHE_TTL_SECONDS
             ),
+            token_addresses=settings.dune_token_addresses,
         ),
     )
 
@@ -171,7 +172,7 @@ def _build_engine(
     level2 = Level2(
         Level2Config(
             symbols=settings.perp_symbols or ["BTC-PERP", "ETH-PERP", "SOL-PERP"],
-            chain=settings.DUNE_CHAIN_TAG,
+            chain=settings.dune_chain,
             lookback_hours=settings.DUNE_LOOKBACK_HOURS,
             cache_ttl_seconds=(
                 settings.DEMO_CACHE_TTL_SECONDS
@@ -179,6 +180,13 @@ def _build_engine(
                 else settings.DUNE_CACHE_TTL_SECONDS
             ),
             demo_mode=settings.DEMO_MODE,
+            token_addresses=settings.dune_token_addresses,
+            usdc_address=settings.dune_usdc_address,
+            vault_address=(
+                settings.DUNE_PERP_VAULT_ADDRESS
+                or settings.ARC_PERP_VAULT_ADDRESS
+            ),
+            whale_min_usd=settings.DUNE_WHALE_MIN_USD,
         ),
         dune=dune,
     )
@@ -259,6 +267,8 @@ async def _build_market_context(
         "account_unrealized_pnl_usdc": float(pnl),
         "account_drawdown_pct": drawdown_pct,
         "l1_timeframes": settings.l1_timeframes,
+        "dune_chain": settings.dune_chain,
+        "dune_tokens": settings.dune_token_addresses,
     }
 
 
