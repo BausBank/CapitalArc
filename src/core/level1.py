@@ -28,13 +28,12 @@ detail lives in `LevelScore.raw["l1"]` for downstream consumers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
 
-from src.data.binance_client import BinanceClient
+from src.data.arc_market_data import ArcMarketData, KlineFetchResult
 from src.utils.logging import logger
 
 if TYPE_CHECKING:
@@ -152,10 +151,11 @@ class Level1:
     def __init__(
         self,
         config: Level1Config | None = None,
-        binance: BinanceClient | None = None,
+        *,
+        market_data: ArcMarketData,
     ) -> None:
         self.config = config or Level1Config()
-        self.binance = binance or BinanceClient()
+        self.market_data = market_data
 
     async def score(self, market: dict[str, Any]) -> "LevelScore":
         from src.core.decision_engine import LevelScore
@@ -274,20 +274,40 @@ class Level1:
         per_tf_trend: list[str] = []
 
         for tf in self.config.timeframes:
-            df = await self._safe_klines(symbol, tf, self.config.klines_limit)
-            if df is None or df.empty or len(df) < max(
-                self.config.ema_slow, self.config.rsi_period, self.config.atr_period
-            ) + 5:
+            fetch = await self._safe_klines(symbol, tf, self.config.klines_limit)
+            df = fetch.df if fetch is not None else None
+            min_required = (
+                max(
+                    self.config.ema_slow,
+                    self.config.rsi_period,
+                    self.config.atr_period,
+                )
+                + 5
+            )
+            if df is None or df.empty or len(df) < min_required:
+                note_hint = ""
+                if fetch is not None:
+                    fills = fetch.fills
+                    note_hint = (
+                        f" (Arc RPC: fills={fills}, "
+                        f"blocks={fetch.from_block}..{fetch.to_block})"
+                    )
                 blocking.append(
                     Level1Reason(
                         code="ohlcv_unavailable",
                         severity="block",
                         message=(
-                            f"OHLCV for {symbol}@{tf} unavailable or too short - "
-                            "cannot apply technical filters."
+                            f"OHLCV for {symbol}@{tf} unavailable or too short "
+                            "to apply technical filters" + note_hint + "."
                         ),
                         symbol=symbol,
                         timeframe=tf,
+                        metadata={
+                            "fills": fetch.fills if fetch else 0,
+                            "have_bars": int(0 if df is None else len(df)),
+                            "min_required_bars": min_required,
+                            "notes": list(fetch.notes) if fetch else [],
+                        },
                     )
                 )
                 continue
@@ -485,12 +505,12 @@ class Level1:
 
     async def _safe_klines(
         self, symbol: str, tf: str, limit: int
-    ) -> pd.DataFrame | None:
+    ) -> KlineFetchResult | None:
         try:
-            return await self.binance.get_klines(symbol, tf, limit)
+            return await self.market_data.get_klines(symbol, tf, limit)
         except Exception as exc:  # noqa: BLE001 - data degrades to a block
             logger.warning(
-                "Level1: klines fetch failed for {}@{}: {!r}",
+                "Level1: Arc RPC klines fetch failed for {}@{}: {!r}",
                 symbol,
                 tf,
                 exc,

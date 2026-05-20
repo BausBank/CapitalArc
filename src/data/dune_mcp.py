@@ -11,28 +11,55 @@ Dune exposes two surfaces that share authentication (`DUNE_API_KEY`):
 
 For a deterministic agent loop, *we* are the planner (not the LLM), so
 we know which queries to run. We therefore talk to the REST endpoint
-directly with the same `DUNE_API_KEY` token. The interface still mirrors
-the MCP tools (`execute_query`, `latest_results`, `list_queries`,
-`ping`), so callers reason about it as "Dune MCP".
+directly with the same `DUNE_API_KEY` token. The interface still
+mirrors the MCP tools (`execute_query`, `latest_results`, `ping`,
+plus a high-level `fetch_metric`), so callers reason about it as
+"Dune MCP".
 
-This client adds:
-- A small TTL cache so demo loops don't hammer the API.
-- `ping()` that reports whether the credentials are healthy.
-- Graceful degradation: if the API is unreachable or the credentials
-  are missing, methods return `None` and log a warning rather than
-  raising - Level 2 is allowed to operate on partial data.
+Per-metric saved-query-id wiring
+--------------------------------
+Level 2 consumes named metrics: `funding_rates`, `open_interest`,
+`volume`, `vault_flows`, `whale_activity`, `long_short_ratio`,
+`cum_funding`, `market_sentiment`. Each maps to a saved Dune query
+whose id is read from `Settings.dune_query_ids[metric_name]`.
+
+Workflow:
+    1. The user saves the SQL templates from `dune/queries/*.sql`
+       into their Dune workspace. Each save gives a query id.
+    2. The user sets `DUNE_QUERY_<METRIC>_ID` in `.env`.
+    3. `fetch_metric()` executes that saved query, parses the rows
+       and returns them with `MetricFetch.source = "dune:<id>"`.
+
+If a query id is not configured, `fetch_metric()` returns a
+`MetricFetch(source="n/a", ...)` so Level 2 can render the metric
+as "not configured" rather than 0/false-confident. **No fallback to
+non-Dune sources happens inside this client by design** - we keep
+Level 2 honest about provenance.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 from src.utils.logging import logger
+
+
+# Canonical metric names used by Level 2.
+METRIC_NAMES = (
+    "funding_rates",
+    "open_interest",
+    "volume",
+    "vault_flows",
+    "whale_activity",
+    "long_short_ratio",
+    "cum_funding",
+    "market_sentiment",
+)
 
 
 @dataclass
@@ -42,10 +69,12 @@ class DuneMCPClientConfig:
     api_key: str
     api_base_url: str = "https://api.dune.com/api/v1"
     mcp_url: str = "https://mcp.dune.com/sse"
-    cache_ttl_seconds: int = 300
+    cache_ttl_seconds: int = 1800
     timeout_seconds: float = 30.0
     poll_interval_seconds: float = 1.0
     max_poll_seconds: float = 60.0
+    # Per-metric saved Dune query ids. Empty / missing -> "not configured".
+    query_ids: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -60,6 +89,23 @@ class DuneQueryResult:
     @property
     def row_count(self) -> int:
         return len(self.rows)
+
+
+@dataclass
+class MetricFetch:
+    """Outcome of a high-level Level-2 metric fetch."""
+
+    metric: str
+    source: str                  # "dune:<query_id>" | "n/a" | "error"
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    query_id: int | None = None
+    note: str | None = None
+    cached: bool = False
+    fetched_at: float = field(default_factory=time.time)
+
+    @property
+    def available(self) -> bool:
+        return self.source.startswith("dune:")
 
 
 class DuneMCPClient:
@@ -93,15 +139,11 @@ class DuneMCPClient:
             self._client = None
 
     # ------------------------------------------------------------------
-    # MCP-style tools
+    # MCP-style tools (low-level)
     # ------------------------------------------------------------------
 
     async def ping(self) -> bool:
-        """Probe the Dune REST endpoint with the cheapest call available.
-
-        Returns `True` if the API key is healthy. Cached after the first
-        successful call so we don't burn requests on every decision loop.
-        """
+        """Probe the Dune REST endpoint with the cheapest call available."""
         if self._healthy is True:
             return True
         if not self.config.api_key:
@@ -109,9 +151,6 @@ class DuneMCPClient:
             return False
         try:
             client = await self._ensure_client()
-            # `/v1/eolas/health` and similar admin endpoints aren't public,
-            # so the lightest probe is to ask for the well-known "Hello"
-            # query (id=1) latest results. It always exists and is small.
             resp = await client.get("/query/1/results", params={"limit": 1})
             ok = resp.status_code in (200, 404)
             self._healthy = ok
@@ -240,6 +279,70 @@ class DuneMCPClient:
         return None
 
     # ------------------------------------------------------------------
+    # High-level Level-2 metrics
+    # ------------------------------------------------------------------
+
+    async def fetch_metric(
+        self,
+        metric: str,
+        *,
+        params: dict[str, Any] | None = None,
+        execute: bool = False,
+    ) -> MetricFetch:
+        """Fetch a Level-2 metric by name.
+
+        Parameters
+        ----------
+        metric :
+            One of `METRIC_NAMES`.
+        params :
+            Optional Dune query parameters (only used when `execute`).
+        execute :
+            When True, calls `execute_query` (with optional parameters)
+            instead of `latest_results`. Default is False because most
+            of our queries are scheduled and `latest_results` is much
+            cheaper.
+        """
+        if metric not in METRIC_NAMES:
+            return MetricFetch(
+                metric=metric,
+                source="error",
+                note=f"unknown metric {metric!r}",
+            )
+        query_id = self.config.query_ids.get(metric)
+        if not query_id:
+            return MetricFetch(
+                metric=metric,
+                source="n/a",
+                note=(
+                    f"DUNE_QUERY_{metric.upper()}_ID is not configured; "
+                    "save dune/queries/{m}.sql to your Dune workspace "
+                    "and set the id in .env."
+                    .format(m=metric)
+                ),
+            )
+
+        if execute:
+            result = await self.execute_query(query_id, params=params or {})
+        else:
+            result = await self.latest_results(query_id)
+        if result is None:
+            return MetricFetch(
+                metric=metric,
+                source="error",
+                query_id=query_id,
+                note=f"Dune query {query_id} returned an error or no data",
+            )
+        return MetricFetch(
+            metric=metric,
+            source=f"dune:{query_id}",
+            rows=result.rows,
+            query_id=query_id,
+            cached=result.is_cached,
+            fetched_at=result.fetched_at,
+        )
+
+    # ------------------------------------------------------------------
     # Cache helpers
     # ------------------------------------------------------------------
 
@@ -280,3 +383,12 @@ class DuneMCPClient:
         if not isinstance(rows, list):
             return []
         return [r for r in rows if isinstance(r, dict)]
+
+
+__all__ = [
+    "DuneMCPClient",
+    "DuneMCPClientConfig",
+    "DuneQueryResult",
+    "MetricFetch",
+    "METRIC_NAMES",
+]

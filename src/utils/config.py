@@ -34,12 +34,16 @@ class Settings(BaseSettings):
     DEMO_MODE: bool = True
     DEMO_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
 
-    # ---------- Market data (Level 1 OHLCV proxy) ----------
-    # Arc Perp DEX uses off-chain matching; for Day 3 we proxy OHLCV/funding
-    # through Binance public perp API (no auth required, free).
-    BINANCE_FAPI_BASE_URL: str = "https://fapi.binance.com"
-    # Symbol mapping override (JSON). Empty / unset -> built-in defaults.
-    BINANCE_SYMBOL_MAP: str | None = None
+    # ---------- Market data (Level 1 OHLCV - Arc RPC only) ----------
+    # Event signature emitted by Arc Perp DEX `ClearingHouse` per fill.
+    # The agent reconstructs OHLCV from these logs (no off-chain feed).
+    # Override here the moment Arc publishes the canonical signature.
+    ARC_PERP_TRADE_EVENT_SIG: str = "Trade(bytes32,uint256,uint256,uint8,uint64)"
+    # Decimal scaling for price / size fields in the trade event payload.
+    ARC_PERP_PRICE_DECIMALS: int = 8
+    ARC_PERP_SIZE_DECIMALS: int = 6
+    # Max block lookback per `eth_getLogs` call.
+    ARC_PERP_OHLCV_LOOKBACK_BLOCKS: int = 100_000
 
     # ---------- Arc Chain ----------
     ARC_RPC_URL: str = "https://rpc.testnet.arc.network"
@@ -86,7 +90,7 @@ class Settings(BaseSettings):
     # ---------- USDC ----------
     USDC_TOKEN_ADDRESS: str | None = None
 
-    # ---------- Dune MCP (Level 2) ----------
+    # ---------- Dune MCP (Level 2 - the only L2 data source) ----------
     DUNE_API_KEY: str | None = None
     DUNE_MCP_URL: str = "https://mcp.dune.com/sse"
     # Dune REST endpoint used to actually execute queries (the MCP SSE
@@ -94,6 +98,20 @@ class Settings(BaseSettings):
     # one we hit programmatically with the same DUNE_API_KEY).
     DUNE_API_BASE_URL: str = "https://api.dune.com/api/v1"
     DUNE_CACHE_TTL_SECONDS: int = 300
+    # Chain tag passed to the Dune SQL templates (see dune/queries/*.sql).
+    DUNE_CHAIN_TAG: str = "arc"
+    DUNE_LOOKBACK_HOURS: int = 24
+
+    # Per-metric saved Dune query ids. Leave any of these unset and
+    # Level 2 reports that metric as `n/a` (no fake zeros).
+    DUNE_QUERY_FUNDING_RATES_ID: int | None = None
+    DUNE_QUERY_OPEN_INTEREST_ID: int | None = None
+    DUNE_QUERY_VOLUME_ID: int | None = None
+    DUNE_QUERY_VAULT_FLOWS_ID: int | None = None
+    DUNE_QUERY_WHALE_ACTIVITY_ID: int | None = None
+    DUNE_QUERY_LONG_SHORT_RATIO_ID: int | None = None
+    DUNE_QUERY_CUM_FUNDING_ID: int | None = None
+    DUNE_QUERY_MARKET_SENTIMENT_ID: int | None = None
 
     # ---------- Level 1 thresholds (technical hard rules) ----------
     L1_RSI_OVERBOUGHT: float = 70.0
@@ -141,27 +159,23 @@ class Settings(BaseSettings):
         return [t.strip() for t in self.L1_TIMEFRAMES.split(",") if t.strip()]
 
     @property
-    def binance_symbol_map(self) -> dict[str, str]:
-        """Map Arc-Perp symbol -> Binance perp symbol.
+    def dune_query_ids(self) -> dict[str, int]:
+        """Per-metric saved Dune query ids, keyed by metric name.
 
-        Built-in defaults cover BTC/ETH/SOL; override with
-        `BINANCE_SYMBOL_MAP='{"FOO-PERP":"FOOUSDT"}'` in `.env`.
+        Metrics whose id is `None` are intentionally omitted so the
+        Dune client reports them as `n/a` instead of executing query 0.
         """
-        defaults = {
-            "BTC-PERP": "BTCUSDT",
-            "ETH-PERP": "ETHUSDT",
-            "SOL-PERP": "SOLUSDT",
+        candidates = {
+            "funding_rates": self.DUNE_QUERY_FUNDING_RATES_ID,
+            "open_interest": self.DUNE_QUERY_OPEN_INTEREST_ID,
+            "volume": self.DUNE_QUERY_VOLUME_ID,
+            "vault_flows": self.DUNE_QUERY_VAULT_FLOWS_ID,
+            "whale_activity": self.DUNE_QUERY_WHALE_ACTIVITY_ID,
+            "long_short_ratio": self.DUNE_QUERY_LONG_SHORT_RATIO_ID,
+            "cum_funding": self.DUNE_QUERY_CUM_FUNDING_ID,
+            "market_sentiment": self.DUNE_QUERY_MARKET_SENTIMENT_ID,
         }
-        if self.BINANCE_SYMBOL_MAP:
-            try:
-                import json
-
-                override = json.loads(self.BINANCE_SYMBOL_MAP)
-                if isinstance(override, dict):
-                    defaults.update({str(k): str(v) for k, v in override.items()})
-            except Exception:  # noqa: BLE001 - best-effort override
-                pass
-        return defaults
+        return {k: int(v) for k, v in candidates.items() if v}
 
     @property
     def level_weights(self) -> dict[str, float]:

@@ -2,10 +2,19 @@
 
 Wires the full pipeline:
 
-    Level 1 (TA) + Level 2 (Dune MCP + Binance + Arc RPC) [+ Level 3]
-        -> DecisionEngine
+    Level 1 (Arc RPC OHLCV) + Level 2 (Dune MCP only) [+ Level 3]
+        -> DecisionEngine (cascade L1 -> L2 -> L3)
             -> AllocationRouter
                 -> ArcPerpExecutor + CircleWallet (Arc Perp DEX, Paymaster)
+
+By design the agent has exactly two market-data sources:
+
+    - Arc RPC, used by `ArcMarketData` to reconstruct OHLCV from
+      on-chain perp DEX trade events (Level 1).
+    - Dune MCP, the only data path for every Level 2 metric.
+
+There is intentionally no CEX adapter (Binance / OKX / ...). Removing
+off-chain feeds keeps CapitalArc Arc-native.
 
 Usage
 -----
@@ -36,8 +45,8 @@ from src.allocation.allocation_router import AllocationConfig, AllocationRouter
 from src.core.decision_engine import DecisionEngine
 from src.core.level1 import Level1, Level1Config
 from src.core.level2 import Level2, Level2Config
+from src.data.arc_market_data import ArcMarketData, ArcMarketDataConfig
 from src.data.arc_onchain import ArcOnchainConfig, ArcOnchainReader
-from src.data.binance_client import BinanceClient, BinanceClientConfig
 from src.data.dune_mcp import DuneMCPClient, DuneMCPClientConfig
 from src.execution.arc_perp_executor import ArcPerpConfig, ArcPerpExecutor
 from src.execution.circle_wallet import CircleWallet, CircleWalletConfig
@@ -88,11 +97,16 @@ def _build_executor(
     return ArcPerpExecutor(wallet=wallet, config=cfg, dry_run=dry_run)
 
 
-def _build_binance(settings: Settings) -> BinanceClient:
-    return BinanceClient(
-        BinanceClientConfig(
-            base_url=settings.BINANCE_FAPI_BASE_URL,
-            symbol_map=settings.binance_symbol_map,
+def _build_arc_market_data(settings: Settings) -> ArcMarketData:
+    return ArcMarketData(
+        ArcMarketDataConfig(
+            rpc_url=settings.ARC_RPC_URL,
+            clearinghouse_address=settings.ARC_PERP_ROUTER_ADDRESS,
+            market_registry_address=settings.ARC_PERP_MARKET_REGISTRY_ADDRESS,
+            trade_event_sig=settings.ARC_PERP_TRADE_EVENT_SIG,
+            price_decimals=settings.ARC_PERP_PRICE_DECIMALS,
+            size_decimals=settings.ARC_PERP_SIZE_DECIMALS,
+            max_lookback_blocks=settings.ARC_PERP_OHLCV_LOOKBACK_BLOCKS,
         )
     )
 
@@ -110,6 +124,7 @@ def _build_dune(settings: Settings) -> DuneMCPClient | None:
                 if settings.DEMO_MODE
                 else settings.DUNE_CACHE_TTL_SECONDS
             ),
+            query_ids=settings.dune_query_ids,
         )
     )
 
@@ -127,9 +142,8 @@ def _build_arc_reader(settings: Settings) -> ArcOnchainReader:
 
 def _build_engine(
     settings: Settings,
-    binance: BinanceClient,
+    market_data: ArcMarketData,
     dune: DuneMCPClient | None,
-    onchain: ArcOnchainReader,
 ) -> DecisionEngine:
     level1 = Level1(
         Level1Config(
@@ -146,22 +160,21 @@ def _build_engine(
             max_drawdown_pct=settings.MAX_DRAWDOWN_PCT,
             require_tf_agreement=settings.L1_REQUIRE_TF_AGREEMENT,
         ),
-        binance=binance,
+        market_data=market_data,
     )
     level2 = Level2(
         Level2Config(
             symbols=settings.perp_symbols or ["BTC-PERP", "ETH-PERP", "SOL-PERP"],
+            chain=settings.DUNE_CHAIN_TAG,
+            lookback_hours=settings.DUNE_LOOKBACK_HOURS,
             cache_ttl_seconds=(
                 settings.DEMO_CACHE_TTL_SECONDS
                 if settings.DEMO_MODE
                 else settings.DUNE_CACHE_TTL_SECONDS
             ),
             demo_mode=settings.DEMO_MODE,
-            dune_enabled=dune is not None,
         ),
-        binance=binance,
         dune=dune,
-        onchain=onchain,
     )
     return DecisionEngine(
         level1=level1,
@@ -269,17 +282,22 @@ async def run_once(dry_run: bool) -> None:
 
     wallet = _build_circle_wallet(settings, dry_run=dry_run)
     executor = _build_executor(settings, wallet=wallet, dry_run=dry_run)
-    binance = _build_binance(settings)
+    market_data = _build_arc_market_data(settings)
     dune = _build_dune(settings)
     onchain = _build_arc_reader(settings)
-    engine = _build_engine(settings, binance=binance, dune=dune, onchain=onchain)
+    engine = _build_engine(settings, market_data=market_data, dune=dune)
     router = _build_router(settings, executor=executor, dry_run=dry_run)
 
     try:
         # Probe Dune MCP once so the panel shows accurate health.
         await engine.level2.connect()
 
+        onchain_snapshot = await onchain.snapshot(
+            account_id=None  # filled in by the executor below if known
+        )
+
         context = await _build_market_context(settings, executor, wallet)
+        context["onchain"] = onchain_snapshot
         console.print(
             market_context_panel(
                 context, mode=mode, app_env=settings.APP_ENV
@@ -318,7 +336,6 @@ async def run_once(dry_run: bool) -> None:
         console.print(Rule(f"[green]cycle done[/]  score={decision.final_score:.3f}  action={decision.directive.action}"))
     finally:
         await wallet.aclose()
-        await binance.aclose()
         if dune is not None:
             await dune.aclose()
 

@@ -116,6 +116,27 @@ def market_context_panel(
     timeframes = context.get("l1_timeframes")
     if timeframes:
         table.add_row("L1 timeframes", ", ".join(timeframes))
+    margin = context.get("account_margin_usdc")
+    pnl = context.get("account_unrealized_pnl_usdc")
+    if margin is not None:
+        table.add_row("Agent margin", _fmt_usd(margin))
+    if pnl is not None:
+        pnl_v = float(pnl)
+        pnl_colour = "green" if pnl_v >= 0 else "red"
+        table.add_row("Unrealized PnL", Text(_fmt_usd(pnl_v), style=pnl_colour))
+    dd = context.get("account_drawdown_pct")
+    if dd is not None:
+        dd_v = float(dd)
+        dd_colour = "white" if dd_v < 5 else "yellow" if dd_v < 10 else "red"
+        table.add_row("Drawdown", Text(f"{dd_v:.2f}%", style=dd_colour))
+    onchain = context.get("onchain")
+    if onchain is not None:
+        table.add_row(
+            "Arc latest block", str(getattr(onchain, "latest_block", "-") or "-")
+        )
+        tvl = getattr(onchain, "vault_tvl_usdc", None)
+        if tvl is not None:
+            table.add_row("Vault TVL", _fmt_usd(tvl))
     return Panel(
         table,
         title="[bold]Market Context[/]",
@@ -226,23 +247,27 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
     heat = float(l2_raw.get("market_heat", 0.5))
     cached = bool(l2_raw.get("cached", False))
     per_symbol = l2_raw.get("per_symbol", {}) or {}
-    onchain = l2_raw.get("onchain", {}) or {}
+    vault = l2_raw.get("vault_flow", {}) or {}
+    metric_status = l2_raw.get("metric_status", {}) or {}
+    notes = l2_raw.get("notes") or []
+    dune_healthy = bool(l2_raw.get("dune_healthy", False))
 
-    # Market summary
+    # ---------- Market summary -----------------------------------------
     summary = Table.grid(padding=(0, 2))
     summary.add_column(style="bold cyan", justify="right")
     summary.add_column(style="white")
-    summary.add_row(
-        "Regime",
-        Text(regime, style=_colour_for_regime(regime)),
-    )
+    summary.add_row("Regime", Text(regime, style=_colour_for_regime(regime)))
     summary.add_row("Score", f"{score:.3f}")
     summary.add_row("Market heat", f"{heat:.3f}")
     summary.add_row("Cache", "[yellow]HIT[/]" if cached else "[green]MISS[/]")
+    summary.add_row(
+        "Dune MCP",
+        "[green]healthy[/]" if dune_healthy else "[red]unreachable[/]",
+    )
 
-    # Per-symbol funding / OI / volume / LSR
+    # ---------- Per-symbol metrics --------------------------------------
     metrics = Table(
-        title="Per-symbol metrics",
+        title="Per-symbol metrics (Dune MCP)",
         box=box.MINIMAL_HEAVY_HEAD,
         expand=True,
     )
@@ -265,20 +290,20 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
 
         price_change = float(vol.get("price_change_pct_24h", 0))
         change_colour = (
-            "bold green" if price_change > 0 else "bold red" if price_change < 0 else "white"
+            "bold green" if price_change > 0
+            else "bold red" if price_change < 0
+            else "white"
         )
         funding_rate = float(fund.get("current_rate", 0)) * 100  # %
         funding_colour = (
-            "green" if funding_rate > 0 else "red" if funding_rate < 0 else "white"
+            "green" if funding_rate > 0
+            else "red" if funding_rate < 0
+            else "white"
         )
         oi_1h = float(oi.get("delta_1h_pct", 0))
-        oi_1h_colour = (
-            "green" if oi_1h > 0 else "red" if oi_1h < 0 else "white"
-        )
+        oi_1h_colour = "green" if oi_1h > 0 else "red" if oi_1h < 0 else "white"
         oi_24h = float(oi.get("delta_24h_pct", 0))
-        oi_24h_colour = (
-            "green" if oi_24h > 0 else "red" if oi_24h < 0 else "white"
-        )
+        oi_24h_colour = "green" if oi_24h > 0 else "red" if oi_24h < 0 else "white"
         ls_ratio = float(lsr.get("long_short_ratio", 1.0))
         ls_colour = (
             "green" if ls_ratio > 1.1 else "red" if ls_ratio < 0.9 else "white"
@@ -299,7 +324,7 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
             Text(spike_text, style=spike_colour),
         )
 
-    # Whales + cumulative funding
+    # ---------- Whales + cumulative funding -----------------------------
     whales = Table(
         title="Whale activity & cumulative funding",
         box=box.MINIMAL,
@@ -330,42 +355,71 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
             _fmt_usd(cf.get("net_flow_usd", 0)),
         )
 
-    # On-chain
-    onchain_table = Table.grid(padding=(0, 2))
-    onchain_table.add_column(style="bold cyan", justify="right")
-    onchain_table.add_column(style="white")
-    arc = onchain.get("arc") or {}
-    onchain_table.add_row(
-        "Dune MCP",
-        "[green]healthy[/]" if onchain.get("dune_healthy") else "[red]unreachable[/]",
+    # ---------- Vault flow ---------------------------------------------
+    vault_table = Table.grid(padding=(0, 2))
+    vault_table.add_column(style="bold cyan", justify="right")
+    vault_table.add_column(style="white")
+    vault_table.add_row("Vault TVL", _fmt_usd(vault.get("tvl_usdc", 0)))
+    vault_table.add_row(
+        "Window",
+        f"{vault.get('window_hours', 0):.0f}h",
     )
-    if arc:
-        onchain_table.add_row(
-            "Arc block",
-            str(arc.get("latest_block") or "-"),
-        )
-        onchain_table.add_row(
-            "Vault TVL",
-            _fmt_usd(arc.get("vault_tvl_usdc", 0)),
-        )
-        if arc.get("agent_margin_usdc") is not None:
-            onchain_table.add_row(
-                "Agent margin",
-                _fmt_usd(arc.get("agent_margin_usdc")),
+    vault_table.add_row("Deposits", _fmt_usd(vault.get("deposits_usdc", 0)))
+    vault_table.add_row("Withdrawals", _fmt_usd(vault.get("withdrawals_usdc", 0)))
+    net = float(vault.get("net_flow_usdc", 0))
+    net_colour = "green" if net > 0 else "red" if net < 0 else "white"
+    vault_table.add_row("Net flow", Text(_fmt_usd(net), style=net_colour))
+    vault_table.add_row(
+        "Events",
+        f"in {vault.get('deposit_events', 0)}  "
+        f"out {vault.get('withdrawal_events', 0)}",
+    )
+
+    # ---------- Per-metric provenance -----------------------------------
+    prov = Table(
+        title="Metric provenance (Dune MCP)",
+        box=box.MINIMAL,
+        expand=True,
+    )
+    prov.add_column("Metric", style="bold")
+    prov.add_column("Source")
+    prov.add_column("Rows", justify="right")
+    prov.add_column("Cached")
+    prov.add_column("Note")
+
+    if not metric_status:
+        prov.add_row("-", "n/a", "0", "no", "Dune client unavailable")
+    else:
+        for name, st in metric_status.items():
+            source = st.get("source", "n/a")
+            available = bool(st.get("available", False))
+            src_colour = (
+                "green" if available else "red" if source == "error" else "yellow"
             )
-        flow = arc.get("flow") or {}
-        if flow:
-            onchain_table.add_row(
-                "Vault net flow",
-                f"{_fmt_usd(flow.get('net_flow_usdc'))}  "
-                f"(in {flow.get('deposit_events')}, "
-                f"out {flow.get('withdrawal_events')}, "
-                f"window {flow.get('block_window')} blocks)",
+            prov.add_row(
+                name,
+                Text(source, style=src_colour),
+                str(st.get("rows", 0)),
+                "yes" if st.get("cached") else "no",
+                (st.get("note") or "")[:80],
             )
 
+    # ---------- Notes ---------------------------------------------------
+    grouped: list[Any] = [summary, metrics, whales, vault_table, prov]
+    if notes:
+        notes_text = "\n".join(f"- {n}" for n in notes)
+        grouped.append(
+            Panel(
+                Text(notes_text, style="yellow"),
+                title="Notes",
+                border_style="yellow",
+                box=box.MINIMAL,
+            )
+        )
+
     return Panel(
-        Group(summary, metrics, whales, onchain_table),
-        title="[bold]Level 2 - On-chain Intelligence (Dune MCP + Binance + Arc RPC)[/]",
+        Group(*grouped),
+        title="[bold]Level 2 - On-chain Intelligence (Dune MCP only)[/]",
         border_style=_colour_for_regime(regime),
         box=box.ROUNDED,
     )

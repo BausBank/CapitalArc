@@ -66,13 +66,15 @@ CapitalArc/
 ├── main.py           # Entry point: --dry-run / --live, optional --loop
 ├── src/
 │   ├── core/         # DecisionEngine + Level 1/2/3 + ExecutionDirective
-│   ├── data/         # BinanceClient, DuneMCPClient, ArcOnchainReader
+│   ├── data/         # ArcMarketData, DuneMCPClient, ArcOnchainReader
 │   ├── execution/    # ArcPerpExecutor + CircleWallet (DCW + Paymaster)
 │   ├── allocation/   # AllocationRouter: directive -> on-chain action
 │   ├── llm/          # Gemini 2.5 Flash client (final arbiter)
 │   ├── agents/       # Reserved for top-level orchestration helpers
 │   └── utils/        # Settings (pydantic), logging (loguru), rich panels
 ├── prompts/          # LLM prompt templates for the Level 3 arbiter
+├── dune/             # Dune MCP SQL templates (Level 2) + setup README
+│   └── queries/      #   funding_rates.sql, open_interest.sql, ...
 ├── scripts/          # One-off scripts: deploy, seed, simulate, backtest
 ├── tests/            # Unit & integration tests
 ├── .env.example      # Template for environment variables
@@ -96,7 +98,8 @@ CapitalArc/
 - **USYC** — yield-bearing tokenized USDC (risk-off leg)
 
 **Intelligence & Data**
-- **Dune MCP** — on-chain analytics, flows, dashboards (Level 2)
+- **Arc RPC** — Level 1 OHLCV reconstruction (no CEX feeds)
+- **Dune MCP** — the **only** Level 2 data source, on-chain analytics
 - **Gemini 2.5 Flash** (Google AI Studio) — LLM final arbiter (Level 3)
 
 **Backend**
@@ -168,16 +171,24 @@ USDC.
 ### Day 3 — Completed
 
 Level 1 (technical hard rules) and Level 2 (on-chain intelligence)
-are both fully wired and feed a cascading `DecisionEngine`.
+are both fully wired and feed a cascading `DecisionEngine`. By design
+the agent has exactly **two market-data sources** — Arc RPC for
+Level 1 OHLCV and Dune MCP for every Level 2 metric. There is **no**
+CEX adapter (Binance / OKX / ...).
 
 - **Level 1 — Technical hard rules** (`src/core/level1.py`)
-  - Real OHLCV ingestion for **BTC-PERP / ETH-PERP / SOL-PERP** on
-    `15m` and `1h` timeframes via the new **`BinanceClient`**
-    (`src/data/binance_client.py`). Binance USDT-M Perp is used as a
-    Day-3 OHLCV / funding / OI / LSR proxy until Arc Perp DEX exposes
-    a public market API; symbol mapping is `BTC-PERP → BTCUSDT`,
-    `ETH-PERP → ETHUSDT`, `SOL-PERP → SOLUSDT` and is overridable via
-    `BINANCE_SYMBOL_MAP`.
+  - OHLCV for **BTC-PERP / ETH-PERP / SOL-PERP** on `15m` and `1h`
+    is reconstructed directly from Arc Perp DEX trade events via the
+    new **`ArcMarketData`** reader (`src/data/arc_market_data.py`):
+    it pulls `Trade(bytes32 indexed marketId, uint256 price,
+    uint256 size, uint8 side, uint64 timestamp)` logs from the
+    `ClearingHouse` contract through `web3.py` over Arc RPC, then
+    buckets fills into time intervals. The event signature is
+    configurable (`ARC_PERP_TRADE_EVENT_SIG`) so the agent picks up
+    the canonical one as soon as Arc publishes it.
+  - When Arc Testnet has no fills in the window, Level 1 returns
+    an `ohlcv_unavailable` block with the exact block range scanned
+    and how many fills were found — never invents data.
   - Four hard rules ("защита от дурака") that can each veto a trade:
     1. **Trend filter** — `close > EMA9 > EMA21` (or mirror down) must
        hold on *both* 15m and 1h; otherwise `trend_mixed` blocks.
@@ -191,29 +202,39 @@ are both fully wired and feed a cascading `DecisionEngine`.
     (`code`, `severity`, `message`, `symbol`, `timeframe`) plus a
     per-symbol `SymbolReadout` with the latest indicator snapshot.
 
-- **Level 2 — On-chain intelligence** (`src/core/level2.py`)
-  - Combines three live sources:
-    - **Dune MCP** via the new `DuneMCPClient`
-      (`src/data/dune_mcp.py`) — speaks the same Bearer-authenticated
-      surface the Dune MCP server exposes to LLMs (`run_query`,
-      `latest_results`, `ping`), with a 30-min TTL cache in demo mode.
-    - **Binance perp public API** — funding rate history, premium /
-      mark price, open-interest history, 24h ticker, long/short
-      ratio.
-    - **Arc Testnet RPC** via `ArcOnchainReader`
-      (`src/data/arc_onchain.py`) — vault USDC TVL, agent's margin
-      balance, recent vault deposits / withdrawals from ERC-20
-      `Transfer` events.
+- **Level 2 — On-chain intelligence (Dune MCP only)**
+  (`src/core/level2.py`)
+  - Sourced **exclusively** from Dune MCP via the new
+    `DuneMCPClient` (`src/data/dune_mcp.py`). Speaks the same
+    Bearer-authenticated surface the Dune MCP server exposes to
+    LLMs (`execute_query`, `latest_results`, `ping`), plus a
+    high-level `fetch_metric(name, params)` that resolves each
+    metric to a saved Dune query id (configurable per metric via
+    `DUNE_QUERY_*_ID` env vars).
   - Per-symbol metrics: funding rate (current + 8h / 24h delta +
     weighted average + annualised %), open interest (current +
-    1h / 4h / 24h deltas), volume + z-score spike detection, long/short
-    ratio with inferred bias, cumulative funding paid / received over
-    the recent 48h window, whale-activity flag derived from 1h OI
-    deltas.
-  - A market-wide **heat score** (0–1) aggregates all three symbols
-    and labels the regime as `risk_on` / `risk_off` / `neutral` /
-    `transition`. Arc vault net flow adds a small modifier to the
-    score so on-chain capital movement actually moves the needle.
+    1h / 4h / 24h deltas), volume + 1h-vs-24h spike detection,
+    long/short ratio with inferred bias, cumulative funding paid /
+    received over the window, whale-activity flag with rationale.
+  - Vault-level metrics: `USDCCollateralVault` TVL and net deposits
+    / withdrawals over the recent window.
+  - A market-wide **heat score** in `[0, 1]` labels the regime as
+    `risk_on` / `risk_off` / `neutral` / `transition`. When the
+    `market_sentiment` Dune query is configured, its `heat` is used
+    directly; otherwise the engine falls back to a heuristic blend
+    of funding, OI 1h delta, 24h price change and L/S.
+  - **Per-metric provenance.** Every metric records its source
+    (`dune:<query_id>` when it ran, `n/a` with an instructive note
+    when the corresponding `DUNE_QUERY_*_ID` isn't set, `error` if
+    Dune was unreachable). The L2 panel renders this provenance map
+    so demos and live runs are honest about what's actually on-chain.
+  - **SQL templates ship in `dune/queries/`** — `funding_rates.sql`,
+    `open_interest.sql`, `volume.sql`, `vault_flows.sql`,
+    `whale_activity.sql`, `long_short_ratio.sql`, `cum_funding.sql`,
+    `market_sentiment.sql`, each documented with its expected
+    parameters and column contract. Save them in your Dune
+    workspace, set the query ids in `.env`, and Level 2 starts
+    returning live numbers.
   - `DEMO_MODE` caches the full `Level2Intelligence` payload for
     `DEMO_CACHE_TTL_SECONDS` (default 30 min) so demo loops are fast
     and idempotent.
@@ -223,7 +244,7 @@ are both fully wired and feed a cascading `DecisionEngine`.
   - If Level 1 blocks (`Level1Decision.passes == False`), Level 2 is
     **not** called and the engine emits `final_score = 0.0`,
     `regime = "risk-off"`, `short_circuited = True` with the explicit
-    L1 block reason. The `AllocationRouter` now distinguishes a
+    L1 block reason. The `AllocationRouter` distinguishes a
     short-circuit risk-off (legitimate close) from stale data
     (denied).
   - When L1 passes, L2 runs. Level 3 is left as a deterministic
@@ -234,17 +255,20 @@ are both fully wired and feed a cascading `DecisionEngine`.
     symbols → `long`, negative → `short`.
 
 - **Rich visualisation** (`src/utils/console.py`, `main.py`)
-  - Every decision cycle prints six panels: **Market Context**,
-    **Level 1 — Technical Hard Rules**, **Level 2 — On-chain
-    Intelligence**, **Final Decision**, **Execution Plan** and
-    **On-chain Result**. Panels colour-code regime, trend, severity,
+  - Every decision cycle prints six panels: **Market Context**
+    (with Arc latest block + vault TVL + agent margin / PnL /
+    drawdown), **Level 1 — Technical Hard Rules**, **Level 2 — On-chain
+    Intelligence (Dune MCP only)** with a **Metric provenance** table,
+    **Final Decision**, **Execution Plan** and **On-chain Result**.
+    Panels colour-code regime, trend, severity, source-availability
     and tx state.
 
 - **Config & env**
-  - New settings: `DEMO_MODE`, `DEMO_CACHE_TTL_SECONDS`,
-    `BINANCE_FAPI_BASE_URL`, `BINANCE_SYMBOL_MAP`, `DUNE_API_BASE_URL`,
-    all `L1_*` thresholds. Default `ARC_PERP_SYMBOLS` now includes
-    `SOL-PERP`.
+  - New settings: `ARC_PERP_TRADE_EVENT_SIG`, `ARC_PERP_PRICE_DECIMALS`,
+    `ARC_PERP_SIZE_DECIMALS`, `ARC_PERP_OHLCV_LOOKBACK_BLOCKS`,
+    `DUNE_CHAIN_TAG`, `DUNE_LOOKBACK_HOURS`, and one
+    `DUNE_QUERY_*_ID` per Level-2 metric. Removed: all `BINANCE_*`
+    settings (no more CEX feeds).
 
 ### Day 4 — Planned
 
@@ -292,10 +316,14 @@ Every cycle prints six panels to the terminal:
 │  indicators table (EMA9/21, RSI, ATR%, │
 │  trend) and reasons table.             │
 └────────────────────────────────────────┘
-┌── Level 2 - On-chain Intelligence ─────┐
-│  regime, market heat, per-symbol       │
-│  funding / OI / volume / L-S /         │
-│  whales, vault TVL, Dune MCP health    │
+┌── Level 2 - On-chain Intel (Dune MCP) ─┐
+│  regime, heat, Dune MCP health,        │
+│  per-symbol funding / OI / volume /    │
+│  L-S / whales / cum funding,           │
+│  vault TVL + net flow, plus a          │
+│  per-metric provenance map (dune:id /  │
+│  n/a / error) so the data path is      │
+│  honest at a glance.                   │
 └────────────────────────────────────────┘
 ┌── Final Decision ──────────────────────┐
 │  final score, regime, action, side,    │

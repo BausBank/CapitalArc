@@ -1,30 +1,43 @@
-"""Level 2 - on-chain intelligence (the agent's main analytical pillar).
+"""Level 2 - on-chain intelligence sourced **only** from Dune MCP.
 
-Level 2 fuses three data sources into one structured market read:
+Level 2 is the agent's main analytical pillar. By design it consults
+exactly one external service - the **Dune MCP** server (via its
+Bearer-authenticated REST API) - and aggregates the result into a
+structured, actionable on-chain read for the three perp symbols we
+trade (`BTC-PERP`, `ETH-PERP`, `SOL-PERP`).
 
-    1. **Dune MCP** (`DuneMCPClient`)         - on-chain analytics layer.
-    2. **Binance perp public API**            - real-time funding, OI,
-                                                volume and long/short
-                                                ratio used as a high-
-                                                quality proxy for the
-                                                three perp symbols.
-    3. **Arc on-chain reader**                - direct reads against
-                                                `USDCCollateralVault` on
-                                                Arc Testnet.
+What Level 2 measures
+---------------------
+Per symbol:
 
-The output is a structured, actionable `Level2Intelligence` object
-covering, per perp symbol:
-    - funding rate (current + 8h / 24h delta) and weighted-average.
-    - open interest (current + 1h / 4h / 24h delta) and volume spikes.
-    - long/short ratio and inferred bias.
-    - cumulative funding paid / received over the recent window.
-    - whale-activity flag derived from OI deltas.
-    - Arc vault TVL + net deposits / withdrawals + Dune MCP health.
-    - a market-wide "heat" score that summarises overall risk-on /
-      risk-off pressure across all three perps.
+    * Funding rates       - current + 8h / 24h change, weighted average
+    * Open interest       - total + 1h / 4h / 24h deltas
+    * Trading volume      - 1h / 24h totals + 24h spike flag
+    * Long/short ratio    - account ratio or inferred from OI + price
+    * Whale activity      - large position / OI moves in the last hour
+    * Cumulative funding  - longs paid vs shorts paid over the window
 
-Caching: in `demo` mode every produced `Level2Intelligence` is cached
-for `cache_ttl_seconds` so demo iterations are cheap and idempotent.
+Vault-level:
+
+    * Perp Vault TVL      - USDC sitting in `USDCCollateralVault`
+    * Net deposits/withdrawals into the vault over the recent window
+
+Market-wide:
+
+    * `market_sentiment`  - heat / regime classifier produced by a Dune
+                            query that reduces the per-symbol signals
+                            to a single `[0, 1]` score.
+
+Provenance is first-class
+-------------------------
+Every metric reports the saved Dune query id (`dune:<id>`) that
+produced it. When the corresponding `DUNE_QUERY_*_ID` is not set in
+`.env`, the metric is reported as `n/a` rather than a fake zero.
+This keeps demos and live runs honest about what's actually on-chain.
+
+SQL templates for the queries live in `dune/queries/*.sql`; users
+save them in their Dune workspace, then paste the resulting query
+ids back into `.env`. The data path is otherwise pinned to Dune MCP.
 """
 
 from __future__ import annotations
@@ -33,12 +46,9 @@ import asyncio
 import statistics
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
-from src.data.arc_onchain import ArcOnchainReader, ArcOnchainSnapshot
-from src.data.binance_client import BinanceClient
-from src.data.dune_mcp import DuneMCPClient
+from src.data.dune_mcp import DuneMCPClient, MetricFetch
 from src.utils.logging import logger
 
 if TYPE_CHECKING:
@@ -60,15 +70,16 @@ class Level2Config:
     symbols: list[str] = field(
         default_factory=lambda: ["BTC-PERP", "ETH-PERP", "SOL-PERP"]
     )
-    funding_history_limit: int = 6        # last 6 funding events ~= 48h
-    oi_period: str = "1h"
-    oi_history_limit: int = 30            # 30 hours of 1h OI samples
-    volume_spike_z: float = 1.5           # 1.5 sigma above 24h mean = spike
-    whale_oi_delta_pct: float = 5.0       # |OI 1h-delta| >= 5% -> whale flag
-    funding_alarm_bps: float = 5.0        # |annualised funding| > 50% triggers warn
+    chain: str = "arc"               # Dune chain tag used as a query param
+    lookback_hours: int = 24
     cache_ttl_seconds: int = 1800
     demo_mode: bool = True
-    dune_enabled: bool = True
+    whale_oi_delta_pct: float = 5.0
+    volume_spike_z: float = 1.5
+    # Used by the heuristic regime classifier when the Dune-side
+    # `market_sentiment` query is not configured.
+    risk_on_heat: float = 0.62
+    risk_off_heat: float = 0.38
 
 
 # ---------------------------------------------------------------------------
@@ -77,22 +88,36 @@ class Level2Config:
 
 
 @dataclass
+class MetricStatus:
+    """Lightweight provenance carrier for a single metric."""
+
+    name: str
+    source: str          # "dune:<id>" | "n/a" | "error"
+    rows: int = 0
+    query_id: int | None = None
+    cached: bool = False
+    note: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.source.startswith("dune:")
+
+
+@dataclass
 class FundingSnapshot:
     """Funding-rate snapshot for one symbol."""
 
     symbol: str
-    current_rate: float = 0.0           # per-funding-event rate (8h)
-    rate_8h_change: float = 0.0          # current - previous (raw rate, not bps)
+    current_rate: float = 0.0
+    rate_8h_change: float = 0.0
     rate_24h_change: float = 0.0
     weighted_average_24h: float = 0.0
-    annualised_pct: float = 0.0          # rate * 3 * 365 * 100, just a hint
-    next_funding_ms: int = 0
-    history: list[dict[str, Any]] = field(default_factory=list)
+    annualised_pct: float = 0.0
 
 
 @dataclass
 class OpenInterestSnapshot:
-    """Open-interest snapshot for one symbol (contracts and USD value)."""
+    """Open-interest snapshot for one symbol."""
 
     symbol: str
     current_contracts: float = 0.0
@@ -100,26 +125,24 @@ class OpenInterestSnapshot:
     delta_1h_pct: float = 0.0
     delta_4h_pct: float = 0.0
     delta_24h_pct: float = 0.0
-    history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
 class VolumeSnapshot:
-    """Recent volume snapshot for one symbol (24h ticker + spike flag)."""
+    """Trading-volume snapshot for one symbol."""
 
     symbol: str
     last_price: float = 0.0
     price_change_pct_24h: float = 0.0
-    base_volume_24h: float = 0.0
-    quote_volume_24h: float = 0.0
-    trades_24h: int = 0
+    volume_24h_usd: float = 0.0
+    volume_1h_usd: float = 0.0
     spike_detected: bool = False
     spike_zscore: float = 0.0
 
 
 @dataclass
 class LongShortSnapshot:
-    """Long/short account ratio + inferred bias."""
+    """Long/short ratio + inferred bias."""
 
     symbol: str
     long_short_ratio: float = 1.0
@@ -130,7 +153,7 @@ class LongShortSnapshot:
 
 @dataclass
 class WhaleSnapshot:
-    """Whale-activity inference based on rapid OI moves."""
+    """Whale-activity inference for one symbol."""
 
     symbol: str
     flagged: bool = False
@@ -144,10 +167,26 @@ class CumulativeFundingSnapshot:
     """Cumulative funding paid / received in the recent window."""
 
     symbol: str
-    longs_paid_usd: float = 0.0          # positive funding -> longs pay shorts
+    longs_paid_usd: float = 0.0
     shorts_paid_usd: float = 0.0
     net_flow_usd: float = 0.0
     window_hours: float = 0.0
+
+
+@dataclass
+class VaultFlowSnapshot:
+    """Aggregate vault TVL + net flow snapshot."""
+
+    tvl_usdc: float = 0.0
+    deposits_usdc: float = 0.0
+    withdrawals_usdc: float = 0.0
+    deposit_events: int = 0
+    withdrawal_events: int = 0
+    window_hours: float = 0.0
+
+    @property
+    def net_flow_usdc(self) -> float:
+        return self.deposits_usdc - self.withdrawals_usdc
 
 
 @dataclass
@@ -165,24 +204,17 @@ class SymbolIntel:
 
 
 @dataclass
-class OnchainSummary:
-    """Aggregated on-chain (Arc + Dune) layer of Level 2."""
-
-    arc: ArcOnchainSnapshot | None
-    dune_healthy: bool
-    dune_notes: list[str] = field(default_factory=list)
-
-
-@dataclass
 class Level2Intelligence:
-    """Top-level result of Level 2."""
+    """Top-level Level-2 result."""
 
     score: float
     regime: Regime
     rationale: str
-    market_heat: float                   # 0..1 aggregated heat
+    market_heat: float
     per_symbol: dict[str, SymbolIntel]
-    onchain: OnchainSummary
+    vault_flow: VaultFlowSnapshot
+    metric_status: dict[str, MetricStatus]
+    dune_healthy: bool
     generated_at: float = field(default_factory=time.time)
     cached: bool = False
     notes: list[str] = field(default_factory=list)
@@ -194,28 +226,37 @@ class Level2Intelligence:
 
 
 class Level2:
-    """On-chain + market intelligence level."""
+    """On-chain intelligence level, sourced only from Dune MCP."""
 
     LEVEL = 2
 
     def __init__(
         self,
         config: Level2Config | None = None,
-        binance: BinanceClient | None = None,
         dune: DuneMCPClient | None = None,
-        onchain: ArcOnchainReader | None = None,
     ) -> None:
         self.config = config or Level2Config()
-        self.binance = binance or BinanceClient()
         self.dune = dune
-        self.onchain = onchain
         self._cache: tuple[Level2Intelligence, float] | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def connect(self) -> None:
         """Probe Dune MCP once so callers know whether it's healthy."""
-        if self.dune is not None and self.config.dune_enabled:
-            ok = await self.dune.ping()
-            logger.info("Dune MCP {}", "connected" if ok else "unavailable")
+        if self.dune is None:
+            logger.warning(
+                "Level2: DuneMCPClient is None - Level 2 will return all "
+                "metrics as n/a (DUNE_API_KEY missing in .env)."
+            )
+            return
+        ok = await self.dune.ping()
+        logger.info("Dune MCP {}", "connected" if ok else "unavailable")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     async def score(self, market: dict[str, Any]) -> "LevelScore":
         from src.core.decision_engine import LevelScore
@@ -229,7 +270,7 @@ class Level2:
         )
 
     async def evaluate(self, market: dict[str, Any]) -> Level2Intelligence:
-        # ---- cache ------------------------------------------------------
+        # ---- demo cache -----------------------------------------------
         if self.config.demo_mode and self._cache is not None:
             cached, expiry = self._cache
             if time.time() < expiry:
@@ -238,214 +279,206 @@ class Level2:
 
         symbols = list(market.get("symbols") or self.config.symbols)
         symbols = [s for s in symbols if s] or self.config.symbols
+        dune_healthy = await self._dune_health()
 
-        # ---- per-symbol fetches in parallel ----------------------------
-        per_symbol = await self._gather_symbols(symbols)
+        # ---- fetch every metric from Dune in parallel -----------------
+        fetches = await self._fetch_all_metrics(symbols)
 
-        # ---- on-chain + dune readouts in parallel ----------------------
-        onchain_task = asyncio.create_task(self._collect_onchain(market))
-        dune_task = asyncio.create_task(self._collect_dune())
-        arc_snapshot, dune_status = await asyncio.gather(onchain_task, dune_task)
+        # ---- map raw rows -> structured per-symbol intel --------------
+        per_symbol: dict[str, SymbolIntel] = {}
+        for sym in symbols:
+            per_symbol[sym] = self._build_symbol_intel(sym, fetches)
+        vault_flow = self._build_vault_flow(fetches["vault_flows"])
 
-        onchain_summary = OnchainSummary(
-            arc=arc_snapshot,
-            dune_healthy=dune_status["healthy"],
-            dune_notes=dune_status["notes"],
-        )
+        # ---- regime / heat --------------------------------------------
+        sentiment_row = self._first_row(fetches["market_sentiment"].rows)
+        heat = _coerce_float(sentiment_row.get("heat") if sentiment_row else None)
+        if heat is None:
+            heat = self._heuristic_heat(per_symbol)
+        score = float(min(1.0, max(0.0, heat)))
+        regime = self._classify_regime(score)
+        rationale = self._build_rationale(score, regime, heat, per_symbol)
 
-        score, heat, regime, rationale = self._aggregate(per_symbol, onchain_summary)
+        # ---- metric_status (provenance map) ---------------------------
+        metric_status = {
+            name: _to_status(name, fetch) for name, fetch in fetches.items()
+        }
+
+        notes: list[str] = []
+        if not dune_healthy:
+            notes.append(
+                "Dune MCP unreachable; Level 2 reports last-cached or n/a values."
+            )
+        missing = [name for name, st in metric_status.items() if not st.available]
+        if missing:
+            notes.append(
+                "Dune query ids missing for: "
+                + ", ".join(missing)
+                + " (see dune/queries/ for the SQL templates)."
+            )
+
         intel = Level2Intelligence(
             score=score,
             regime=regime,
             rationale=rationale,
-            market_heat=heat,
+            market_heat=float(heat),
             per_symbol=per_symbol,
-            onchain=onchain_summary,
-            notes=[],
+            vault_flow=vault_flow,
+            metric_status=metric_status,
+            dune_healthy=dune_healthy,
+            notes=notes,
         )
         if self.config.demo_mode:
             self._cache = (intel, time.time() + self.config.cache_ttl_seconds)
         return intel
 
     # ------------------------------------------------------------------
-    # Data collection helpers
+    # Dune fetches
     # ------------------------------------------------------------------
 
-    async def _gather_symbols(self, symbols: list[str]) -> dict[str, SymbolIntel]:
-        tasks = {sym: asyncio.create_task(self._collect_symbol(sym)) for sym in symbols}
-        out: dict[str, SymbolIntel] = {}
-        for sym, task in tasks.items():
-            try:
-                out[sym] = await task
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("L2 collect {} failed: {}", sym, exc)
-                out[sym] = _empty_symbol_intel(sym, note=f"fetch failed: {exc}")
-        return out
+    async def _dune_health(self) -> bool:
+        if self.dune is None:
+            return False
+        try:
+            return await self.dune.ping()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dune ping failed: {}", exc)
+            return False
 
-    async def _collect_symbol(self, symbol: str) -> SymbolIntel:
-        funding_task = asyncio.create_task(
-            self.binance.get_funding_rate_history(
-                symbol, limit=self.config.funding_history_limit
+    async def _fetch_all_metrics(
+        self, symbols: list[str]
+    ) -> dict[str, MetricFetch]:
+        """Run every named metric query in parallel."""
+        common_params = {
+            "chain": self.config.chain,
+            "lookback_hours": self.config.lookback_hours,
+            "symbols": ",".join(symbols),
+        }
+        metric_names = (
+            "funding_rates",
+            "open_interest",
+            "volume",
+            "vault_flows",
+            "whale_activity",
+            "long_short_ratio",
+            "cum_funding",
+            "market_sentiment",
+        )
+
+        async def _fetch(name: str) -> tuple[str, MetricFetch]:
+            if self.dune is None:
+                return name, MetricFetch(
+                    metric=name,
+                    source="n/a",
+                    note="DuneMCPClient is None (DUNE_API_KEY missing)",
+                )
+            return name, await self.dune.fetch_metric(
+                name, params=common_params
             )
-        )
-        premium_task = asyncio.create_task(self.binance.get_premium_index(symbol))
-        oi_task = asyncio.create_task(self.binance.get_open_interest(symbol))
-        oi_hist_task = asyncio.create_task(
-            self.binance.get_open_interest_history(
-                symbol,
-                period=self.config.oi_period,
-                limit=self.config.oi_history_limit,
-            )
-        )
-        ticker_task = asyncio.create_task(self.binance.get_24h_ticker(symbol))
-        lsr_task = asyncio.create_task(
-            self.binance.get_long_short_ratio(symbol, period="1h", limit=1)
-        )
 
-        funding_hist, premium, oi_current, oi_hist, ticker, lsr = await asyncio.gather(
-            funding_task,
-            premium_task,
-            oi_task,
-            oi_hist_task,
-            ticker_task,
-            lsr_task,
-            return_exceptions=False,
+        results = await asyncio.gather(*(_fetch(n) for n in metric_names))
+        return dict(results)
+
+    # ------------------------------------------------------------------
+    # Per-symbol mapping
+    # ------------------------------------------------------------------
+
+    def _build_symbol_intel(
+        self,
+        symbol: str,
+        fetches: dict[str, MetricFetch],
+    ) -> SymbolIntel:
+        funding = self._extract_funding(symbol, fetches["funding_rates"])
+        oi = self._extract_open_interest(symbol, fetches["open_interest"])
+        vol = self._extract_volume(symbol, fetches["volume"])
+        lsr = self._extract_long_short(symbol, fetches["long_short_ratio"])
+        whales = self._extract_whales(symbol, fetches["whale_activity"], oi)
+        cf = self._extract_cum_funding(
+            symbol, fetches["cum_funding"], oi, funding
         )
-
-        funding = self._build_funding(symbol, funding_hist, premium)
-        oi = self._build_oi(symbol, oi_current, oi_hist, ticker.get("lastPrice", 0.0))
-        volume = self._build_volume(symbol, ticker, oi_hist)
-        long_short = self._build_long_short(symbol, lsr)
-        whales = self._build_whales(symbol, oi)
-        cum_funding = self._build_cumulative_funding(symbol, funding_hist, oi)
-
         return SymbolIntel(
             symbol=symbol,
             funding=funding,
             open_interest=oi,
-            volume=volume,
-            long_short=long_short,
+            volume=vol,
+            long_short=lsr,
             whales=whales,
-            cum_funding=cum_funding,
+            cum_funding=cf,
         )
 
-    # ---- builders ----------------------------------------------------
-
-    def _build_funding(
-        self,
-        symbol: str,
-        history: list[dict[str, Any]],
-        premium: dict[str, Any],
+    def _extract_funding(
+        self, symbol: str, fetch: MetricFetch
     ) -> FundingSnapshot:
-        if not history:
-            current_rate = float(premium.get("lastFundingRate", 0.0))
-            history = []
-        else:
-            current_rate = float(history[-1]["fundingRate"])
-        rate_8h_change = (
-            current_rate - float(history[-2]["fundingRate"])
-            if len(history) >= 2
-            else 0.0
-        )
-        # 24h window = last 3 events (Binance settles every 8h).
-        last24 = history[-3:]
-        if len(last24) >= 1:
-            avg = sum(float(h["fundingRate"]) for h in last24) / len(last24)
-        else:
-            avg = current_rate
-        rate_24h_change = (
-            current_rate - float(history[-4]["fundingRate"])
-            if len(history) >= 4
-            else 0.0
-        )
-        annualised = current_rate * 3 * 365 * 100  # %/yr
+        row = self._row_for_symbol(fetch.rows, symbol)
+        if row is None:
+            return FundingSnapshot(symbol=symbol)
+        cur = _coerce_float(row.get("current_rate")) or 0.0
         return FundingSnapshot(
             symbol=symbol,
-            current_rate=current_rate,
-            rate_8h_change=rate_8h_change,
-            rate_24h_change=rate_24h_change,
-            weighted_average_24h=avg,
-            annualised_pct=annualised,
-            next_funding_ms=int(premium.get("nextFundingTime", 0)),
-            history=history,
+            current_rate=cur,
+            rate_8h_change=_coerce_float(row.get("rate_8h_change")) or 0.0,
+            rate_24h_change=_coerce_float(row.get("rate_24h_change")) or 0.0,
+            weighted_average_24h=_coerce_float(
+                row.get("weighted_average_24h")
+            )
+            or 0.0,
+            annualised_pct=_coerce_float(row.get("annualised_pct"))
+            or cur * 3 * 365 * 100,
         )
 
-    def _build_oi(
-        self,
-        symbol: str,
-        current_contracts: Decimal,
-        history: list[dict[str, Any]],
-        last_price: float,
+    def _extract_open_interest(
+        self, symbol: str, fetch: MetricFetch
     ) -> OpenInterestSnapshot:
-        cur = float(current_contracts)
-        cur_value_usd = cur * float(last_price)
-        if history:
-            # The value entries are USD value directly (sumOpenInterestValue).
-            latest = float(history[-1].get("sumOpenInterest", cur))
-            cur_value_usd = float(history[-1].get("sumOpenInterestValue", cur_value_usd))
-            # 1h, 4h, 24h deltas (Binance points are spaced by `period`).
-            def _delta(n: int) -> float:
-                if len(history) <= n:
-                    return 0.0
-                prev = float(history[-1 - n].get("sumOpenInterest", 0.0))
-                if prev == 0:
-                    return 0.0
-                return (latest - prev) / prev * 100.0
-
-            d1 = _delta(1)
-            d4 = _delta(4)
-            d24 = _delta(24)
-            current = latest
-        else:
-            current = cur
-            d1 = d4 = d24 = 0.0
+        row = self._row_for_symbol(fetch.rows, symbol)
+        if row is None:
+            return OpenInterestSnapshot(symbol=symbol)
         return OpenInterestSnapshot(
             symbol=symbol,
-            current_contracts=current,
-            current_value_usd=cur_value_usd,
-            delta_1h_pct=d1,
-            delta_4h_pct=d4,
-            delta_24h_pct=d24,
-            history=history,
+            current_contracts=_coerce_float(row.get("current_contracts")) or 0.0,
+            current_value_usd=_coerce_float(row.get("current_value_usd")) or 0.0,
+            delta_1h_pct=_coerce_float(row.get("delta_1h_pct")) or 0.0,
+            delta_4h_pct=_coerce_float(row.get("delta_4h_pct")) or 0.0,
+            delta_24h_pct=_coerce_float(row.get("delta_24h_pct")) or 0.0,
         )
 
-    def _build_volume(
-        self,
-        symbol: str,
-        ticker: dict[str, Any],
-        oi_hist: list[dict[str, Any]],
+    def _extract_volume(
+        self, symbol: str, fetch: MetricFetch
     ) -> VolumeSnapshot:
-        quote_vol = float(ticker.get("quoteVolume", 0.0))
-        base_vol = float(ticker.get("volume", 0.0))
-        # Use OI USD-value series as a cheap proxy "activity" baseline.
-        # If volume in the latest period is meaningfully above the mean,
-        # we flag a spike.
-        spike = False
-        z = 0.0
-        if oi_hist and len(oi_hist) >= 5:
-            values = [float(r.get("sumOpenInterestValue", 0.0)) for r in oi_hist]
-            mean = statistics.fmean(values) if values else 0.0
-            stdev = statistics.pstdev(values) if len(values) > 1 else 0.0
-            if stdev > 0:
-                z = (values[-1] - mean) / stdev
+        row = self._row_for_symbol(fetch.rows, symbol)
+        if row is None:
+            return VolumeSnapshot(symbol=symbol)
+        vol_24h = _coerce_float(row.get("volume_24h_usd")) or 0.0
+        vol_1h = _coerce_float(row.get("volume_1h_usd")) or 0.0
+        # Spike detection: if the 1h rate exceeds the 24h-implied hourly
+        # mean by `volume_spike_z` standard deviations, flag it. When
+        # only totals are available we approximate stdev as 0.4 * mean.
+        spike, z = False, 0.0
+        if vol_24h > 0 and vol_1h > 0:
+            mean_hourly = vol_24h / 24.0
+            stdev_proxy = mean_hourly * 0.4
+            if stdev_proxy > 0:
+                z = (vol_1h - mean_hourly) / stdev_proxy
                 spike = abs(z) >= self.config.volume_spike_z
         return VolumeSnapshot(
             symbol=symbol,
-            last_price=float(ticker.get("lastPrice", 0.0)),
-            price_change_pct_24h=float(ticker.get("priceChangePct", 0.0)),
-            base_volume_24h=base_vol,
-            quote_volume_24h=quote_vol,
-            trades_24h=int(ticker.get("count", 0)),
+            last_price=_coerce_float(row.get("last_price")) or 0.0,
+            price_change_pct_24h=_coerce_float(row.get("price_change_pct_24h"))
+            or 0.0,
+            volume_24h_usd=vol_24h,
+            volume_1h_usd=vol_1h,
             spike_detected=spike,
             spike_zscore=z,
         )
 
-    def _build_long_short(
-        self, symbol: str, lsr: dict[str, Any]
+    def _extract_long_short(
+        self, symbol: str, fetch: MetricFetch
     ) -> LongShortSnapshot:
-        ratio = float(lsr.get("longShortRatio", 1.0))
-        long_pct = float(lsr.get("longAccount", 0.5))
-        short_pct = float(lsr.get("shortAccount", 0.5))
+        row = self._row_for_symbol(fetch.rows, symbol)
+        if row is None:
+            return LongShortSnapshot(symbol=symbol)
+        ratio = _coerce_float(row.get("long_short_ratio")) or 1.0
+        long_pct = _coerce_float(row.get("long_account_pct")) or 0.5
+        short_pct = _coerce_float(row.get("short_account_pct")) or 0.5
         if ratio >= 1.5:
             bias: Literal["long", "short", "balanced"] = "long"
         elif ratio <= 0.66:
@@ -460,131 +493,138 @@ class Level2:
             inferred_bias=bias,
         )
 
-    def _build_whales(
-        self, symbol: str, oi: OpenInterestSnapshot
-    ) -> WhaleSnapshot:
-        thresh = self.config.whale_oi_delta_pct
-        if abs(oi.delta_1h_pct) < thresh:
-            return WhaleSnapshot(symbol=symbol)
-        if oi.delta_1h_pct > 0:
-            direction = "accumulating"
-            msg = (
-                f"OI grew {oi.delta_1h_pct:.2f}% in 1h on {symbol} - "
-                "large position open."
-            )
-        else:
-            direction = "distributing"
-            msg = (
-                f"OI fell {oi.delta_1h_pct:.2f}% in 1h on {symbol} - "
-                "large position close."
-            )
-        notional_change = oi.current_value_usd * oi.delta_1h_pct / 100.0
-        return WhaleSnapshot(
-            symbol=symbol,
-            flagged=True,
-            direction=direction,
-            notional_usd_change=notional_change,
-            rationale=msg,
-        )
-
-    def _build_cumulative_funding(
+    def _extract_whales(
         self,
         symbol: str,
-        history: list[dict[str, Any]],
+        fetch: MetricFetch,
         oi: OpenInterestSnapshot,
+    ) -> WhaleSnapshot:
+        row = self._row_for_symbol(fetch.rows, symbol)
+        if row is None:
+            # Fallback: derive whale flag from OI 1h delta.
+            thresh = self.config.whale_oi_delta_pct
+            if abs(oi.delta_1h_pct) < thresh:
+                return WhaleSnapshot(symbol=symbol)
+            direction = (
+                "accumulating" if oi.delta_1h_pct > 0 else "distributing"
+            )
+            notional = oi.current_value_usd * oi.delta_1h_pct / 100.0
+            return WhaleSnapshot(
+                symbol=symbol,
+                flagged=True,
+                direction=direction,
+                notional_usd_change=notional,
+                rationale=(
+                    f"OI 1h move {oi.delta_1h_pct:+.2f}% on {symbol} - "
+                    "treated as whale activity (Dune whale_activity query "
+                    "not configured)."
+                ),
+            )
+        return WhaleSnapshot(
+            symbol=symbol,
+            flagged=bool(row.get("flagged") or row.get("whale_flagged")),
+            direction=str(row.get("direction") or "neutral"),  # type: ignore[arg-type]
+            notional_usd_change=_coerce_float(
+                row.get("notional_usd_change")
+            )
+            or 0.0,
+            rationale=str(row.get("rationale") or ""),
+        )
+
+    def _extract_cum_funding(
+        self,
+        symbol: str,
+        fetch: MetricFetch,
+        oi: OpenInterestSnapshot,
+        funding: FundingSnapshot,
     ) -> CumulativeFundingSnapshot:
-        if not history:
-            return CumulativeFundingSnapshot(symbol=symbol)
+        row = self._row_for_symbol(fetch.rows, symbol)
+        if row is not None:
+            return CumulativeFundingSnapshot(
+                symbol=symbol,
+                longs_paid_usd=_coerce_float(row.get("longs_paid_usd")) or 0.0,
+                shorts_paid_usd=_coerce_float(row.get("shorts_paid_usd")) or 0.0,
+                net_flow_usd=_coerce_float(row.get("net_flow_usd")) or 0.0,
+                window_hours=_coerce_float(row.get("window_hours"))
+                or float(self.config.lookback_hours),
+            )
+        # Fallback: rough estimate from funding rate * OI value * window.
+        if oi.current_value_usd <= 0 or funding.current_rate == 0:
+            return CumulativeFundingSnapshot(
+                symbol=symbol, window_hours=float(self.config.lookback_hours)
+            )
+        events = max(1, self.config.lookback_hours // 8)
         notional = oi.current_value_usd
-        longs_paid = 0.0
-        shorts_paid = 0.0
-        for h in history:
-            r = float(h.get("fundingRate", 0.0))
-            # Positive funding => longs pay shorts at notional * rate.
-            if r >= 0:
-                longs_paid += notional * r
-            else:
-                shorts_paid += notional * abs(r)
-        net = longs_paid - shorts_paid
-        # Each Binance funding event covers 8 hours.
-        window_hours = float(len(history) * 8)
+        total = notional * funding.current_rate * events
+        longs_paid = total if total >= 0 else 0.0
+        shorts_paid = -total if total < 0 else 0.0
         return CumulativeFundingSnapshot(
             symbol=symbol,
             longs_paid_usd=longs_paid,
             shorts_paid_usd=shorts_paid,
-            net_flow_usd=net,
-            window_hours=window_hours,
+            net_flow_usd=longs_paid - shorts_paid,
+            window_hours=float(self.config.lookback_hours),
         )
 
-    # ---- on-chain + dune --------------------------------------------
-
-    async def _collect_onchain(
-        self, market: dict[str, Any]
-    ) -> ArcOnchainSnapshot | None:
-        if self.onchain is None:
-            return None
-        account_id = market.get("account_id")
-        try:
-            return await self.onchain.snapshot(account_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Arc on-chain snapshot failed: {}", exc)
-            return None
-
-    async def _collect_dune(self) -> dict[str, Any]:
-        notes: list[str] = []
-        if self.dune is None or not self.config.dune_enabled:
-            notes.append("Dune MCP disabled in config.")
-            return {"healthy": False, "notes": notes}
-        try:
-            healthy = await self.dune.ping()
-        except Exception as exc:  # noqa: BLE001
-            notes.append(f"Dune MCP ping raised {exc!r}.")
-            healthy = False
-        if healthy:
-            notes.append("Dune MCP reachable; using cached query surface.")
-        else:
-            notes.append("Dune MCP unreachable; on-chain layer degrades gracefully.")
-        return {"healthy": healthy, "notes": notes}
+    def _build_vault_flow(self, fetch: MetricFetch) -> VaultFlowSnapshot:
+        row = self._first_row(fetch.rows)
+        if row is None:
+            return VaultFlowSnapshot(
+                window_hours=float(self.config.lookback_hours)
+            )
+        return VaultFlowSnapshot(
+            tvl_usdc=_coerce_float(row.get("tvl_usdc")) or 0.0,
+            deposits_usdc=_coerce_float(row.get("deposits_usdc")) or 0.0,
+            withdrawals_usdc=_coerce_float(row.get("withdrawals_usdc")) or 0.0,
+            deposit_events=int(row.get("deposit_events") or 0),
+            withdrawal_events=int(row.get("withdrawal_events") or 0),
+            window_hours=_coerce_float(row.get("window_hours"))
+            or float(self.config.lookback_hours),
+        )
 
     # ------------------------------------------------------------------
-    # Aggregation
+    # Regime / heat
     # ------------------------------------------------------------------
 
-    def _aggregate(
-        self,
-        per_symbol: dict[str, SymbolIntel],
-        onchain: OnchainSummary,
-    ) -> tuple[float, float, Regime, str]:
+    def _heuristic_heat(
+        self, per_symbol: dict[str, SymbolIntel]
+    ) -> float:
+        """Fallback heat formula when `market_sentiment` isn't configured."""
         if not per_symbol:
-            return 0.5, 0.5, "neutral", "L2 has no symbols to analyse."
-
-        symbol_scores: list[float] = []
+            return 0.5
+        scores: list[float] = []
         for intel in per_symbol.values():
-            symbol_scores.append(self._score_symbol(intel))
+            base = 0.5
+            base += max(-0.10, min(0.10, intel.funding.current_rate * 20))
+            base += max(-0.10, min(0.10, intel.open_interest.delta_1h_pct / 100.0 * 2))
+            base += max(
+                -0.15,
+                min(0.15, intel.volume.price_change_pct_24h / 100.0),
+            )
+            lsr = intel.long_short.long_short_ratio
+            if lsr > 1.0:
+                base += min(0.05, (lsr - 1.0) * 0.05)
+            else:
+                base -= min(0.05, (1.0 - lsr) * 0.05)
+            scores.append(max(0.0, min(1.0, base)))
+        return float(statistics.fmean(scores))
 
-        heat = float(sum(symbol_scores) / len(symbol_scores))
-        # On-chain modifier: vault net-inflow bumps risk-on slightly;
-        # large net outflow dampens score.
-        modifier = 0.0
-        if onchain.arc and onchain.arc.flow:
-            net = float(onchain.arc.flow.net_flow_usdc)
-            tvl = float(onchain.arc.vault_tvl_usdc or 1.0)
-            if tvl > 0:
-                rel = max(-0.2, min(0.2, net / tvl))
-                modifier = 0.1 * rel / 0.2  # max +/- 0.1
-        score = max(0.0, min(1.0, heat + modifier))
+    def _classify_regime(self, score: float) -> Regime:
+        if score >= self.config.risk_on_heat:
+            return "risk_on"
+        if score <= self.config.risk_off_heat:
+            return "risk_off"
+        if abs(score - 0.5) <= 0.05:
+            return "neutral"
+        return "transition"
 
-        regime: Regime
-        if score >= 0.62:
-            regime = "risk_on"
-        elif score <= 0.38:
-            regime = "risk_off"
-        elif abs(score - 0.5) <= 0.05:
-            regime = "neutral"
-        else:
-            regime = "transition"
-
-        # Compact rationale.
+    def _build_rationale(
+        self,
+        score: float,
+        regime: Regime,
+        heat: float,
+        per_symbol: dict[str, SymbolIntel],
+    ) -> str:
         bits: list[str] = []
         for intel in per_symbol.values():
             bits.append(
@@ -592,57 +632,51 @@ class Level2:
                 f"OI(1h)={intel.open_interest.delta_1h_pct:+.2f}% "
                 f"L/S={intel.long_short.long_short_ratio:.2f}"
             )
-        rationale = (
+        return (
             f"L2 regime={regime} score={score:.2f} heat={heat:.2f} | "
             + " | ".join(bits)
         )
-        return float(score), float(heat), regime, rationale
 
-    def _score_symbol(self, intel: SymbolIntel) -> float:
-        """Heuristic per-symbol score in [0,1].
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        Combines:
-            * Funding direction (positive funding -> shorts paid =>
-              market net-long => slight risk-on bias).
-            * OI 1h delta sign.
-            * 24h price change.
-            * Long/short ratio.
-            * Volume spike (small positive contribution to magnitude).
-        """
-        base = 0.5
-        # Funding contribution (bounded).
-        f = intel.funding.current_rate
-        base += max(-0.10, min(0.10, f * 20))  # 0.01% rate ~= +0.002
-        # OI delta contribution.
-        d = intel.open_interest.delta_1h_pct / 100.0
-        base += max(-0.10, min(0.10, d * 2))
-        # Price change contribution.
-        p = intel.volume.price_change_pct_24h / 100.0
-        base += max(-0.15, min(0.15, p))
-        # Long/short bias.
-        lsr = intel.long_short.long_short_ratio
-        if lsr > 1.0:
-            base += min(0.05, (lsr - 1.0) * 0.05)
-        else:
-            base -= min(0.05, (1.0 - lsr) * 0.05)
-        return float(max(0.0, min(1.0, base)))
+    @staticmethod
+    def _first_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _row_for_symbol(
+        rows: list[dict[str, Any]], symbol: str
+    ) -> dict[str, Any] | None:
+        for r in rows:
+            if str(r.get("symbol") or "").upper() == symbol.upper():
+                return r
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (module-private)
 # ---------------------------------------------------------------------------
 
 
-def _empty_symbol_intel(symbol: str, note: str = "") -> SymbolIntel:
-    return SymbolIntel(
-        symbol=symbol,
-        funding=FundingSnapshot(symbol=symbol),
-        open_interest=OpenInterestSnapshot(symbol=symbol),
-        volume=VolumeSnapshot(symbol=symbol),
-        long_short=LongShortSnapshot(symbol=symbol),
-        whales=WhaleSnapshot(symbol=symbol),
-        cum_funding=CumulativeFundingSnapshot(symbol=symbol),
-        notes=[note] if note else [],
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_status(name: str, fetch: MetricFetch) -> MetricStatus:
+    return MetricStatus(
+        name=name,
+        source=fetch.source,
+        rows=len(fetch.rows),
+        query_id=fetch.query_id,
+        cached=fetch.cached,
+        note=fetch.note,
     )
 
 
@@ -655,10 +689,27 @@ def _intel_to_dict(intel: Level2Intelligence) -> dict[str, Any]:
         "generated_at": intel.generated_at,
         "cached": intel.cached,
         "notes": intel.notes,
-        "onchain": {
-            "arc": _arc_snapshot_to_dict(intel.onchain.arc),
-            "dune_healthy": intel.onchain.dune_healthy,
-            "dune_notes": intel.onchain.dune_notes,
+        "dune_healthy": intel.dune_healthy,
+        "vault_flow": {
+            "tvl_usdc": intel.vault_flow.tvl_usdc,
+            "deposits_usdc": intel.vault_flow.deposits_usdc,
+            "withdrawals_usdc": intel.vault_flow.withdrawals_usdc,
+            "deposit_events": intel.vault_flow.deposit_events,
+            "withdrawal_events": intel.vault_flow.withdrawal_events,
+            "net_flow_usdc": intel.vault_flow.net_flow_usdc,
+            "window_hours": intel.vault_flow.window_hours,
+        },
+        "metric_status": {
+            name: {
+                "name": st.name,
+                "source": st.source,
+                "rows": st.rows,
+                "query_id": st.query_id,
+                "cached": st.cached,
+                "note": st.note,
+                "available": st.available,
+            }
+            for name, st in intel.metric_status.items()
         },
         "per_symbol": {
             sym: {
@@ -668,7 +719,6 @@ def _intel_to_dict(intel: Level2Intelligence) -> dict[str, Any]:
                     "rate_24h_change": s.funding.rate_24h_change,
                     "weighted_average_24h": s.funding.weighted_average_24h,
                     "annualised_pct": s.funding.annualised_pct,
-                    "next_funding_ms": s.funding.next_funding_ms,
                 },
                 "open_interest": {
                     "current_contracts": s.open_interest.current_contracts,
@@ -680,9 +730,8 @@ def _intel_to_dict(intel: Level2Intelligence) -> dict[str, Any]:
                 "volume": {
                     "last_price": s.volume.last_price,
                     "price_change_pct_24h": s.volume.price_change_pct_24h,
-                    "base_volume_24h": s.volume.base_volume_24h,
-                    "quote_volume_24h": s.volume.quote_volume_24h,
-                    "trades_24h": s.volume.trades_24h,
+                    "volume_24h_usd": s.volume.volume_24h_usd,
+                    "volume_1h_usd": s.volume.volume_1h_usd,
                     "spike_detected": s.volume.spike_detected,
                     "spike_zscore": s.volume.spike_zscore,
                 },
@@ -711,37 +760,6 @@ def _intel_to_dict(intel: Level2Intelligence) -> dict[str, Any]:
     }
 
 
-def _arc_snapshot_to_dict(snap: ArcOnchainSnapshot | None) -> dict[str, Any] | None:
-    if snap is None:
-        return None
-    flow = snap.flow
-    return {
-        "rpc_url": snap.rpc_url,
-        "chain_id": snap.chain_id,
-        "latest_block": snap.latest_block,
-        "vault_tvl_usdc": float(snap.vault_tvl_usdc),
-        "vault_address": snap.vault_address,
-        "usdc_address": snap.usdc_address,
-        "agent_margin_usdc": float(snap.agent_margin_usdc)
-        if snap.agent_margin_usdc is not None
-        else None,
-        "flow": (
-            None
-            if flow is None
-            else {
-                "block_window": flow.block_window,
-                "deposits_usdc": float(flow.deposits_usdc),
-                "withdrawals_usdc": float(flow.withdrawals_usdc),
-                "net_flow_usdc": float(flow.net_flow_usdc),
-                "deposit_events": flow.deposit_events,
-                "withdrawal_events": flow.withdrawal_events,
-            }
-        ),
-        "healthy": snap.healthy,
-        "notes": snap.notes,
-    }
-
-
 __all__ = [
     "Level2",
     "Level2Config",
@@ -753,5 +771,6 @@ __all__ = [
     "LongShortSnapshot",
     "WhaleSnapshot",
     "CumulativeFundingSnapshot",
-    "OnchainSummary",
+    "VaultFlowSnapshot",
+    "MetricStatus",
 ]
