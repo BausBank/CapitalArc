@@ -21,6 +21,9 @@ eth-account==0.11.3
 eth-abi==5.1.0
 
 # --- Circle Developer-Controlled Wallets SDK (scripts/setup) ---
+# Pinned to 9.0.0: version 9.1.0 reorganised modules (`circle.web3.utils`
+# was removed) and introduced an unmet `lazy_imports` dep. Do not bump
+# without re-testing `scripts/create_circle_wallet.py`.
 circle-developer-controlled-wallets==9.0.0
 
 # --- Crypto (RSA-OAEP encryption of Circle entity secret) ---

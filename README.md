@@ -164,10 +164,54 @@ The agent can now move real capital on Arc Testnet through Circle DCW.
 the chain. Flip to `--live` once the Arc Testnet wallet is funded with
 USDC.
 
-**Next (Day 3):** real Level-1 indicators on live OHLCV, Dune MCP client
-for Level 2, first real Gemini arbitration call returning strict JSON,
-EIP-712 order signing against the perp matcher endpoint, and USYC
-rotation on the risk-off leg.
+### Day 3 — Planned
+
+Concrete checklist for the next session (so a fresh chat can pick up
+without re-discovering anything):
+
+- **Level 1 — real technical signals** (`src/core/level1.py`)
+  - Wire OHLCV ingestion (1m / 5m / 1h candles). Source TBD: public Arc
+    perp API if exposed, else fall back to a CEX proxy (Binance perp
+    BTC/ETH) for the demo.
+  - Implement EMA stack (e.g. 21 / 55 / 200), RSI(14), MACD, ATR(14),
+    realised vol. Return a `LevelScore` in `[0, 1]` with a short rationale.
+
+- **Level 2 — Dune MCP client** (`src/core/level2.py`)
+  - Talk to the Dune MCP server using `DUNE_API_KEY`.
+  - Queries: stablecoin net flows on Arc, perp open-interest delta, DEX
+    volume regime, whale-wallet rotations, CCTP bridge volume.
+  - Aggregate into a `LevelScore` with structured rationale lines.
+
+- **Level 3 — real Gemini 2.5 Flash arbitration** (`src/core/level3.py`
+  + `src/llm/gemini_client.py`)
+  - Pin temperature low, force strict JSON: `{"score": float, "regime":
+    str, "rationale": str}`.
+  - Feed `ArbiterBriefing { l1_score, l1_rationale, l2_score, l2_rationale,
+    market_snapshot }`.
+
+- **Trading wire-up** (`src/execution/arc_perp_executor.py`)
+  - Set `ARC_PERP_MATCHER_URL` in `.env` once published in
+    `#agora-hackers`.
+  - Sign EIP-712 `OrderTypes.Order` with `eth-account`, POST signed
+    orders to the matcher. `open_position` / `close_position` then go
+    fully live.
+  - Decode `PositionLedger.getPosition` return tuple into the `Position`
+    dataclass (we already read it; only the decoder is missing).
+
+- **Risk-off leg — USYC rotation** (`src/allocation/allocation_router.py`)
+  - On `risk_off`, withdraw USDC margin from the perp vault and route
+    into USYC (mint via Circle's USYC token contracts, addresses already
+    in `.env`).
+  - Reverse path on the next `risk_on`.
+
+- **Observability**
+  - Persist every `DecisionResult` + `ExecutionPlan` to a local JSONL
+    log so we can replay the agent's day.
+  - Optional: small CLI summary (`scripts/show_last_decisions.py`).
+
+**Definition of done for Day 3:** the agent runs end-to-end on real
+signals, opens / closes a real perp position on Arc Testnet on `--live`,
+and can rotate into USYC on a risk-off flip.
 
 ---
 
