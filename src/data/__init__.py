@@ -3,27 +3,29 @@
 This package contains the *only* market-data sources the decision
 engine is allowed to consult:
 
-- `DuneMCPClient` - **the** Level-2 source. Speaks the same
-  Bearer-authenticated REST surface the Dune MCP server exposes to
-  LLMs and runs the Arc-native SQL templates stored in
-  `dune/queries/*.sql`.
-- `ArcMarketData` - Level-1 OHLCV reader. Reconstructs candles
-  directly from Arc Perp DEX `Trade`-style events via `web3.py`
-  against `ARC_RPC_URL` - no off-chain CEX feeds.
-- `ArcOnchainReader` - lightweight Arc Testnet reader for the
-  agent's own wallet / margin / vault TVL (used to build the market
-  context and the on-chain panel - **not** as a Level-2 data path).
+- `DuneMCPClient` - **the single source of truth** for every market
+  signal. Speaks the same Bearer-authenticated REST surface the Dune
+  MCP server exposes to LLMs, and runs the Arc-native SQL templates
+  stored in `dune/queries/*.sql`.
+- `DuneMarketData` - Level-1 OHLCV adapter built on top of
+  `DuneMCPClient`. Wraps the `ohlcv` saved query so Level 1 can ask
+  for candles per `(symbol, interval)` without knowing about Dune at
+  all.
+- `ArcOnchainReader` - thin Arc Testnet reader for **account state
+  only** (agent wallet balance, vault TVL, agent margin). It is
+  **not** a market-data source: the Decision Engine never reads
+  trading signals through it.
 
 There is intentionally no CEX adapter (Binance, OKX, etc.). All
-intelligence is Arc-native.
+analysis is on-chain via Dune.
 """
 
-from src.data.arc_market_data import (
-    ArcMarketData,
-    ArcMarketDataConfig,
+from src.data.arc_onchain import ArcOnchainConfig, ArcOnchainReader
+from src.data.dune_market_data import (
+    DuneMarketData,
+    DuneMarketDataConfig,
     KlineFetchResult,
 )
-from src.data.arc_onchain import ArcOnchainConfig, ArcOnchainReader
 from src.data.dune_mcp import (
     METRIC_NAMES,
     DuneMCPClient,
@@ -33,9 +35,6 @@ from src.data.dune_mcp import (
 )
 
 __all__ = [
-    "ArcMarketData",
-    "ArcMarketDataConfig",
-    "KlineFetchResult",
     "ArcOnchainReader",
     "ArcOnchainConfig",
     "DuneMCPClient",
@@ -43,4 +42,7 @@ __all__ = [
     "DuneQueryResult",
     "MetricFetch",
     "METRIC_NAMES",
+    "DuneMarketData",
+    "DuneMarketDataConfig",
+    "KlineFetchResult",
 ]

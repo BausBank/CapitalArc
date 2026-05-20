@@ -49,11 +49,12 @@ The engine evaluates levels **cascadingly**, not in parallel:
 
 ### Level 1 - Technical hard rules ("защита от дурака")
 - **Inputs:** OHLCV on `15m` and `1h` for `BTC-PERP / ETH-PERP /
-  SOL-PERP`, reconstructed directly from Arc Perp DEX trade events
-  via `ArcMarketData` (`src/data/arc_market_data.py`) over Arc RPC
-  with `web3.py`. **No CEX feed is consulted** - if Arc has no fills
-  in the lookback window, the rule returns `ohlcv_unavailable` and
-  the agent honestly refuses to trade.
+  SOL-PERP`, fetched through `DuneMarketData`
+  (`src/data/dune_market_data.py`) which executes the `ohlcv` saved
+  Dune query (`dune/queries/ohlcv.sql`). **There is no other market
+  data path:** no CEX feed, no Arc-RPC scrape. If Dune returns no
+  rows (or `DUNE_QUERY_OHLCV_ID` is unset), the rule returns
+  `ohlcv_unavailable` and the agent refuses to trade.
 - **Hard rules:**
   - Trend filter: `close > EMA9 > EMA21` (or mirrored down) on *both*
     timeframes; otherwise `trend_mixed` blocks.
@@ -65,11 +66,12 @@ The engine evaluates levels **cascadingly**, not in parallel:
     `MAX_DRAWDOWN_PCT`.
 - **Output:** `Level1Decision { passes, score, rationale, reasons,
   per_symbol }` carrying every triggered rule as a structured
-  `Level1Reason` so the UI can render the *why*. Mapped to
-  `LevelScore` in `[0, 1]` (0.0 when blocked; `0.5 + 0.5 * strength`
-  otherwise).
-- **Code:** `src/core/level1.py`, OHLCV reader in
-  `src/data/arc_market_data.py`.
+  `Level1Reason` so the UI can render the *why*. Each block reason
+  carries Dune provenance (`source`, `query_id`, bars vs required).
+  Mapped to `LevelScore` in `[0, 1]` (0.0 when blocked;
+  `0.5 + 0.5 * strength` otherwise).
+- **Code:** `src/core/level1.py`, OHLCV adapter in
+  `src/data/dune_market_data.py`, SQL in `dune/queries/ohlcv.sql`.
 
 ### Level 2 - On-chain intelligence (Dune MCP only)
 - **Single data source:** `DuneMCPClient` (`src/data/dune_mcp.py`) -
@@ -174,7 +176,7 @@ All execution is idempotent: every action is keyed by an internal
 | Folder           | Responsibility                                                  |
 |------------------|-----------------------------------------------------------------|
 | `src/core`       | Decision engine, Level 1-3, score aggregation                   |
-| `src/data`       | Arc-native adapters: `ArcMarketData` (OHLCV from Arc RPC), `DuneMCPClient` (Level 2 source), `ArcOnchainReader` (wallet / vault) |
+| `src/data`       | `DuneMCPClient` (single source of truth for L1 + L2), `DuneMarketData` (OHLCV adapter on top of Dune), `ArcOnchainReader` (account state only - wallet / vault) |
 | `src/execution`  | Arc Perp DEX client, order/position management, risk checks     |
 | `src/allocation` | Risk-on / risk-off router, USYC rotation, CCTP moves            |
 | `src/llm`        | Gemini 2.5 Flash client (Level 3 final arbiter)                 |
@@ -190,11 +192,11 @@ All execution is idempotent: every action is keyed by an internal
 ## 6. Operating principles
 
 1. **On-chain by default.** If an action can happen on Arc through Circle primitives, it must.
-2. **Arc-native data only.** Level 1 OHLCV comes from Arc RPC; Level 2 metrics come from Dune MCP. There is *no* CEX adapter - off-chain feeds are explicitly out of scope.
+2. **Dune MCP is the single source of truth.** Every market signal - OHLCV (L1) and on-chain intelligence (L2) - reads through a saved Dune query. No CEX feed, no direct RPC market-data scrape. Arc RPC is used **only** for account state (wallet balance, vault TVL, agent margin).
 3. **Deterministic decisions.** Same inputs -> same score -> same action. Gemini is pinned to low temperature and strict JSON output.
 4. **Safety over alpha.** Drawdown guard and stale-data guard always win over signals. L1 hard rules veto trades; they are never softened by L2 / L3.
 5. **Cascade, don't average.** Levels are *gates*, not weighted blobs. If L1 says no, the engine doesn't call L2 / L3 and never produces a false-positive risk-on.
-6. **Honest provenance.** Each Level-2 metric reports its Dune query id (or `n/a` with a clear note) so users always know whether a number is on-chain truth or a placeholder.
+6. **Honest provenance.** Every metric (L1 OHLCV included) reports its Dune query id (or `n/a` with a clear note) so users always know whether a number is on-chain truth or a placeholder.
 7. **Observable.** Every decision logs its inputs, level scores, final score, action and tx hash. The CLI renders a six-panel rich report on each cycle.
 8. **Modular.** Each level is replaceable; the router does not care how a score was computed.
 
@@ -206,5 +208,5 @@ All execution is idempotent: every action is keyed by an internal
 |-----|-------------|------------------------------------------------------------------------------------|
 | 1   | ✅ Done     | Repository scaffolding, three-level stubs, secret hygiene.                         |
 | 2   | ✅ Done     | Live Arc Perp DEX margin moves through Circle DCW + Paymaster + RSA encryption.    |
-| 3   | ✅ Done     | Level 1 hard rules (Arc RPC OHLCV via `ArcMarketData`) + Level 2 on-chain intelligence (Dune MCP only, per-metric provenance, SQL templates in `dune/queries/`). Cascading engine with short-circuit. Rich-panel CLI. **No CEX feed in the stack.** |
+| 3   | ✅ Done     | Level 1 + Level 2 fully implemented with **Dune MCP as the single source of truth** (OHLCV via `DuneMarketData` + 8 on-chain metrics, all carrying per-query provenance, SQL templates in `dune/queries/`). Cascading engine with short-circuit. Rich-panel CLI. Arc RPC kept only for account state. |
 | 4   | 🚧 Planned  | Real Gemini 2.5 Flash arbiter (L3), EIP-712 order signing for `open_position`, USYC rotation on risk-off, JSONL decision log. |

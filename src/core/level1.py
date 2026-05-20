@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import pandas as pd
 
-from src.data.arc_market_data import ArcMarketData, KlineFetchResult
+from src.data.dune_market_data import DuneMarketData, KlineFetchResult
 from src.utils.logging import logger
 
 if TYPE_CHECKING:
@@ -152,7 +152,7 @@ class Level1:
         self,
         config: Level1Config | None = None,
         *,
-        market_data: ArcMarketData,
+        market_data: DuneMarketData,
     ) -> None:
         self.config = config or Level1Config()
         self.market_data = market_data
@@ -287,10 +287,10 @@ class Level1:
             if df is None or df.empty or len(df) < min_required:
                 note_hint = ""
                 if fetch is not None:
-                    fills = fetch.fills
                     note_hint = (
-                        f" (Arc RPC: fills={fills}, "
-                        f"blocks={fetch.from_block}..{fetch.to_block})"
+                        f" (Dune MCP: source={fetch.source}, "
+                        f"bars={0 if df is None else len(df)}, "
+                        f"need={min_required})"
                     )
                 blocking.append(
                     Level1Reason(
@@ -303,7 +303,8 @@ class Level1:
                         symbol=symbol,
                         timeframe=tf,
                         metadata={
-                            "fills": fetch.fills if fetch else 0,
+                            "source": fetch.source if fetch else "n/a",
+                            "query_id": fetch.query_id if fetch else None,
                             "have_bars": int(0 if df is None else len(df)),
                             "min_required_bars": min_required,
                             "notes": list(fetch.notes) if fetch else [],
@@ -510,7 +511,7 @@ class Level1:
             return await self.market_data.get_klines(symbol, tf, limit)
         except Exception as exc:  # noqa: BLE001 - data degrades to a block
             logger.warning(
-                "Level1: Arc RPC klines fetch failed for {}@{}: {!r}",
+                "Level1: Dune MCP klines fetch failed for {}@{}: {!r}",
                 symbol,
                 tf,
                 exc,

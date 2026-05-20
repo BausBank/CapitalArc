@@ -223,7 +223,7 @@ def level1_panel(l1_raw: dict[str, Any], score: float) -> Panel:
 
     return Panel(
         Group(summary, indicators, reasons_table),
-        title="[bold]Level 1 - Technical Hard Rules[/]",
+        title="[bold]Level 1 - Technical Hard Rules (OHLCV via Dune MCP)[/]",
         border_style="green" if passes else "red",
         box=box.ROUNDED,
     )
@@ -419,7 +419,7 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
 
     return Panel(
         Group(*grouped),
-        title="[bold]Level 2 - On-chain Intelligence (Dune MCP only)[/]",
+        title="[bold]Level 2 - On-chain Intelligence (Dune MCP single source)[/]",
         border_style=_colour_for_regime(regime),
         box=box.ROUNDED,
     )

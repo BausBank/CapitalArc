@@ -66,15 +66,15 @@ CapitalArc/
 ├── main.py           # Entry point: --dry-run / --live, optional --loop
 ├── src/
 │   ├── core/         # DecisionEngine + Level 1/2/3 + ExecutionDirective
-│   ├── data/         # ArcMarketData, DuneMCPClient, ArcOnchainReader
+│   ├── data/         # DuneMCPClient + DuneMarketData (OHLCV), ArcOnchainReader
 │   ├── execution/    # ArcPerpExecutor + CircleWallet (DCW + Paymaster)
 │   ├── allocation/   # AllocationRouter: directive -> on-chain action
 │   ├── llm/          # Gemini 2.5 Flash client (final arbiter)
 │   ├── agents/       # Reserved for top-level orchestration helpers
 │   └── utils/        # Settings (pydantic), logging (loguru), rich panels
 ├── prompts/          # LLM prompt templates for the Level 3 arbiter
-├── dune/             # Dune MCP SQL templates (Level 2) + setup README
-│   └── queries/      #   funding_rates.sql, open_interest.sql, ...
+├── dune/             # Dune MCP SQL templates (Level 1 + 2) + setup README
+│   └── queries/      #   ohlcv.sql, funding_rates.sql, open_interest.sql, ...
 ├── scripts/          # One-off scripts: deploy, seed, simulate, backtest
 ├── tests/            # Unit & integration tests
 ├── .env.example      # Template for environment variables
@@ -98,8 +98,8 @@ CapitalArc/
 - **USYC** — yield-bearing tokenized USDC (risk-off leg)
 
 **Intelligence & Data**
-- **Arc RPC** — Level 1 OHLCV reconstruction (no CEX feeds)
-- **Dune MCP** — the **only** Level 2 data source, on-chain analytics
+- **Dune MCP** — the **single source of truth** for both Level 1 (OHLCV / TA) and Level 2 (on-chain intelligence)
+- **Arc RPC** — used **only** for non-trading account state (wallet, vault TVL, agent margin); never feeds trading signals
 - **Gemini 2.5 Flash** (Google AI Studio) — LLM final arbiter (Level 3)
 
 **Backend**
@@ -172,23 +172,26 @@ USDC.
 
 Level 1 (technical hard rules) and Level 2 (on-chain intelligence)
 are both fully wired and feed a cascading `DecisionEngine`. By design
-the agent has exactly **two market-data sources** — Arc RPC for
-Level 1 OHLCV and Dune MCP for every Level 2 metric. There is **no**
-CEX adapter (Binance / OKX / ...).
+the agent has exactly **one market-data source**: **Dune MCP**. Both
+Level 1 (OHLCV / TA) and Level 2 (funding, OI, volume, vault flows,
+whales, L/S, cum funding, market sentiment) read through saved Dune
+queries. Arc RPC is still used, but **only** for non-trading account
+state (wallet, vault TVL, agent margin) - it never feeds the
+decision engine.
 
 - **Level 1 — Technical hard rules** (`src/core/level1.py`)
   - OHLCV for **BTC-PERP / ETH-PERP / SOL-PERP** on `15m` and `1h`
-    is reconstructed directly from Arc Perp DEX trade events via the
-    new **`ArcMarketData`** reader (`src/data/arc_market_data.py`):
-    it pulls `Trade(bytes32 indexed marketId, uint256 price,
-    uint256 size, uint8 side, uint64 timestamp)` logs from the
-    `ClearingHouse` contract through `web3.py` over Arc RPC, then
-    buckets fills into time intervals. The event signature is
-    configurable (`ARC_PERP_TRADE_EVENT_SIG`) so the agent picks up
-    the canonical one as soon as Arc publishes it.
-  - When Arc Testnet has no fills in the window, Level 1 returns
-    an `ohlcv_unavailable` block with the exact block range scanned
-    and how many fills were found — never invents data.
+    is fetched through the new **`DuneMarketData`** adapter
+    (`src/data/dune_market_data.py`), which wraps `DuneMCPClient`
+    and runs the `ohlcv` saved query (`dune/queries/ohlcv.sql`).
+    The adapter executes one Dune call per cycle for *every*
+    `(symbol, interval)` combination, then fan-outs the rows to
+    per-symbol pandas DataFrames so the indicator stack stays
+    unchanged.
+  - When `DUNE_QUERY_OHLCV_ID` isn't configured (or the query
+    returns no rows), Level 1 emits an `ohlcv_unavailable` block
+    that explicitly cites the Dune source (`source=n/a / dune:<id>`,
+    bars returned vs required) - never invents data.
   - Four hard rules ("защита от дурака") that can each veto a trade:
     1. **Trend filter** — `close > EMA9 > EMA21` (or mirror down) must
        hold on *both* 15m and 1h; otherwise `trend_mixed` blocks.
@@ -264,11 +267,12 @@ CEX adapter (Binance / OKX / ...).
     and tx state.
 
 - **Config & env**
-  - New settings: `ARC_PERP_TRADE_EVENT_SIG`, `ARC_PERP_PRICE_DECIMALS`,
-    `ARC_PERP_SIZE_DECIMALS`, `ARC_PERP_OHLCV_LOOKBACK_BLOCKS`,
-    `DUNE_CHAIN_TAG`, `DUNE_LOOKBACK_HOURS`, and one
-    `DUNE_QUERY_*_ID` per Level-2 metric. Removed: all `BINANCE_*`
-    settings (no more CEX feeds).
+  - New settings: `OHLCV_LOOKBACK_HOURS`, `DUNE_CHAIN_TAG`,
+    `DUNE_LOOKBACK_HOURS`, and one `DUNE_QUERY_*_ID` per metric
+    (now including `DUNE_QUERY_OHLCV_ID` for Level 1). Removed:
+    all `BINANCE_*` settings and the `ARC_PERP_TRADE_EVENT_SIG /
+    ARC_PERP_*_DECIMALS / ARC_PERP_OHLCV_LOOKBACK_BLOCKS` family
+    (no more direct Arc-RPC OHLCV scraping).
 
 ### Day 4 — Planned
 

@@ -49,8 +49,11 @@ import httpx
 from src.utils.logging import logger
 
 
-# Canonical metric names used by Level 2.
+# Canonical metric names used by Level 1 + Level 2.
 METRIC_NAMES = (
+    # Level 1
+    "ohlcv",            # used to reconstruct candles for the TA rules
+    # Level 2
     "funding_rates",
     "open_interest",
     "volume",

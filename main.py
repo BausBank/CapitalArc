@@ -2,19 +2,20 @@
 
 Wires the full pipeline:
 
-    Level 1 (Arc RPC OHLCV) + Level 2 (Dune MCP only) [+ Level 3]
+    Level 1 (Dune MCP OHLCV) + Level 2 (Dune MCP on-chain) [+ Level 3]
         -> DecisionEngine (cascade L1 -> L2 -> L3)
             -> AllocationRouter
                 -> ArcPerpExecutor + CircleWallet (Arc Perp DEX, Paymaster)
 
-By design the agent has exactly two market-data sources:
+Single source of truth: **Dune MCP**. Both Level 1 (OHLCV / TA) and
+Level 2 (funding, OI, volume, vault flow, whales, L/S, cum funding,
+sentiment) read from saved Dune queries. There is no CEX adapter
+and no Arc-RPC market-data scraper.
 
-    - Arc RPC, used by `ArcMarketData` to reconstruct OHLCV from
-      on-chain perp DEX trade events (Level 1).
-    - Dune MCP, the only data path for every Level 2 metric.
-
-There is intentionally no CEX adapter (Binance / OKX / ...). Removing
-off-chain feeds keeps CapitalArc Arc-native.
+Arc RPC is still used, but **only** for non-trading account state -
+the agent's wallet balance, vault TVL and margin in the Market
+Context panel. The decision engine itself never reads market signals
+through it.
 
 Usage
 -----
@@ -45,8 +46,8 @@ from src.allocation.allocation_router import AllocationConfig, AllocationRouter
 from src.core.decision_engine import DecisionEngine
 from src.core.level1 import Level1, Level1Config
 from src.core.level2 import Level2, Level2Config
-from src.data.arc_market_data import ArcMarketData, ArcMarketDataConfig
 from src.data.arc_onchain import ArcOnchainConfig, ArcOnchainReader
+from src.data.dune_market_data import DuneMarketData, DuneMarketDataConfig
 from src.data.dune_mcp import DuneMCPClient, DuneMCPClientConfig
 from src.execution.arc_perp_executor import ArcPerpConfig, ArcPerpExecutor
 from src.execution.circle_wallet import CircleWallet, CircleWalletConfig
@@ -97,17 +98,22 @@ def _build_executor(
     return ArcPerpExecutor(wallet=wallet, config=cfg, dry_run=dry_run)
 
 
-def _build_arc_market_data(settings: Settings) -> ArcMarketData:
-    return ArcMarketData(
-        ArcMarketDataConfig(
-            rpc_url=settings.ARC_RPC_URL,
-            clearinghouse_address=settings.ARC_PERP_ROUTER_ADDRESS,
-            market_registry_address=settings.ARC_PERP_MARKET_REGISTRY_ADDRESS,
-            trade_event_sig=settings.ARC_PERP_TRADE_EVENT_SIG,
-            price_decimals=settings.ARC_PERP_PRICE_DECIMALS,
-            size_decimals=settings.ARC_PERP_SIZE_DECIMALS,
-            max_lookback_blocks=settings.ARC_PERP_OHLCV_LOOKBACK_BLOCKS,
-        )
+def _build_dune_market_data(
+    settings: Settings, dune: DuneMCPClient | None
+) -> DuneMarketData:
+    return DuneMarketData(
+        dune=dune,
+        config=DuneMarketDataConfig(
+            chain=settings.DUNE_CHAIN_TAG,
+            symbols=settings.perp_symbols or ["BTC-PERP", "ETH-PERP", "SOL-PERP"],
+            intervals=settings.l1_timeframes,
+            lookback_hours=settings.OHLCV_LOOKBACK_HOURS,
+            cache_ttl_seconds=(
+                settings.DEMO_CACHE_TTL_SECONDS
+                if settings.DEMO_MODE
+                else settings.DUNE_CACHE_TTL_SECONDS
+            ),
+        ),
     )
 
 
@@ -142,7 +148,7 @@ def _build_arc_reader(settings: Settings) -> ArcOnchainReader:
 
 def _build_engine(
     settings: Settings,
-    market_data: ArcMarketData,
+    market_data: DuneMarketData,
     dune: DuneMCPClient | None,
 ) -> DecisionEngine:
     level1 = Level1(
@@ -282,8 +288,8 @@ async def run_once(dry_run: bool) -> None:
 
     wallet = _build_circle_wallet(settings, dry_run=dry_run)
     executor = _build_executor(settings, wallet=wallet, dry_run=dry_run)
-    market_data = _build_arc_market_data(settings)
     dune = _build_dune(settings)
+    market_data = _build_dune_market_data(settings, dune=dune)
     onchain = _build_arc_reader(settings)
     engine = _build_engine(settings, market_data=market_data, dune=dune)
     router = _build_router(settings, executor=executor, dry_run=dry_run)

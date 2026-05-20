@@ -34,16 +34,12 @@ class Settings(BaseSettings):
     DEMO_MODE: bool = True
     DEMO_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
 
-    # ---------- Market data (Level 1 OHLCV - Arc RPC only) ----------
-    # Event signature emitted by Arc Perp DEX `ClearingHouse` per fill.
-    # The agent reconstructs OHLCV from these logs (no off-chain feed).
-    # Override here the moment Arc publishes the canonical signature.
-    ARC_PERP_TRADE_EVENT_SIG: str = "Trade(bytes32,uint256,uint256,uint8,uint64)"
-    # Decimal scaling for price / size fields in the trade event payload.
-    ARC_PERP_PRICE_DECIMALS: int = 8
-    ARC_PERP_SIZE_DECIMALS: int = 6
-    # Max block lookback per `eth_getLogs` call.
-    ARC_PERP_OHLCV_LOOKBACK_BLOCKS: int = 100_000
+    # ---------- Market data (Level 1 OHLCV - sourced via Dune MCP) ----------
+    # Day-3+: Level 1 OHLCV comes from the Dune `ohlcv` saved query
+    # (see dune/queries/ohlcv.sql + DUNE_QUERY_OHLCV_ID below). No
+    # Arc RPC scrape, no CEX feed - the agent's analytical stack is
+    # single-sourced from Dune MCP.
+    OHLCV_LOOKBACK_HOURS: int = 48
 
     # ---------- Arc Chain ----------
     ARC_RPC_URL: str = "https://rpc.testnet.arc.network"
@@ -103,7 +99,10 @@ class Settings(BaseSettings):
     DUNE_LOOKBACK_HOURS: int = 24
 
     # Per-metric saved Dune query ids. Leave any of these unset and
-    # Level 2 reports that metric as `n/a` (no fake zeros).
+    # the corresponding metric is reported as `n/a` (no fake zeros).
+    # Level 1 OHLCV ships first because the entire technical-rule
+    # stack depends on it - without this id Level 1 cannot run.
+    DUNE_QUERY_OHLCV_ID: int | None = None
     DUNE_QUERY_FUNDING_RATES_ID: int | None = None
     DUNE_QUERY_OPEN_INTEREST_ID: int | None = None
     DUNE_QUERY_VOLUME_ID: int | None = None
@@ -166,6 +165,7 @@ class Settings(BaseSettings):
         Dune client reports them as `n/a` instead of executing query 0.
         """
         candidates = {
+            "ohlcv": self.DUNE_QUERY_OHLCV_ID,
             "funding_rates": self.DUNE_QUERY_FUNDING_RATES_ID,
             "open_interest": self.DUNE_QUERY_OPEN_INTEREST_ID,
             "volume": self.DUNE_QUERY_VOLUME_ID,
