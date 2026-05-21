@@ -18,13 +18,271 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from rich import box
-from rich.console import Group
+from rich.console import Console, Group
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TextColumn,
+)
 from rich.table import Table
 from rich.text import Text
+
+
+# ---------------------------------------------------------------------------
+# Retro / clean-mode UI primitives
+# ---------------------------------------------------------------------------
+
+
+# Tag emoji palette used by the clean output. Centralised so the demo
+# can stay consistent across helpers.
+_EMOJI_OK = "[green]\u2713[/]"  # ✓
+_EMOJI_FAIL = "[red]\u2717[/]"  # ✗
+_EMOJI_WARN = "[yellow]\u26a0[/]"  # ⚠
+_EMOJI_UP = "[bold green]\U0001f4c8[/]"  # 📈
+_EMOJI_DOWN = "[bold red]\U0001f4c9[/]"  # 📉
+
+
+def _now_local() -> datetime:
+    return datetime.now()
+
+
+def print_retro_header(console: Console) -> None:
+    """Single-shot greeting printed once per process.
+
+    Format intentionally evokes early-2000s sysadmin terminals:
+
+        [ 2026-05-21 14:21:18 ] CapitalArc starting ...
+    """
+    ts = _now_local().strftime("%Y-%m-%d %H:%M:%S")
+    console.print(
+        f"[bold cyan][[/] [bold]{ts}[/] [bold cyan]][/] "
+        f"[bold magenta]CapitalArc[/] [dim]starting ...[/]"
+    )
+
+
+def print_section(console: Console, label: str) -> None:
+    """Print a top-level retro section header (e.g. `> Loading Level 2 data...`)."""
+    console.print(f"[bold cyan]>[/] [bold]{label}[/]")
+
+
+def print_note(console: Console, label: str, *, style: str = "yellow") -> None:
+    """Print an inline retro-style note prefixed with `>`."""
+    console.print(f"[bold cyan]>[/] [{style}]{label}[/]")
+
+
+def print_cycle_summary(
+    console: Console,
+    *,
+    action: str,
+    bias: str,
+    bias_strength: float,
+    score: float,
+    symbol: str | None,
+) -> None:
+    """One-line cycle headline rendered before the detailed panels.
+
+    Example::
+
+        > DECISION: RISK_OFF | Bias: BEARISH (0.72) | Score: 0.31 | Action: CLOSE BTC-PERP
+    """
+    decision_label = action.upper()
+    bias_label = bias.upper()
+    bias_color = _colour_for_bias(bias)
+
+    if decision_label.startswith("OPEN_LONG"):
+        decision_color = "bold green"
+        emoji = _EMOJI_UP
+        action_label = f"OPEN LONG {symbol}" if symbol else "OPEN LONG"
+        action_color = "bold green"
+        regime_label = "RISK_ON"
+    elif decision_label.startswith("OPEN_SHORT"):
+        decision_color = "bold red"
+        emoji = _EMOJI_DOWN
+        action_label = f"OPEN SHORT {symbol}" if symbol else "OPEN SHORT"
+        action_color = "bold red"
+        regime_label = "RISK_ON"
+    elif decision_label == "CLOSE":
+        decision_color = "bold yellow"
+        emoji = _EMOJI_WARN
+        action_label = f"CLOSE {symbol}" if symbol else "CLOSE"
+        action_color = "yellow"
+        regime_label = "RISK_OFF"
+    elif decision_label == "DENY":
+        decision_color = "bold red"
+        emoji = _EMOJI_FAIL
+        action_label = "DENY"
+        action_color = "bold red"
+        regime_label = "RISK_OFF"
+    else:  # hold / unknown
+        decision_color = "bold white"
+        emoji = "\U0001f4ca"  # 📊
+        action_label = decision_label
+        action_color = "white"
+        regime_label = "HOLD"
+
+    console.print(
+        f"[bold cyan]>[/] {emoji} "
+        f"[bold]DECISION:[/] [{decision_color}]{regime_label}[/] [dim]|[/] "
+        f"[bold]Bias:[/] [{bias_color}]{bias_label}[/] "
+        f"({bias_strength:.2f}) [dim]|[/] "
+        f"[bold]Score:[/] [bold]{score:.3f}[/] [dim]|[/] "
+        f"[bold]Action:[/] [{action_color}]{action_label}[/]"
+    )
+
+
+def print_market_bias_summary(
+    console: Console,
+    *,
+    bias: str,
+    strength: float,
+) -> None:
+    """One-line on-chain bias readout (used after the L2 progress block)."""
+    bias_label = bias.upper()
+    bias_color = _colour_for_bias(bias)
+    if bias.lower() == "bullish":
+        emoji = _EMOJI_UP
+    elif bias.lower() == "bearish":
+        emoji = _EMOJI_DOWN
+    else:
+        emoji = "\u27a1\ufe0f"  # ➡️
+    console.print(
+        f"[bold cyan]>[/] {emoji} "
+        f"[bold]Market Bias:[/] [{bias_color}]{bias_label}[/] "
+        f"(strength=[bold]{strength:.2f}[/])"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metric progress reporter (rich.progress wrapper)
+# ---------------------------------------------------------------------------
+
+
+_METRIC_LABEL_WIDTH = 20
+
+
+class MetricProgressReporter:
+    """Thin wrapper around `rich.progress.Progress` for metric fetches.
+
+    Each metric advances through up to two hops:
+
+        start  ->  submitted  ->  completed
+
+    A "cached" or "n/a" event also lands in the terminal state (full
+    bar) but is colour-coded so the user can tell real Dune rows from
+    cached / not-configured ones at a glance. An "error" event paints
+    the bar red and freezes it at its last position.
+    """
+
+    # Map abstract DuneMCPClient events to the progress steps we want
+    # the bar to show. 2 steps matches the user's `(2/2)` example.
+    _TOTAL = 2
+
+    def __init__(self, console: Console, metrics: list[str]) -> None:
+        self._console = console
+        self._metrics = metrics
+        self._progress = Progress(
+            TextColumn("  {task.description}"),
+            BarColumn(
+                bar_width=22,
+                complete_style="cyan",
+                finished_style="bold green",
+                pulse_style="cyan",
+            ),
+            TextColumn(
+                "[progress.percentage]{task.percentage:>3.0f}%",
+                justify="right",
+            ),
+            TextColumn("({task.completed}/{task.total})"),
+            console=console,
+            transient=False,
+            refresh_per_second=20,
+        )
+        self._tasks: dict[str, int] = {}
+        self._terminal: dict[str, str] = {}
+        self._started = False
+
+    # ---- Lifecycle -----------------------------------------------------
+
+    def __enter__(self) -> "MetricProgressReporter":
+        self._progress.__enter__()
+        self._started = True
+        for metric in self._metrics:
+            label = self._format_label(metric, "white")
+            task_id = self._progress.add_task(
+                label, total=self._TOTAL, completed=0
+            )
+            self._tasks[metric] = task_id
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._progress.__exit__(exc_type, exc, tb)
+        self._started = False
+
+    # ---- Hook callable -------------------------------------------------
+
+    def callback(self) -> Callable[[str, str], None]:
+        """Return a thread-safe callable suitable for `DuneMCPClient.on_metric_event`."""
+        return self.handle_event
+
+    def handle_event(self, metric: str, event: str) -> None:
+        if not self._started:
+            return
+        task_id = self._tasks.get(metric)
+        if task_id is None:
+            return
+        if event == "start":
+            self._progress.update(task_id, completed=0)
+        elif event == "submitted":
+            self._progress.update(task_id, completed=1)
+        elif event == "completed":
+            self._progress.update(
+                task_id,
+                completed=self._TOTAL,
+                description=self._format_label(metric, "green", suffix="OK"),
+            )
+            self._terminal[metric] = "ok"
+        elif event == "cached":
+            self._progress.update(
+                task_id,
+                completed=self._TOTAL,
+                description=self._format_label(metric, "cyan", suffix="cached"),
+            )
+            self._terminal[metric] = "cached"
+        elif event == "n/a":
+            self._progress.update(
+                task_id,
+                completed=self._TOTAL,
+                description=self._format_label(
+                    metric, "yellow", suffix="n/a"
+                ),
+            )
+            self._terminal[metric] = "n/a"
+        elif event == "error":
+            self._progress.update(
+                task_id,
+                description=self._format_label(metric, "red", suffix="err"),
+            )
+            self._terminal[metric] = "error"
+
+    # ---- Helpers -------------------------------------------------------
+
+    def _format_label(
+        self, metric: str, color: str, *, suffix: str = ""
+    ) -> str:
+        base = metric.ljust(_METRIC_LABEL_WIDTH)
+        tag = f" [dim]\u2014 {suffix}[/]" if suffix else ""
+        return f"[{color}]{base}[/]{tag}"
+
+
+def metric_progress(
+    console: Console, metrics: list[str]
+) -> MetricProgressReporter:
+    """Convenience factory mirroring the other helpers in this module."""
+    return MetricProgressReporter(console, metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +317,24 @@ def _colour_for_regime(regime: str) -> str:
         "transition": "yellow",
         "hold": "yellow",
     }.get(regime, "white")
+
+
+def _colour_for_bias(bias: str) -> str:
+    return {
+        "bullish": "bold green",
+        "bearish": "bold red",
+        "neutral": "yellow",
+    }.get(bias, "white")
+
+
+def _colour_for_side(side: str | None) -> str:
+    if not side:
+        return "white"
+    return {
+        "long": "bold green",
+        "short": "bold red",
+        "flat": "yellow",
+    }.get(side.lower(), "white")
 
 
 def _fmt_pct(x: float, precision: int = 2) -> str:
@@ -243,7 +519,12 @@ def level1_panel(l1_raw: dict[str, Any], score: float) -> Panel:
 # ---------------------------------------------------------------------------
 
 
-def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
+def level2_panel(
+    l2_raw: dict[str, Any],
+    score: float,
+    *,
+    short_circuit_note: str | None = None,
+) -> Panel:
     if l2_raw.get("skipped"):
         return Panel(
             Text("Level 2 skipped (Level 1 short-circuit).", style="yellow"),
@@ -265,9 +546,24 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
     summary = Table.grid(padding=(0, 2))
     summary.add_column(style="bold cyan", justify="right")
     summary.add_column(style="white")
+    heat_source = l2_raw.get("heat_source", "heuristic")
+    heat_src_style = "green" if heat_source.startswith("dune:") else "yellow"
+    heat_src_label = heat_source if heat_source.startswith("dune:") else "heuristic (fallback)"
     summary.add_row("Regime", Text(regime, style=_colour_for_regime(regime)))
     summary.add_row("Score", f"{score:.3f}")
-    summary.add_row("Market heat", f"{heat:.3f}")
+    summary.add_row(
+        "Market heat",
+        Text(f"{heat:.3f}  [{heat_src_label}]", style=heat_src_style),
+    )
+    bias = str(l2_raw.get("market_bias", "neutral"))
+    bias_strength = float(l2_raw.get("bias_strength", 0.0) or 0.0)
+    summary.add_row(
+        "Market bias",
+        Text(
+            f"{bias.upper()}  (strength={bias_strength:.2f})",
+            style=_colour_for_bias(bias),
+        ),
+    )
     summary.add_row("Cache", "[yellow]HIT[/]" if cached else "[green]MISS[/]")
     summary.add_row(
         "Dune MCP",
@@ -341,8 +637,9 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
     )
     whales.add_column("Symbol", style="bold")
     whales.add_column("Whale", style="yellow")
+    whales.add_column("Count", justify="right")
     whales.add_column("Direction")
-    whales.add_column("Notional Δ", justify="right")
+    whales.add_column("Notional delta", justify="right")
     whales.add_column("Cum funding (window)", justify="right")
     whales.add_column("Net longs paid", justify="right")
 
@@ -358,6 +655,7 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
         whales.add_row(
             sym,
             "YES" if wh.get("flagged") else "no",
+            str(int(wh.get("n_whales", 0) or 0)),
             Text(direction, style=dir_colour),
             _fmt_usd(wh.get("notional_usd_change")),
             f"{cf.get('window_hours', 0):.0f}h",
@@ -414,7 +712,16 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
             )
 
     # ---------- Notes ---------------------------------------------------
-    grouped: list[Any] = [summary, metrics, whales, vault_table, prov]
+    grouped: list[Any] = []
+    if short_circuit_note:
+        grouped.append(
+            Panel(
+                Text(short_circuit_note, style="bold yellow"),
+                border_style="yellow",
+                box=box.MINIMAL,
+            )
+        )
+    grouped += [summary, metrics, whales, vault_table, prov]
     if notes:
         notes_text = "\n".join(f"- {n}" for n in notes)
         grouped.append(
@@ -426,10 +733,18 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
             )
         )
 
+    title_suffix = (
+        " (short-circuited for final decision)" if short_circuit_note else ""
+    )
     return Panel(
         Group(*grouped),
-        title="[bold]Level 2 - On-chain Intelligence (Dune MCP single source)[/]",
-        border_style=_colour_for_regime(regime),
+        title=(
+            "[bold]Level 2 - On-chain Intelligence (Dune MCP single source)"
+            f"{title_suffix}[/]"
+        ),
+        border_style=(
+            "yellow" if short_circuit_note else _colour_for_regime(regime)
+        ),
         box=box.ROUNDED,
     )
 
@@ -446,15 +761,52 @@ def final_decision_panel(decision: Any) -> Panel:
     regime = decision.regime
     colour = _colour_for_regime(action)
 
+    if directive.side == "long":
+        headline_emoji = "\U0001f4c8"  # 📈
+    elif directive.side == "short":
+        headline_emoji = "\U0001f4c9"  # 📉
+    elif action == "risk_off":
+        headline_emoji = "\U0001f6d1"  # 🛑
+    elif action == "hold":
+        headline_emoji = "\u23f8\ufe0f"  # ⏸️
+    else:
+        headline_emoji = "\U0001f4ca"  # 📊
+    headline = Text(
+        f"{headline_emoji}  FINAL DECISION  ", style="bold white on grey15"
+    )
+
     summary = Table.grid(padding=(0, 2))
     summary.add_column(style="bold cyan", justify="right")
     summary.add_column(style="white")
     summary.add_row("Final score", f"[bold]{decision.final_score:.3f}[/]")
     summary.add_row("Regime", Text(regime, style=colour))
-    summary.add_row("Action", Text(action.upper(), style=colour))
+    # Decorate the action with the side hint so SHORT opens stand out
+    # at a glance ("RISK_ON (SHORT)" in red vs "RISK_ON (LONG)" in
+    # green). This makes the demo unambiguous - shorts no longer look
+    # like longs in the panel.
+    action_label = action.upper()
     if directive.side:
-        side_colour = "green" if directive.side == "long" else "red"
-        summary.add_row("Side", Text(directive.side.upper(), style=side_colour))
+        action_label = f"{action_label} ({directive.side.upper()})"
+    summary.add_row(
+        "Action", Text(action_label, style=_colour_for_side(directive.side) if directive.side else colour)
+    )
+    if directive.side:
+        summary.add_row(
+            "Side",
+            Text(directive.side.upper(), style=_colour_for_side(directive.side)),
+        )
+    # Market bias is always shown - even on hold / risk-off - because
+    # it's the answer to "what does on-chain say?" independent of the
+    # final action the engine took.
+    market_bias = getattr(directive, "market_bias", "neutral")
+    bias_strength = float(getattr(directive, "bias_strength", 0.0) or 0.0)
+    summary.add_row(
+        "Market bias",
+        Text(
+            f"{market_bias.upper()}  (strength={bias_strength:.2f})",
+            style=_colour_for_bias(market_bias),
+        ),
+    )
     summary.add_row("Intensity", f"{directive.intensity:.2f}")
     if decision.short_circuited:
         summary.add_row(
@@ -477,10 +829,11 @@ def final_decision_panel(decision: Any) -> Panel:
         )
 
     return Panel(
-        Group(summary, weights_tbl),
+        Group(headline, summary, weights_tbl),
         title="[bold]Final Decision[/]",
         border_style=colour,
-        box=box.ROUNDED,
+        box=box.HEAVY,
+        padding=(1, 2),
     )
 
 
@@ -494,13 +847,39 @@ def execution_plan_panel(plan: Any) -> Panel:
     table.add_column(style="bold cyan", justify="right")
     table.add_column(style="white")
     table.add_row("Decision ID", str(plan.decision_id))
-    table.add_row("Action", str(plan.action))
+    # Tint the action when it explicitly opens a side; "open_short"
+    # rendered in red is the unmistakable signal that the agent is
+    # going short on this cycle.
+    action = str(plan.action)
+    action_style = "white"
+    if action.startswith("open_long"):
+        action_style = "bold green"
+    elif action.startswith("open_short"):
+        action_style = "bold red"
+    elif action == "close":
+        action_style = "yellow"
+    elif action == "deny":
+        action_style = "bold red"
+    table.add_row("Action", Text(action.upper(), style=action_style))
     table.add_row("Symbol", str(plan.symbol or "-"))
     table.add_row("Size (USD)", str(plan.size_usd))
     table.add_row("Leverage", str(plan.leverage))
+    # Bias / strength are now in plan.extra when the directive carried
+    # them; surface them inline so the panel tells the full story.
+    extra = dict(plan.extra or {})
+    bias = extra.pop("market_bias", None)
+    bias_strength = extra.pop("bias_strength", None)
+    if bias:
+        table.add_row(
+            "Market bias",
+            Text(
+                f"{str(bias).upper()} (strength={float(bias_strength or 0):.2f})",
+                style=_colour_for_bias(str(bias)),
+            ),
+        )
     table.add_row("Rationale", plan.rationale)
-    if plan.extra:
-        table.add_row("Extra", ", ".join(f"{k}={v}" for k, v in plan.extra.items()))
+    if extra:
+        table.add_row("Extra", ", ".join(f"{k}={v}" for k, v in extra.items()))
     return Panel(
         table,
         title="[bold]Execution Plan[/]",

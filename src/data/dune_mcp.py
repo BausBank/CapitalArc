@@ -40,13 +40,36 @@ Level 2 honest about provenance.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from src.utils.logging import logger
+
+
+# Lifecycle events fired by the client for every metric fetch. Used
+# by the rich-progress reporter in `main.py` to render real-time
+# per-metric progress bars without piggy-backing on stderr logs.
+#   "start"      - fetch_metric() entered for this metric
+#   "submitted"  - Dune accepted the /execute POST (or cache hit / latest_results landed)
+#   "completed"  - rows are in hand
+#   "cached"     - the metric came back from the in-process cache
+#   "n/a"        - the metric has no DUNE_QUERY_*_ID configured
+#   "error"      - Dune returned an error / no rows / unknown metric
+MetricEvent = str
+MetricEventCallback = Callable[[str, MetricEvent], None]
+
+
+# Dune's REST API returns HTTP 400 with a body like
+# `{"error":"unknown parameters (intervals, lookback_hours)"}` when the
+# caller sends params that aren't declared on the saved query. We parse
+# those names so we can transparently retry without them - that lets the
+# agent stay compatible with whichever subset of parameters the user
+# happened to define in their Dune workspace.
+_UNKNOWN_PARAMS_RE = re.compile(r"unknown parameters?\s*\(([^)]*)\)", re.IGNORECASE)
 
 
 # Canonical metric names used by Level 1 + Level 2.
@@ -76,6 +99,19 @@ class DuneMCPClientConfig:
     timeout_seconds: float = 30.0
     poll_interval_seconds: float = 1.0
     max_poll_seconds: float = 60.0
+    # Free-tier Dune limits concurrent executions per API key. L2
+    # fans out 8 metric calls in parallel and L1 fans out 1 OHLCV
+    # call, so without throttling we hammer Dune with ~9 concurrent
+    # /execute POSTs on a cold cycle and get HTTP 429s back. This
+    # semaphore caps the live request count to a safe number; 3 is
+    # a comfortable default for the free tier.
+    max_concurrent_requests: int = 3
+    # Retry budget for HTTP 429 (rate-limit) responses. Each retry
+    # waits `rate_limit_backoff_seconds * (2 ** attempt)` so a
+    # rate-limited burst recovers naturally instead of being mapped
+    # to `error` in the L2 panel.
+    rate_limit_max_retries: int = 4
+    rate_limit_backoff_seconds: float = 1.5
     # Per-metric saved Dune query ids. Empty / missing -> "not configured".
     query_ids: dict[str, int] = field(default_factory=dict)
 
@@ -121,6 +157,23 @@ class DuneMCPClient:
         # query_id -> (result, expiry_ts)
         self._cache: dict[int, tuple[DuneQueryResult, float]] = {}
         self._healthy: bool | None = None
+        # Caps concurrent HTTP POSTs against Dune so we don't trip
+        # the free-tier rate limit on cold cycles (L2 fans out 8
+        # metrics + L1 1 OHLCV in parallel).
+        self._semaphore = asyncio.Semaphore(
+            max(1, int(config.max_concurrent_requests))
+        )
+        # Optional progress hook fired at every metric lifecycle event;
+        # the clean-mode CLI in `main.py` plugs into this to render
+        # rich-progress bars per metric without grepping stderr logs.
+        self.on_metric_event: MetricEventCallback | None = None
+
+    def _fire(self, metric: str | None, event: MetricEvent) -> None:
+        if metric and self.on_metric_event is not None:
+            try:
+                self.on_metric_event(metric, event)
+            except Exception:  # noqa: BLE001 - never let UI break a fetch
+                logger.debug("metric event hook raised for {} ({})", metric, event)
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -175,19 +228,19 @@ class DuneMCPClient:
         *,
         limit: int = 1000,
         use_cache: bool = True,
+        metric: str | None = None,
     ) -> DuneQueryResult | None:
         """Return the latest cached execution of `query_id`."""
         if use_cache:
             hit = self._cache_get(query_id)
             if hit is not None:
+                self._fire(metric, "cached")
                 return hit
         client = await self._ensure_client()
-        try:
-            resp = await client.get(
-                f"/query/{query_id}/results", params={"limit": limit}
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Dune latest_results({}) failed: {}", query_id, exc)
+        resp = await self._get_with_rate_limit(
+            client, f"/query/{query_id}/results", params={"limit": limit}
+        )
+        if resp is None:
             return None
         if resp.status_code != 200:
             logger.warning(
@@ -213,31 +266,38 @@ class DuneMCPClient:
         params: dict[str, Any] | None = None,
         wait: bool = True,
         use_cache: bool = True,
+        metric: str | None = None,
     ) -> DuneQueryResult | None:
         """Execute `query_id` and (optionally) wait for results."""
         if use_cache:
             hit = self._cache_get(query_id)
             if hit is not None:
+                logger.debug(
+                    "Dune execute_query({}) cache hit ({} rows)",
+                    query_id,
+                    hit.row_count,
+                )
+                self._fire(metric, "cached")
                 return hit
-        client = await self._ensure_client()
-        body: dict[str, Any] = {}
+
+        # Dune's `query_parameters` map expects string values
+        # (parameters are textually substituted into the SQL).
+        # Coercing here lets callers pass native Python ints / floats
+        # without surprising the API.
+        query_params: dict[str, str] = {}
         if params:
-            body["query_parameters"] = params
-        try:
-            resp = await client.post(f"/query/{query_id}/execute", json=body)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Dune execute_query({}) failed: {}", query_id, exc)
+            query_params = {
+                str(k): _stringify_param(v) for k, v in params.items()
+            }
+
+        execution_id = await self._submit_execution(query_id, query_params)
+        if execution_id is None:
             return None
-        if resp.status_code not in (200, 201):
-            logger.warning(
-                "Dune execute_query({}) HTTP {}: {}",
-                query_id,
-                resp.status_code,
-                resp.text[:200],
-            )
-            return None
-        execution_id = resp.json().get("execution_id")
-        if not execution_id or not wait:
+        # Fire "submitted" only once we have an execution_id so a
+        # rejected /execute (HTTP 400 / 401 / 5xx) doesn't bump the
+        # progress bar past the running state.
+        self._fire(metric, "submitted")
+        if not wait:
             return DuneQueryResult(
                 query_id=query_id,
                 rows=[],
@@ -245,24 +305,211 @@ class DuneMCPClient:
             )
         return await self._poll_execution(query_id, execution_id)
 
+    # How many "unknown-parameter" 400 responses we tolerate before
+    # giving up on a single execute. Saved queries on Dune sometimes
+    # surface their unknowns in multiple chunks (e.g. a query rejects
+    # `whale_min_usd` first, then on retry rejects `usdc_address`),
+    # so we converge in a short loop rather than after a single retry.
+    _MAX_UNKNOWN_PARAM_RETRIES = 4
+
+    async def _post_with_rate_limit(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> httpx.Response | None:
+        """POST with concurrency cap + HTTP 429 backoff.
+
+        Dune's free tier returns HTTP 429
+        `{"error":"Too many requests. Please upgrade your..."}`
+        when too many executions land in parallel. The fix is two-
+        sided: (a) cap how many requests we have in flight via the
+        instance semaphore, and (b) on a 429, sleep and retry with
+        exponential backoff instead of letting the metric collapse
+        to `error` in the L2 panel for 30 minutes.
+        """
+        max_retries = max(0, int(self.config.rate_limit_max_retries))
+        backoff = max(0.0, float(self.config.rate_limit_backoff_seconds))
+        attempt = 0
+        while True:
+            async with self._semaphore:
+                try:
+                    resp = await client.post(url, json=json or {})
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Dune POST {} failed: {}", url, exc)
+                    return None
+            if resp.status_code != 429 or attempt >= max_retries:
+                return resp
+            # Honour Retry-After header when Dune provides one;
+            # otherwise back off exponentially from `backoff`.
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                sleep_for = (
+                    float(retry_after)
+                    if retry_after is not None
+                    else backoff * (2 ** attempt)
+                )
+            except ValueError:
+                sleep_for = backoff * (2 ** attempt)
+            logger.warning(
+                "Dune POST {} rate-limited (429); "
+                "sleeping {:.2f}s before retry {}/{}",
+                url, sleep_for, attempt + 1, max_retries,
+            )
+            await asyncio.sleep(sleep_for)
+            attempt += 1
+
+    async def _get_with_rate_limit(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response | None:
+        """Mirror of `_post_with_rate_limit` for GETs (used by polling)."""
+        max_retries = max(0, int(self.config.rate_limit_max_retries))
+        backoff = max(0.0, float(self.config.rate_limit_backoff_seconds))
+        attempt = 0
+        while True:
+            async with self._semaphore:
+                try:
+                    resp = await client.get(url, params=params or {})
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Dune GET {} failed: {}", url, exc)
+                    return None
+            if resp.status_code != 429 or attempt >= max_retries:
+                return resp
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                sleep_for = (
+                    float(retry_after)
+                    if retry_after is not None
+                    else backoff * (2 ** attempt)
+                )
+            except ValueError:
+                sleep_for = backoff * (2 ** attempt)
+            logger.warning(
+                "Dune GET {} rate-limited (429); "
+                "sleeping {:.2f}s before retry {}/{}",
+                url, sleep_for, attempt + 1, max_retries,
+            )
+            await asyncio.sleep(sleep_for)
+            attempt += 1
+
+    async def _submit_execution(
+        self, query_id: int, query_params: dict[str, str]
+    ) -> str | None:
+        """POST /query/{id}/execute, retrying past unknown-parameter rejects.
+
+        Dune rejects requests that carry parameter names the saved query
+        didn't declare with a HTTP 400 body shaped like
+        `{"error":"unknown parameters (a, b, c)"}`. We strip the
+        rejected names and retry, repeating until either:
+
+          * Dune accepts the request (200 / 201), or
+          * the unknown set stops shrinking the param map (i.e. the
+            same param is rejected twice, or the error is no longer
+            a recognisable unknown-parameter notice), or
+          * we hit `_MAX_UNKNOWN_PARAM_RETRIES` (defence in depth).
+
+        This is what makes the agent resilient to the common case where
+        a saved query on Dune declares a *subset* of the parameters
+        the local SQL template ships with - e.g. `vault_flows`,
+        `cum_funding`, `market_sentiment` saved without
+        `whale_min_usd` / token addresses / vault address. The retry
+        used to be single-shot which left an entire 30-minute cycle
+        marked as `error` whenever Dune surfaced its unknowns in two
+        waves.
+        """
+        client = await self._ensure_client()
+        body: dict[str, Any] = {}
+        if query_params:
+            body["query_parameters"] = dict(query_params)
+        logger.info(
+            "Dune POST /query/{}/execute | body={}",
+            query_id,
+            body if body else "{}",
+        )
+        url = f"/query/{query_id}/execute"
+        resp = await self._post_with_rate_limit(client, url, json=body)
+        if resp is None:
+            return None
+
+        attempts = 0
+        while (
+            resp.status_code == 400
+            and query_params
+            and attempts < self._MAX_UNKNOWN_PARAM_RETRIES
+        ):
+            unknown = _parse_unknown_params(resp.text)
+            if not unknown:
+                break
+            remaining = {
+                k: v for k, v in query_params.items() if k not in unknown
+            }
+            if len(remaining) == len(query_params):
+                # Dune flagged names we never sent - stop, this is a
+                # different 400 (e.g. parameter type / value error).
+                break
+            logger.warning(
+                "Dune query {} rejected unknown parameters {}; "
+                "retrying with {} (attempt {}/{})",
+                query_id,
+                sorted(unknown),
+                sorted(remaining),
+                attempts + 1,
+                self._MAX_UNKNOWN_PARAM_RETRIES,
+            )
+            query_params = remaining
+            retry_body: dict[str, Any] = {}
+            if remaining:
+                retry_body["query_parameters"] = remaining
+            resp = await self._post_with_rate_limit(client, url, json=retry_body)
+            if resp is None:
+                return None
+            attempts += 1
+
+        if resp.status_code not in (200, 201):
+            logger.warning(
+                "Dune execute_query({}) HTTP {} after {} retries: {}",
+                query_id,
+                resp.status_code,
+                attempts,
+                resp.text[:200],
+            )
+            return None
+        execution_id = resp.json().get("execution_id")
+        logger.info(
+            "Dune execute_query({}) accepted | execution_id={} (after {} retries)",
+            query_id,
+            execution_id,
+            attempts,
+        )
+        return execution_id
+
     async def _poll_execution(
         self, query_id: int, execution_id: str
     ) -> DuneQueryResult | None:
         client = await self._ensure_client()
         deadline = time.time() + self.config.max_poll_seconds
         while time.time() < deadline:
-            try:
-                resp = await client.get(
-                    f"/execution/{execution_id}/results"
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Dune poll failed: {}", exc)
+            resp = await self._get_with_rate_limit(
+                client, f"/execution/{execution_id}/results"
+            )
+            if resp is None:
                 return None
             if resp.status_code == 200:
                 payload = resp.json()
                 state = payload.get("state")
                 if state in {"QUERY_STATE_COMPLETED", "completed"}:
                     rows = self._extract_rows(payload)
+                    logger.info(
+                        "Dune execution {} completed | query_id={} rows={}",
+                        execution_id,
+                        query_id,
+                        len(rows),
+                    )
                     out = DuneQueryResult(
                         query_id=query_id,
                         rows=rows,
@@ -306,7 +553,9 @@ class DuneMCPClient:
             of our queries are scheduled and `latest_results` is much
             cheaper.
         """
+        self._fire(metric, "start")
         if metric not in METRIC_NAMES:
+            self._fire(metric, "error")
             return MetricFetch(
                 metric=metric,
                 source="error",
@@ -314,6 +563,7 @@ class DuneMCPClient:
             )
         query_id = self.config.query_ids.get(metric)
         if not query_id:
+            self._fire(metric, "n/a")
             return MetricFetch(
                 metric=metric,
                 source="n/a",
@@ -326,16 +576,20 @@ class DuneMCPClient:
             )
 
         if execute:
-            result = await self.execute_query(query_id, params=params or {})
+            result = await self.execute_query(
+                query_id, params=params or {}, metric=metric
+            )
         else:
-            result = await self.latest_results(query_id)
+            result = await self.latest_results(query_id, metric=metric)
         if result is None:
+            self._fire(metric, "error")
             return MetricFetch(
                 metric=metric,
                 source="error",
                 query_id=query_id,
                 note=f"Dune query {query_id} returned an error or no data",
             )
+        self._fire(metric, "completed")
         return MetricFetch(
             metric=metric,
             source=f"dune:{query_id}",
@@ -386,6 +640,32 @@ class DuneMCPClient:
         if not isinstance(rows, list):
             return []
         return [r for r in rows if isinstance(r, dict)]
+
+
+def _stringify_param(value: Any) -> str:
+    """Coerce a parameter value to the string form Dune expects.
+
+    Dune's `query_parameters` are substituted into the SQL as text, so
+    the REST API canonically wants string values. Booleans become
+    lowercase JSON-ish so a "text" parameter doesn't accidentally land
+    as Python's title-cased "True".
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _parse_unknown_params(body: str) -> set[str]:
+    """Pull parameter names out of a Dune `unknown parameters (...)` error."""
+    if not body:
+        return set()
+    match = _UNKNOWN_PARAMS_RE.search(body)
+    if not match:
+        return set()
+    inner = match.group(1)
+    return {p.strip() for p in inner.split(",") if p.strip()}
 
 
 __all__ = [
