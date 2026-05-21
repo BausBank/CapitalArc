@@ -35,8 +35,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
-import sys
 from decimal import Decimal
 from typing import Any
 
@@ -44,33 +42,12 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.rule import Rule
 
-
-def _force_utf8_console() -> None:
-    """Force the Windows console into UTF-8 + VT100 mode.
-
-    The clean-mode CLI uses emojis (\U0001f4c8 \U0001f4c9 \u26a0\ufe0f \u2713 \u2717)
-    and box-drawing glyphs that crash on the legacy code page (cp1251 here).
-    `os.system("")` is the canonical no-op that enables ANSI escape
-    parsing on Windows 10+, after which `sys.stdout.reconfigure` swaps
-    the encoding to UTF-8 so the emojis render natively. Wrapped in
-    a best-effort try/except so non-Windows runtimes are untouched.
-    """
-    if sys.platform == "win32":
-        try:
-            os.system("")
-        except Exception:  # noqa: BLE001
-            pass
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-        except (AttributeError, OSError, ValueError):
-            pass
-
-
-_force_utf8_console()
+from rich import box
+from rich.panel import Panel
+from rich.table import Table
 
 from src.allocation.allocation_router import AllocationConfig, AllocationRouter
-from src.core.decision_engine import DecisionEngine, DecisionResult, LevelScore
+from src.core.decision_engine import DecisionEngine, LevelScore
 from src.core.level1 import Level1, Level1Config
 from src.core.level2 import Level2, Level2Config
 from src.data.arc_onchain import ArcOnchainConfig, ArcOnchainReader
@@ -85,32 +62,12 @@ from src.utils.console import (
     level1_panel,
     level2_panel,
     market_context_panel,
-    metric_progress,
     onchain_result_panel,
-    print_cycle_summary,
-    print_market_bias_summary,
-    print_note,
-    print_retro_header,
-    print_section,
 )
 from src.utils.logging import configure_logging, logger
 
 
-console = Console(force_terminal=True, legacy_windows=False)
-
-# Metric labels used to size the per-metric progress bars in clean mode.
-# Order matters - it's the order rendered in the terminal.
-_L1_METRICS = ("ohlcv",)
-_L2_METRICS = (
-    "funding_rates",
-    "open_interest",
-    "volume",
-    "long_short_ratio",
-    "cum_funding",
-    "whale_activity",
-    "vault_flows",
-    "market_sentiment",
-)
+console = Console()
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +205,8 @@ def _build_engine(
         risk_on_threshold=settings.RISK_ON_THRESHOLD,
         risk_off_threshold=settings.RISK_OFF_THRESHOLD,
         short_bias_min_strength=settings.SHORT_BIAS_MIN_STRENGTH,
+        strong_bias_open_strength=settings.STRONG_BIAS_OPEN_STRENGTH,
+        redistribute_synthetic_l3_weight=settings.REDISTRIBUTE_SYNTHETIC_L3_WEIGHT,
     )
 
 
@@ -257,13 +216,18 @@ def _build_router(
     symbols = settings.perp_symbols or ["BTC-PERP"]
     cfg = AllocationConfig(
         perp_symbol=symbols[0],
-        base_position_usd=Decimal("1000"),
-        max_position_usd=Decimal("10000"),
+        base_position_usd=Decimal(str(settings.BASE_POSITION_USD)),
+        max_position_usd=Decimal(str(settings.MAX_POSITION_USD)),
         max_drawdown_pct=settings.MAX_DRAWDOWN_PCT,
         risk_on_threshold=settings.RISK_ON_THRESHOLD,
         risk_off_threshold=settings.RISK_OFF_THRESHOLD,
         symmetric_short_sizing=settings.SYMMETRIC_SHORT_SIZING,
         short_size_multiplier=Decimal(str(settings.SHORT_SIZE_MULTIPLIER)),
+        target_risk_pct=settings.TARGET_RISK_PCT,
+        stop_atr_mult=settings.STOP_ATR_MULT,
+        min_atr_pct_for_sizing=settings.MIN_ATR_PCT_FOR_SIZING,
+        dd_haircut_exponent=settings.DD_HAIRCUT_EXPONENT,
+        explain_sizing=settings.EXPLAIN_SIZING,
     )
     return AllocationRouter(executor=executor, config=cfg, dry_run=dry_run)
 
@@ -325,262 +289,18 @@ async def _build_market_context(
     }
 
 
-def _replace_l2_score(
-    decision: DecisionResult, l2_score: LevelScore
-) -> DecisionResult:
-    """Swap the L2 placeholder in a short-circuited decision for a real L2 read.
-
-    The decision math (final_score, regime, directive) is preserved -
-    we only patch the L2 entry so the panel can render the real
-    on-chain intelligence even on cycles where Level 1 short-circuited.
-    """
-    new_scores: list[LevelScore] = []
-    for s in decision.level_scores:
-        if s.level == 2:
-            new_scores.append(
-                LevelScore(
-                    level=2,
-                    score=l2_score.score,
-                    rationale=l2_score.rationale,
-                    raw=l2_score.raw,
-                )
-            )
-        else:
-            new_scores.append(s)
-    decision.level_scores = new_scores
-    return decision
-
-
 # ---------------------------------------------------------------------------
 # Cycle
 # ---------------------------------------------------------------------------
 
 
-async def _run_cycle_clean(
-    *,
-    settings: Settings,
-    dry_run: bool,
-    mode: str,
-    wallet: CircleWallet,
-    executor: ArcPerpExecutor,
-    dune: DuneMCPClient | None,
-    onchain: ArcOnchainReader,
-    engine: DecisionEngine,
-    router: AllocationRouter,
-) -> DecisionResult:
-    """Clean retro cycle (default). Renders progress bars + six panels."""
-    # Always re-attach the hook before a cycle (Dune client persists
-    # across cycles in --loop, the reporter is per-cycle).
-    if dune is not None:
-        dune.on_metric_event = None
-
-    onchain_snapshot = await onchain.snapshot(account_id=None)
-    context = await _build_market_context(settings, executor, wallet)
-    context["onchain"] = onchain_snapshot
-
-    # ---- Level 1 ------------------------------------------------------
-    print_section(console, "Loading Level 1 data (OHLCV via Dune MCP)...")
-    with metric_progress(console, list(_L1_METRICS)) as l1_progress:
-        if dune is not None:
-            dune.on_metric_event = l1_progress.callback()
-        l1_score = await engine.level1.score(context)
-    if dune is not None:
-        dune.on_metric_event = None
-
-    l1_blocked = bool(l1_score.raw.get("l1", {}).get("passes") is False)
-    if l1_blocked:
-        print_note(
-            console,
-            f"Level 1 BLOCKED: {l1_score.rationale}",
-            style="bold red",
-        )
-    else:
-        print_note(console, "Level 1 PASS", style="bold green")
-
-    # ---- Level 2 (always - even on short-circuit, for display) -------
-    print_section(
-        console,
-        "Loading Level 2 data (on-chain intelligence via Dune MCP)...",
-    )
-    with metric_progress(console, list(_L2_METRICS)) as l2_progress:
-        if dune is not None:
-            dune.on_metric_event = l2_progress.callback()
-        l2_score = await engine.level2.score(context)
-    if dune is not None:
-        dune.on_metric_event = None
-
-    l2_raw = l2_score.raw.get("l2", {})
-    market_bias = str(l2_raw.get("market_bias", "neutral"))
-    bias_strength = float(l2_raw.get("bias_strength", 0.0) or 0.0)
-    print_market_bias_summary(
-        console, bias=market_bias, strength=bias_strength
-    )
-
-    # ---- Build the final DecisionResult ------------------------------
-    if l1_blocked:
-        # Re-run the engine's short-circuit path so the directive +
-        # final_score stay consistent with AGENTS.md, then patch the
-        # L2 placeholder with the real reading we just fetched for the
-        # panel.
-        decision = engine._short_circuited(l1_score)  # type: ignore[attr-defined]
-        decision = _replace_l2_score(decision, l2_score)
-    else:
-        l3_score = await engine._maybe_level3(  # type: ignore[attr-defined]
-            l1_score, l2_score, context
-        )
-        scores = [l1_score, l2_score, l3_score]
-        final_score = engine._aggregate(scores)  # type: ignore[attr-defined]
-        directive = engine._build_directive(final_score, scores)  # type: ignore[attr-defined]
-        regime = (
-            l2_score.raw.get("l2", {}).get("regime")
-            or directive.action.replace("_", "-")
-        )
-        decision = DecisionResult(
-            final_score=final_score,
-            regime=regime,
-            directive=directive,
-            level_scores=scores,
-            weights=engine.weights,
-        )
-
-    plan = await router.route(decision)
-
-    # ---- Headline summary --------------------------------------------
-    print_cycle_summary(
-        console,
-        action=plan.action,
-        bias=decision.directive.market_bias,
-        bias_strength=decision.directive.bias_strength,
-        score=decision.final_score,
-        symbol=plan.symbol or context.get("symbol"),
-    )
-
-    # ---- Panels (six-panel rich report) ------------------------------
-    console.print(
-        market_context_panel(context, mode=mode, app_env=settings.APP_ENV)
-    )
-    l1_raw = decision.level_score(1).raw.get("l1", {}) if decision.level_score(1) else {}
-    l2_raw = decision.level_score(2).raw.get("l2", {}) if decision.level_score(2) else {}
-    console.print(level1_panel(l1_raw, decision.level_score(1).score))
-    short_circuit_note = (
-        "Level 2 evaluated (short-circuited for final decision) - "
-        "L1 hard rules vetoed the trade, but on-chain intelligence is "
-        "rendered in full so the demo always shows what Dune MCP saw."
-        if decision.short_circuited
-        else None
-    )
-    console.print(
-        level2_panel(
-            l2_raw, decision.level_score(2).score,
-            short_circuit_note=short_circuit_note,
-        )
-    )
-    console.print(final_decision_panel(decision))
-    console.print(execution_plan_panel(plan))
-    console.print(
-        onchain_result_panel(
-            plan.tx_results,
-            explorer=lambda h: _explorer_link(settings, h),
-        )
-    )
-
-    if not dry_run:
-        for tx in plan.tx_results:
-            if tx.state in {"DRY_RUN", "FAILED", "DENIED"}:
-                continue
-            final = await wallet.wait_for_tx(tx.tx_id, poll_seconds=3.0)
-            link = _explorer_link(settings, final.tx_hash)
-            logger.info(
-                "  tx settled | id={} state={} hash={} {}",
-                final.tx_id, final.state, final.tx_hash,
-                f"explorer={link}" if link else "",
-            )
-
-    console.print(
-        f"[bold cyan]>[/] [dim]cycle done[/]  score=[bold]"
-        f"{decision.final_score:.3f}[/]  action=[bold]"
-        f"{decision.directive.action}[/]"
-    )
-    return decision
-
-
-async def _run_cycle_verbose(
-    *,
-    settings: Settings,
-    dry_run: bool,
-    mode: str,
-    wallet: CircleWallet,
-    executor: ArcPerpExecutor,
-    dune: DuneMCPClient | None,
-    onchain: ArcOnchainReader,
-    engine: DecisionEngine,
-    router: AllocationRouter,
-) -> DecisionResult:
-    """Verbose cycle - the original Day-3 behaviour with full loguru chatter."""
-    console.print(
-        Rule(f"[bold cyan]CapitalArc[/]  mode={mode}  env={settings.APP_ENV}")
-    )
-
-    onchain_snapshot = await onchain.snapshot(account_id=None)
-    context = await _build_market_context(settings, executor, wallet)
-    context["onchain"] = onchain_snapshot
-    console.print(
-        market_context_panel(context, mode=mode, app_env=settings.APP_ENV)
-    )
-
-    decision = await engine.decide(context)
-
-    l1_raw = decision.level_score(1).raw.get("l1", {}) if decision.level_score(1) else {}
-    l2_raw = decision.level_score(2).raw.get("l2", {}) if decision.level_score(2) else {}
-    console.print(level1_panel(l1_raw, decision.level_score(1).score))
-    console.print(level2_panel(l2_raw, decision.level_score(2).score))
-    console.print(final_decision_panel(decision))
-
-    plan = await router.route(decision)
-    console.print(execution_plan_panel(plan))
-    console.print(
-        onchain_result_panel(
-            plan.tx_results,
-            explorer=lambda h: _explorer_link(settings, h),
-        )
-    )
-
-    if not dry_run:
-        for tx in plan.tx_results:
-            if tx.state in {"DRY_RUN", "FAILED", "DENIED"}:
-                continue
-            final = await wallet.wait_for_tx(tx.tx_id, poll_seconds=3.0)
-            link = _explorer_link(settings, final.tx_hash)
-            logger.info(
-                "  tx settled | id={} state={} hash={} {}",
-                final.tx_id, final.state, final.tx_hash,
-                f"explorer={link}" if link else "",
-            )
-
-    console.print(
-        Rule(
-            f"[green]cycle done[/]  score={decision.final_score:.3f}  "
-            f"action={decision.directive.action}"
-        )
-    )
-    return decision
-
-
-async def run_once(dry_run: bool, *, first_cycle: bool = True) -> None:
+async def run_once(dry_run: bool) -> None:
     settings = get_settings()
-    configure_logging(settings.LOG_LEVEL, verbose=settings.VERBOSE)
+    configure_logging(settings.LOG_LEVEL)
     mode = "DRY-RUN" if dry_run else "LIVE"
 
-    if first_cycle:
-        if settings.VERBOSE:
-            logger.info("CapitalArc starting | mode={} env={}", mode, settings.APP_ENV)
-        else:
-            print_retro_header(console)
-            console.print(
-                f"[bold cyan]>[/] mode=[bold]{mode}[/]  "
-                f"env=[bold]{settings.APP_ENV}[/]  "
-                f"verbose=[bold]{settings.VERBOSE}[/]"
-            )
+    console.print(Rule(f"[bold cyan]CapitalArc[/]  mode={mode}  env={settings.APP_ENV}"))
+    logger.info("CapitalArc starting | mode={} env={}", mode, settings.APP_ENV)
 
     if not dry_run:
         missing = _preflight_live(settings)
@@ -605,48 +325,285 @@ async def run_once(dry_run: bool, *, first_cycle: bool = True) -> None:
         # Probe Dune MCP once so the panel shows accurate health.
         await engine.level2.connect()
 
-        cycle = (
-            _run_cycle_verbose if settings.VERBOSE else _run_cycle_clean
+        onchain_snapshot = await onchain.snapshot(
+            account_id=None  # filled in by the executor below if known
         )
-        await cycle(
-            settings=settings,
-            dry_run=dry_run,
-            mode=mode,
-            wallet=wallet,
-            executor=executor,
-            dune=dune,
-            onchain=onchain,
-            engine=engine,
-            router=router,
+
+        context = await _build_market_context(settings, executor, wallet)
+        context["onchain"] = onchain_snapshot
+        console.print(
+            market_context_panel(
+                context, mode=mode, app_env=settings.APP_ENV
+            )
         )
+
+        decision = await engine.decide(context)
+
+        l1_raw = decision.level_score(1).raw.get("l1", {}) if decision.level_score(1) else {}
+        l2_raw = decision.level_score(2).raw.get("l2", {}) if decision.level_score(2) else {}
+        console.print(level1_panel(l1_raw, decision.level_score(1).score))
+        console.print(level2_panel(l2_raw, decision.level_score(2).score))
+        console.print(final_decision_panel(decision))
+
+        plan = await router.route(decision)
+        console.print(execution_plan_panel(plan))
+        console.print(
+            onchain_result_panel(
+                plan.tx_results,
+                explorer=lambda h: _explorer_link(settings, h),
+            )
+        )
+
+        if not dry_run:
+            for tx in plan.tx_results:
+                if tx.state in {"DRY_RUN", "FAILED", "DENIED"}:
+                    continue
+                final = await wallet.wait_for_tx(tx.tx_id, poll_seconds=3.0)
+                link = _explorer_link(settings, final.tx_hash)
+                logger.info(
+                    "  tx settled | id={} state={} hash={} {}",
+                    final.tx_id, final.state, final.tx_hash,
+                    f"explorer={link}" if link else "",
+                )
+
+        console.print(Rule(f"[green]cycle done[/]  score={decision.final_score:.3f}  action={decision.directive.action}"))
     finally:
         await wallet.aclose()
         if dune is not None:
             await dune.aclose()
 
 
+# ---------------------------------------------------------------------------
+# --test-bias: offline scenario tester for the strong-bias override
+# ---------------------------------------------------------------------------
+
+
+def _explain_decision(
+    bias: str,
+    strength: float,
+    conviction: float,
+    final_direction: int,
+    direction_strength: float,
+    risk_on: float,
+    risk_off: float,
+    strong_open: float,
+    action: str,
+    side: str | None,
+) -> str:
+    """One-line plain-English why for the rendered directive."""
+    side_str = (
+        "LONG" if final_direction > 0
+        else "SHORT" if final_direction < 0
+        else "NEUTRAL"
+    )
+    if conviction >= risk_on and final_direction != 0:
+        return (
+            f"conv {conviction:.2f} >= risk_on {risk_on:.2f} AND "
+            f"direction={side_str}(strength={direction_strength:.2f}) "
+            f"-> open {side_str}"
+        )
+    if conviction <= risk_off:
+        return (
+            f"conv {conviction:.2f} <= risk_off {risk_off:.2f} -> "
+            f"risk-off close (bias {bias} {strength:.2f} ignored)"
+        )
+    if action == "risk_on":
+        return (
+            f"MID-BAND ({risk_off:.2f} < {conviction:.2f} < {risk_on:.2f}) "
+            f"AND direction_strength {direction_strength:.2f} >= "
+            f"strong_bias_open ({strong_open:.2f}) -> STRONG-DIRECTION "
+            f"override {side_str}"
+        )
+    return (
+        f"MID-BAND ({risk_off:.2f} < {conviction:.2f} < {risk_on:.2f}) "
+        f"AND direction_strength {direction_strength:.2f} < "
+        f"strong_bias_open ({strong_open:.2f}) -> HOLD"
+    )
+
+
+async def run_test_bias(
+    bias: str, strength: float, conviction: float
+) -> None:
+    """Offline scenario test for the conviction/direction engine.
+
+    Synthesises L1, L2 and L3 `LevelScore`s with the requested
+    `conviction` + `direction` (derived from `bias`) and exercises the
+    real `_aggregate / _aggregate_direction / _build_directive`
+    pipeline. Skips Dune, Circle and the AllocationRouter so the test
+    stays fast and offline.
+
+    Note: with the new conviction/direction split, the input `bias`
+    sets every level's `direction_sign`, `strength` is the per-level
+    "magnitude of direction" used only as a tag, and `conviction` is
+    the per-level conviction score that the engine will then aggregate
+    into `final_score`. With three equal-conviction levels and L3
+    redistribution, the aggregate conviction equals the input
+    conviction - which is what the test typically wants to probe.
+    """
+    settings = get_settings()
+    configure_logging(settings.LOG_LEVEL)
+
+    bias = bias.lower().strip()
+    if bias not in {"bearish", "bullish", "neutral"}:
+        raise SystemExit(
+            f"--test-bias must be bearish|bullish|neutral, got {bias!r}"
+        )
+    strength = max(0.0, min(1.0, float(strength)))
+    conviction = max(0.0, min(1.0, float(conviction)))
+    direction_sign = (
+        1 if bias == "bullish" else -1 if bias == "bearish" else 0
+    )
+
+    engine = DecisionEngine(
+        level1=None,  # type: ignore[arg-type]
+        level2=None,  # type: ignore[arg-type]
+        level3=None,
+        weights=settings.level_weights,
+        risk_on_threshold=settings.RISK_ON_THRESHOLD,
+        risk_off_threshold=settings.RISK_OFF_THRESHOLD,
+        short_bias_min_strength=settings.SHORT_BIAS_MIN_STRENGTH,
+        strong_bias_open_strength=settings.STRONG_BIAS_OPEN_STRENGTH,
+        redistribute_synthetic_l3_weight=settings.REDISTRIBUTE_SYNTHETIC_L3_WEIGHT,
+    )
+
+    # Synthetic LevelScores: all three levels carry the same conviction
+    # + direction so the test probes the score-classification branch
+    # cleanly. L3 is marked synthetic so its weight is redistributed,
+    # making the aggregate conviction == input conviction.
+    scores = [
+        LevelScore(
+            level=1,
+            score=conviction,
+            rationale="synthetic L1 (test)",
+            direction_sign=direction_sign,
+        ),
+        LevelScore(
+            level=2,
+            score=conviction,
+            rationale=f"synthetic L2 bias={bias} strength={strength:.2f}",
+            raw={
+                "l2": {
+                    "market_bias": bias,
+                    "bias_strength": strength,
+                    "conviction": conviction,
+                }
+            },
+            direction_sign=direction_sign,
+        ),
+        LevelScore(
+            level=3,
+            score=conviction,
+            rationale="synthetic L3 (test)",
+            raw={"l3": {"synthetic": True}},
+            direction_sign=direction_sign,
+        ),
+    ]
+
+    effective = engine._effective_weights(scores)
+    final_score = engine._aggregate(scores, effective)
+    final_direction, direction_strength = engine._aggregate_direction(
+        scores, effective
+    )
+    directive = engine._build_directive(
+        final_score, final_direction, direction_strength, scores
+    )
+
+    # ---- Inputs table -------------------------------------------------
+    inputs = Table.grid(padding=(0, 2))
+    inputs.add_column(style="dim")
+    inputs.add_column(style="bold")
+    inputs.add_row("market_bias", f"{bias} (strength={strength:.2f})")
+    inputs.add_row("per-level conviction", f"{conviction:.3f}")
+    inputs.add_row(
+        "thresholds",
+        f"risk_off={settings.RISK_OFF_THRESHOLD:.2f}  "
+        f"risk_on={settings.RISK_ON_THRESHOLD:.2f}  "
+        f"strong_bias_open={settings.STRONG_BIAS_OPEN_STRENGTH:.2f}  "
+        f"short_bias_min={settings.SHORT_BIAS_MIN_STRENGTH:.2f}",
+    )
+    inputs.add_row(
+        "weights (configured)",
+        " ".join(f"{k}={v:.2f}" for k, v in settings.level_weights.items()),
+    )
+    inputs.add_row(
+        "weights (effective)",
+        " ".join(f"{k}={v:.2f}" for k, v in effective.items()),
+    )
+
+    # ---- Decision table ----------------------------------------------
+    side_str = (directive.side or "-").upper()
+    action_colour = {
+        "risk_on": "green",
+        "risk_off": "red",
+        "hold": "yellow",
+    }.get(directive.action, "white")
+    decision = Table.grid(padding=(0, 2))
+    decision.add_column(style="dim")
+    decision.add_column()
+    decision.add_row(
+        "action",
+        f"[bold {action_colour}]{directive.action.upper()}[/]",
+    )
+    decision.add_row("side", f"[bold]{side_str}[/]")
+    dir_label = (
+        "LONG" if final_direction > 0
+        else "SHORT" if final_direction < 0
+        else "NEUTRAL"
+    )
+    decision.add_row(
+        "aggregate direction",
+        f"{dir_label} (strength={direction_strength:.3f})",
+    )
+    decision.add_row("final_score (conviction)", f"{final_score:.3f}")
+    decision.add_row("intensity", f"{directive.intensity:.3f}")
+    decision.add_row("rationale", directive.rationale)
+
+    why = _explain_decision(
+        bias=bias,
+        strength=strength,
+        conviction=final_score,
+        final_direction=final_direction,
+        direction_strength=direction_strength,
+        risk_on=settings.RISK_ON_THRESHOLD,
+        risk_off=settings.RISK_OFF_THRESHOLD,
+        strong_open=settings.STRONG_BIAS_OPEN_STRENGTH,
+        action=directive.action,
+        side=directive.side,
+    )
+    decision.add_row("why", f"[italic]{why}[/]")
+
+    console.print(
+        Panel(
+            inputs,
+            title="[bold]--test-bias INPUTS[/]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+    console.print(
+        Panel(
+            decision,
+            title="[bold]--test-bias DECISION[/]",
+            border_style=action_colour,
+            box=box.ROUNDED,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Loop
+# ---------------------------------------------------------------------------
+
+
 async def run_loop(dry_run: bool) -> None:
     settings = get_settings()
     interval = max(1, settings.DECISION_INTERVAL_SECONDS)
-    if settings.VERBOSE:
-        logger.info("Looping every {} seconds. Ctrl-C to stop.", interval)
-    else:
-        # Header prints inside `run_once` on the first cycle; print the
-        # loop hint as a clean retro line so the demo viewer knows the
-        # cadence without needing to read the verbose loguru sink.
-        print_note(
-            console,
-            f"Looping every {interval}s. Press Ctrl-C to stop.",
-            style="dim",
-        )
-
-    first_cycle = True
+    logger.info("Looping every {} seconds. Ctrl-C to stop.", interval)
     while True:
         try:
-            await run_once(dry_run=dry_run, first_cycle=first_cycle)
+            await run_once(dry_run=dry_run)
         except Exception as exc:  # noqa: BLE001 - top-level guard
             logger.exception("Decision cycle failed: {}", exc)
-        first_cycle = False
         await asyncio.sleep(interval)
 
 
@@ -669,7 +626,46 @@ def main() -> None:
         action="store_true",
         help="Run continuously every DECISION_INTERVAL_SECONDS.",
     )
+    parser.add_argument(
+        "--test-bias",
+        choices=["bearish", "bullish", "neutral"],
+        default=None,
+        help=(
+            "Offline scenario test for the strong-bias override. "
+            "Forces market_bias + final_score and prints the directive the "
+            "engine would emit. Skips Dune, Circle and the router."
+        ),
+    )
+    parser.add_argument(
+        "--test-bias-strength",
+        type=float,
+        default=0.86,
+        help="bias_strength for --test-bias (0..1, default 0.86).",
+    )
+    parser.add_argument(
+        "--test-conviction",
+        "--test-final-score",
+        dest="test_conviction",
+        type=float,
+        default=0.52,
+        help=(
+            "Synthetic per-level conviction for --test-bias (0..1, "
+            "default 0.52 = mid-band so the strong-direction override "
+            "is the branch under test). With L3 redistribution, the "
+            "aggregate conviction equals this value."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.test_bias is not None:
+        asyncio.run(
+            run_test_bias(
+                bias=args.test_bias,
+                strength=args.test_bias_strength,
+                conviction=args.test_conviction,
+            )
+        )
+        return
 
     dry_run = not args.live
 

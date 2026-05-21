@@ -106,6 +106,21 @@ class SymbolReadout:
     informational_reasons: list[Level1Reason] = field(default_factory=list)
 
     @property
+    def direction(self) -> int:
+        """+1 (up), -1 (down), 0 (mixed / flat / blocked)."""
+        if not self.passes:
+            return 0
+        return _trend_to_sign(self.trend)
+
+    @property
+    def atr_pct_avg(self) -> float:
+        """Mean ATR% across timeframes (used by the vol-targeted router)."""
+        if not self.rows:
+            return 0.0
+        vals = [r.atr_pct for r in self.rows if r.atr_pct > 0]
+        return float(sum(vals) / len(vals)) if vals else 0.0
+
+    @property
     def strength(self) -> float:
         """0..1 score reflecting how convincingly the trend is aligned."""
         if not self.rows:
@@ -161,11 +176,26 @@ class Level1:
         from src.core.decision_engine import LevelScore
 
         decision = await self.evaluate(market)
+        # L1 emits a direction vote based on the *primary* symbol's
+        # trend (the symbol the router actually trades). Per-symbol
+        # directions also live in `decision.per_symbol[sym].direction`
+        # for future per-symbol routing.
+        primary_symbol = market.get("symbol") or (
+            list(decision.per_symbol.keys())[0]
+            if decision.per_symbol
+            else None
+        )
+        direction_sign = 0
+        if decision.passes and primary_symbol:
+            ro = decision.per_symbol.get(primary_symbol)
+            if ro is not None:
+                direction_sign = _trend_to_sign(ro.trend)
         return LevelScore(
             level=self.LEVEL,
             score=decision.score,
             rationale=decision.rationale,
             raw={"l1": _decision_to_dict(decision)},
+            direction_sign=direction_sign,
         )
 
     async def evaluate(self, market: dict[str, Any]) -> Level1Decision:
@@ -230,14 +260,18 @@ class Level1:
                 f"L1 BLOCKED on primary={primary_symbol}: {tag}"
             )
         else:
-            # When passing, score reflects average per-symbol strength of
-            # the symbols that *individually* passed (so a clear majority
-            # of aligned symbols boosts conviction).
+            # Conviction = average per-symbol trend strength of the
+            # symbols that *individually* passed (so a clear majority
+            # of aligned symbols boosts conviction). No `0.5 + 0.5*`
+            # floor: a passing-but-weak trend should contribute weak
+            # conviction, not a free 0.5 that drags the aggregate
+            # toward risk-on regardless of direction. Direction is
+            # carried separately via `LevelScore.direction_sign`.
             strengths = [
                 ro.strength for ro in per_symbol.values() if ro.passes
             ]
-            avg = sum(strengths) / len(strengths) if strengths else 0.5
-            score = float(0.5 + 0.5 * avg)
+            avg = sum(strengths) / len(strengths) if strengths else 0.25
+            score = float(min(1.0, max(0.0, avg)))
             trends = {sym: ro.trend for sym, ro in per_symbol.items()}
             rationale = (
                 f"L1 OK (primary={primary_symbol}): trends={trends}, "
@@ -559,6 +593,15 @@ def _atr(
 # ---------------------------------------------------------------------------
 
 
+def _trend_to_sign(trend: str) -> int:
+    """Map a trend label to a directional vote sign."""
+    if trend == "up":
+        return 1
+    if trend == "down":
+        return -1
+    return 0
+
+
 def _decision_to_dict(decision: Level1Decision) -> dict[str, Any]:
     return {
         "passes": decision.passes,
@@ -571,6 +614,8 @@ def _decision_to_dict(decision: Level1Decision) -> dict[str, Any]:
                 "passes": ro.passes,
                 "trend": ro.trend,
                 "strength": ro.strength,
+                "direction": ro.direction,
+                "atr_pct_avg": ro.atr_pct_avg,
                 "rows": [
                     {
                         "timeframe": r.timeframe,

@@ -9,7 +9,7 @@
 --
 --   imbalance(window) = (buy_usd - sell_usd) / total_usd
 --
---   "buy_usd"  = trades where the asset (WBTC / WETH / SOL) was the
+--   "buy_usd"  = trades where the asset (WBTC / WETH) was the
 --                token_bought   (i.e. takers paid USD to receive it)
 --   "sell_usd" = trades where the asset was the token_sold
 --                (takers paid the asset to receive USD)
@@ -27,15 +27,12 @@
 --   {{lookback_hours}}     number   - main window (24h typical)
 --   {{btc_token_address}}  text
 --   {{eth_token_address}}  text
---   {{sol_token_address}}  text
 
 WITH symbols AS (
     SELECT 'BTC-PERP'                            AS symbol,
            lower('{{btc_token_address}}')        AS token_address
     UNION ALL
     SELECT 'ETH-PERP', lower('{{eth_token_address}}')
-    UNION ALL
-    SELECT 'SOL-PERP', lower('{{sol_token_address}}')
 ),
 flows AS (
     SELECT

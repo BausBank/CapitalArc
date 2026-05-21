@@ -33,13 +33,7 @@ class Settings(BaseSettings):
     # When True, Level 2 caches Dune / Binance / on-chain results for
     # DEMO_CACHE_TTL_SECONDS so a demo run is fast and idempotent.
     DEMO_MODE: bool = True
-    DEMO_CACHE_TTL_SECONDS: int = 1800
-    # ---------- Output ----------
-    # Verbose mode toggle. False (default) = clean retro CLI with
-    # dynamic progress bars, six rich panels and zero technical chatter.
-    # True = full loguru chatter (Dune POST / retry / execution_id /
-    # poll loops) - useful when debugging, noisy in a demo.
-    VERBOSE: bool = False  # 30 minutes
+    DEMO_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
 
     # ---------- Market data (Level 1 OHLCV - sourced via Dune MCP) ----------
     # Day-3+: Level 1 OHLCV comes from the Dune `ohlcv` saved query
@@ -196,19 +190,53 @@ class Settings(BaseSettings):
     WEIGHT_LEVEL2: float = Field(default=0.35)
     WEIGHT_LEVEL3: float = Field(default=0.40)
 
-    # ---------- Short-selling controls ----------
-    # Minimum Level-2 `bias_strength` (0..1) required to flip a would-
-    # be risk-off into a SHORT open. Lower => more aggressive shorting;
-    # higher => only the cleanest bear setups trade. The L1 short-
-    # circuit guard still applies on top, so a blocked L1 never opens
-    # a short regardless of this value.
+    # ---------- Conviction / direction controls ----------
+    # Minimum aggregated *direction strength* (|weighted_direction|) in
+    # [0, 1] required for the engine to treat the side as decided. Used
+    # both in the risk-off / risk-on classification (turns the
+    # `final_direction` from neutral into long/short) and in the mid-
+    # band override below.
     SHORT_BIAS_MIN_STRENGTH: float = 0.35
-    # When True, shorts use the same `base_position_usd` and intensity
-    # sizing as longs (recommended). Flip to False + tune
-    # SHORT_SIZE_MULTIPLIER if you want half-size shorts during the
-    # ramp-up phase.
+    # Minimum direction strength required to override a mid-band hold
+    # and open a *reduced-size* position. Raise to 0.8 to fire almost
+    # never; lower to 0.5 for more frequent opens.
+    STRONG_BIAS_OPEN_STRENGTH: float = 0.6
+    # When True (default), a synthetic L3 score (no real Gemini wiring
+    # yet) gets its weight redistributed proportionally to L1 + L2 in
+    # the aggregation, so the placeholder doesn't silently dilute the
+    # real signal back into itself. Flip to False to keep the legacy
+    # behaviour where synthetic L3 votes with its configured weight.
+    REDISTRIBUTE_SYNTHETIC_L3_WEIGHT: bool = True
+
+    # ---------- Short-selling controls ----------
+    # When True, shorts use the same sizing pipeline as longs
+    # (recommended). Flip to False + tune SHORT_SIZE_MULTIPLIER if
+    # you want half-size shorts during the ramp-up phase.
     SYMMETRIC_SHORT_SIZING: bool = True
     SHORT_SIZE_MULTIPLIER: float = 1.0
+
+    # ---------- Position sizing (vol-targeted + DD haircut) ----------
+    # Default notional fallback when equity/ATR aren't available
+    # (typical first dry-run cycle before any margin is deposited).
+    BASE_POSITION_USD: float = 1000.0
+    MAX_POSITION_USD: float = 10000.0
+    # Fraction of equity to risk per trade under a `STOP_ATR_MULT * ATR`
+    # adverse move. 0.02 = 2% (textbook default).
+    TARGET_RISK_PCT: float = 0.02
+    # Stop distance in ATR multiples.
+    STOP_ATR_MULT: float = 1.5
+    # ATR% floor used in the sizing denominator to avoid divide-by-zero
+    # / absurdly large sizes when ATR collapses to near-zero. Should
+    # sit close to L1_ATR_PCT_MIN.
+    MIN_ATR_PCT_FOR_SIZING: float = 0.25
+    # Exponent of the drawdown haircut curve.
+    # `intensity *= max(0, 1 - (dd_pct / max_dd_pct) ** exponent)`.
+    # 1.0 = linear haircut; 2.0 = soft early, hard near the cap.
+    DD_HAIRCUT_EXPONENT: float = 2.0
+    # When True, the router stamps the full sizing breakdown (vol
+    # target, intensity, haircut, etc.) onto each ExecutionPlan so the
+    # console panel can show the "why" behind each size.
+    EXPLAIN_SIZING: bool = True
 
     @field_validator("*", mode="before")
     @classmethod

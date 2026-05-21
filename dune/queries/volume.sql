@@ -8,7 +8,7 @@
 -- -----------
 -- `dex.trades` (Dune multichain spot DEX trades). Until Arc is
 -- indexed, this is the most reliable, highest-liquidity feed for
--- BTC / ETH / SOL.
+-- BTC / ETH.
 --
 -- Parameters
 -- ----------
@@ -16,11 +16,10 @@
 --   {{lookback_hours}}     number - rolling window
 --   {{btc_token_address}}  text
 --   {{eth_token_address}}  text
---   {{sol_token_address}}  text
 --
 -- Output (one row per symbol)
 -- ---------------------------
---   symbol                BTC-PERP / ETH-PERP / SOL-PERP
+--   symbol                BTC-PERP / ETH-PERP
 --   last_price            most recent trade price (USD)
 --   price_change_pct_24h  % change over the lookback window
 --   volume_24h_usd        sum of `amount_usd` over the window
@@ -31,8 +30,6 @@ WITH symbols AS (
            lower('{{btc_token_address}}')        AS token_address
     UNION ALL
     SELECT 'ETH-PERP', lower('{{eth_token_address}}')
-    UNION ALL
-    SELECT 'SOL-PERP', lower('{{sol_token_address}}')
 ),
 window AS (
     SELECT

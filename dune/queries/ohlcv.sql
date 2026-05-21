@@ -1,36 +1,35 @@
 -- CapitalArc / Level 1 / ohlcv
 -- ----------------------------------------------------------------
--- Reconstructs OHLCV candles for BTC / ETH / SOL on a live, high
--- liquidity EVM chain (Ethereum / Base / Arbitrum). Level 1 uses
--- these candles to compute EMA / RSI / ATR and apply the trend +
--- volatility filters.
+-- Reconstructs OHLCV candles for BTC / ETH on a live, high-liquidity
+-- EVM chain (Ethereum / Base / Arbitrum). Level 1 uses these candles
+-- to compute EMA / RSI / ATR and apply the trend + volatility filters.
 --
 -- Why spot DEX trades and not perp fills?
 -- ---------------------------------------
 -- The Arc perp DEX is not yet indexed by Dune Analytics. Until it
 -- lands in the public Dune catalog, we run Level 1 against the
--- canonical on-chain wraps of BTC / ETH / SOL on a mainstream EVM
--- chain through `dex.trades` (the multichain spot-DEX trades table).
--- BTC is filtered on WBTC / cbBTC, ETH on WETH, SOL on the
--- Wormhole-wrapped SOL token. The agent treats these candles as
--- proxies for the perp price stream - the structural signal (trend,
--- RSI, ATR) is the same.
+-- canonical on-chain wraps of BTC / ETH on a mainstream EVM chain
+-- through `dex.trades` (the multichain spot-DEX trades table). BTC
+-- is filtered on WBTC / cbBTC, ETH on WETH. The agent treats these
+-- candles as proxies for the perp price stream - the structural
+-- signal (trend, RSI, ATR) is the same.
 --
--- Parameters
--- ----------
---   {{chain}}              text  - Dune chain tag matching `dex.trades.blockchain`
---                                  (e.g. 'ethereum', 'base', 'arbitrum').
---   {{intervals}}          text  - comma-separated timeframes; this template
---                                  emits the union of '15m' and '1h' rows.
---   {{lookback_hours}}     number - rolling window for bucketing trades.
---   {{btc_token_address}}  text  - lower-case hex of the BTC token on chain.
---   {{eth_token_address}}  text  - lower-case hex of the ETH token on chain.
---   {{sol_token_address}}  text  - lower-case hex of the SOL token on chain.
---   {{min_trade_usd}}      number - filter dust trades (default 1000).
+-- Parameters (ALL FIVE must be declared on the saved Dune query;
+-- otherwise Dune returns HTTP 400 'unknown parameters' and the
+-- DuneMCPClient has to retry without them. The Python adapter does
+-- the retry transparently but it's a wasted HTTP round-trip per
+-- cycle - keep these five in sync between this file and your saved
+-- Dune query.)
+--   {{chain}}              text   - Dune chain tag matching `dex.trades.blockchain`
+--                                   (e.g. 'ethereum', 'base', 'arbitrum').
+--   {{lookback_hours}}     number - window for the trade scan (typically 48).
+--   {{btc_token_address}}  text   - lower-case hex of the BTC token on chain.
+--   {{eth_token_address}}  text   - lower-case hex of the ETH token on chain.
+--   {{min_trade_usd}}      number - min trade size in USD to keep (default 1000).
 --
 -- Output schema (one row per (symbol, interval, bucket_time))
 -- -----------------------------------------------------------
---   symbol       text         BTC-PERP / ETH-PERP / SOL-PERP
+--   symbol       text         BTC-PERP / ETH-PERP
 --   interval     text         15m / 1h
 --   bucket_time  timestamp    UTC bucket left-edge (close_time)
 --   open         double
@@ -48,8 +47,6 @@ WITH symbols AS (
            lower('{{btc_token_address}}')        AS token_address
     UNION ALL
     SELECT 'ETH-PERP', lower('{{eth_token_address}}')
-    UNION ALL
-    SELECT 'SOL-PERP', lower('{{sol_token_address}}')
 ),
 trades AS (
     SELECT

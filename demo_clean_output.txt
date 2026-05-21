@@ -1,0 +1,183 @@
+.\.venv\Scripts\python.exe : E:\╨Я╨╡╤А╨╡╨╜╨╛╤Б╨╜╨╛╨╡\╨Ш╨╜╨▓╨╡╤Б╤В╨╕╤Ж╨╕╨╕\╨Т╨╛╤А╨║\CapitalArc\.venv\lib\site-packages\g
+oogle\api_core\_python_version_support.py:273: FutureWarning: You are using a Python version (3.10.10) which Google wil
+l stop supporting in new releases of google.api_core once it reaches its end of life (2026-10-04). Please upgrade to th
+e latest Python version, or at least Python 3.11, to continue receiving updates for google.api_core past that date.
+C:\Users\Антон\AppData\Local\Temp\ps-script-0d1f04ea-b397-43e4-ad7b-4dd2b2286dc6.ps1:77 знак:32
++ ... ONIOENCODING="utf-8"; .\.venv\Scripts\python.exe main.py 2>&1 | Tee-O ...
++                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (E:\╨Я╨╡╤А╨╡╨╜╨╛...past that date.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  warnings.warn(message, FutureWarning)
+[ 2026-05-21 19:08:12 ] CapitalArc starting ...
+> mode=DRY-RUN  env=dev  verbose=False
+> Loading Level 1 data (OHLCV via Dune MCP)...
+  ohlcv                тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+
+> Level 1 BLOCKED: L1 BLOCKED on primary=BTC-PERP: ohlcv_unavailable
+> Loading Level 2 data (on-chain intelligence via Dune MCP)...
+  funding_rates        тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+  open_interest        тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+  volume               тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+  long_short_ratio     тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+  cum_funding          тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+  whale_activity       тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+  vault_flows          тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+  market_sentiment     тАФ err тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ             50% (1/2)
+
+> тЮбя╕П Market Bias: NEUTRAL (strength=0.00)
+> тЪа DECISION: RISK_OFF | Bias: NEUTRAL (0.00) | Score: 0.000 | Action: CLOSE 
+BTC-PERP
+тХнтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФА Market Context тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХо
+тФВ          Time (UTC)  2026-05-21 15:14:47                                     тФВ
+тФВ                Mode  DRY-RUN (env=dev)                                       тФВ
+тФВ             Symbols  BTC-PERP, ETH-PERP                                      тФВ
+тФВ RPC (account state)  https://rpc.testnet.arc.network                         тФВ
+тФВ          Dune chain  ethereum (dex.trades)                                   тФВ
+тФВ           Token map  BTC=0x2260.., ETH=0xc02a..                              тФВ
+тФВ        Agent wallet  0xbd17b08eb061ef30e5243d92f11be45345d2b519              тФВ
+тФВ          Account ID  0x000000000000000000000000bd17b08eb061ef30e5243d92f11bтАж тФВ
+тФВ       L1 timeframes  15m, 1h                                                 тФВ
+тФВ        Agent margin  $0.00                                                   тФВ
+тФВ      Unrealized PnL  $0.00                                                   тФВ
+тФВ            Drawdown  0.00%                                                   тФВ
+тФВ    Arc latest block  43363469                                                тФВ
+тФВ           Vault TVL  $80.40                                                  тФВ
+тХ░тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХп
+тХнтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФА Level 1 - Technical Hard Rules (OHLCV via Dune MCP) тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХо
+тФВ   Verdict  BLOCKED                                                           тФВ
+тФВ     Score  0.000                                                             тФВ
+тФВ Rationale  L1 BLOCKED on primary=BTC-PERP: ohlcv_unavailable                 тФВ
+тФВ                          Indicators (latest candle)                          тФВ
+тФВ             тХ╖      тХ╖          тХ╖        тХ╖         тХ╖       тХ╖        тХ╖          тФВ
+тФВ   Symbol    тФВ TF   тФВ    Close тФВ   EMA9 тФВ   EMA21 тФВ   RSI тФВ   ATR% тФВ Trend    тФВ
+тФВ тХ║тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтХ╕ тФВ
+тФВ             тХ╡      тХ╡          тХ╡        тХ╡         тХ╡       тХ╡        тХ╡          тФВ
+тФВ                                   Reasons                                    тФВ
+тФВ          тХ╖                   тХ╖          тХ╖      тХ╖                             тФВ
+тФВ   Sev    тФВ Code              тФВ Symbol   тФВ TF   тФВ Message                     тФВ
+тФВ тХ╢тФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХ┤ тФВ
+тФВ   BLOCK  тФВ ohlcv_unavailable тФВ BTC-PERP тФВ 15m  тФВ OHLCV for BTC-PERP@15m      тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ unavailable or too short    тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ to apply technical          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ filters (Dune MCP:          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ source=error, bars=0,       тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ need=26).                   тФВ
+тФВ   BLOCK  тФВ ohlcv_unavailable тФВ BTC-PERP тФВ 1h   тФВ OHLCV for BTC-PERP@1h       тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ unavailable or too short    тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ to apply technical          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ filters (Dune MCP:          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ source=error, bars=0,       тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ need=26).                   тФВ
+тФВ   BLOCK  тФВ ohlcv_unavailable тФВ ETH-PERP тФВ 15m  тФВ OHLCV for ETH-PERP@15m      тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ unavailable or too short    тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ to apply technical          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ filters (Dune MCP:          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ source=error, bars=0,       тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ need=26).                   тФВ
+тФВ   BLOCK  тФВ ohlcv_unavailable тФВ ETH-PERP тФВ 1h   тФВ OHLCV for ETH-PERP@1h       тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ unavailable or too short    тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ to apply technical          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ filters (Dune MCP:          тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ source=error, bars=0,       тФВ
+тФВ          тФВ                   тФВ          тФВ      тФВ need=26).                   тФВ
+тФВ          тХ╡                   тХ╡          тХ╡      тХ╡                             тФВ
+тХ░тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХп
+тХнтФА Level 2 - On-chain Intelligence (Dune MCP single source) (short-circuited fтФАтХо
+тФВ                                                                              тФВ
+тФВ   Level 2 evaluated (short-circuited for final decision) - L1 hard rules     тФВ
+тФВ   vetoed the trade, but on-chain intelligence is rendered in full so the     тФВ
+тФВ   demo always shows what Dune MCP saw.                                       тФВ
+тФВ                                                                              тФВ
+тФВ      Regime  neutral                                                         тФВ
+тФВ       Score  0.500                                                           тФВ
+тФВ Market heat  0.500  [heuristic (fallback)]                                   тФВ
+тФВ Market bias  NEUTRAL  (strength=0.00)                                        тФВ
+тФВ       Cache  MISS                                                            тФВ
+тФВ    Dune MCP  healthy                                                         тФВ
+тФВ                        Per-symbol metrics (Dune MCP)                         тФВ
+тФВ         тХ╖       тХ╖      тХ╖       тХ╖      тХ╖       тХ╖      тХ╖       тХ╖      тХ╖        тФВ
+тФВ         тФВ       тФВ  24h тФВ       тФВ Fund тФВ    OI тФВ   OI тФВ    OI тФВ      тФВ Vol    тФВ
+тФВ   SymbтАж тФВ Price тФВ    % тФВ FundтАж тФВ  APR тФВ   USD тФВ   1h тФВ   24h тФВ  L/S тФВ spiтАж   тФВ
+тФВ тХ║тФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтХ╕ тФВ
+тФВ   BTC-тАж тФВ  0.00 тФВ +0.тАж тФВ +0.0тАж тФВ +0.тАж тФВ $0.00 тФВ +0.тАж тФВ +0.0тАж тФВ 1.00 тФВ no     тФВ
+тФВ   ETH-тАж тФВ  0.00 тФВ +0.тАж тФВ +0.0тАж тФВ +0.тАж тФВ $0.00 тФВ +0.тАж тФВ +0.0тАж тФВ 1.00 тФВ no     тФВ
+тФВ         тХ╡       тХ╡      тХ╡       тХ╡      тХ╡       тХ╡      тХ╡       тХ╡      тХ╡        тФВ
+тФВ                     Whale activity & cumulative funding                      тФВ
+тФВ            тХ╖       тХ╖       тХ╖           тХ╖           тХ╖           тХ╖             тФВ
+тФВ            тФВ       тФВ       тФВ           тФВ           тФВ       Cum тФВ             тФВ
+тФВ            тФВ       тФВ       тФВ           тФВ  Notional тФВ   funding тФВ Net longs   тФВ
+тФВ   Symbol   тФВ Whale тФВ Count тФВ Direction тФВ     delta тФВ  (window) тФВ      paid   тФВ
+тФВ тХ╢тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХ┤ тФВ
+тФВ   BTC-PERP тФВ no    тФВ     0 тФВ neutral   тФВ     $0.00 тФВ       24h тФВ     $0.00   тФВ
+тФВ   ETH-PERP тФВ no    тФВ     0 тФВ neutral   тФВ     $0.00 тФВ       24h тФВ     $0.00   тФВ
+тФВ            тХ╡       тХ╡       тХ╡           тХ╡           тХ╡           тХ╡             тФВ
+тФВ   Vault TVL  $0.00                                                           тФВ
+тФВ      Window  24h                                                             тФВ
+тФВ    Deposits  $0.00                                                           тФВ
+тФВ Withdrawals  $0.00                                                           тФВ
+тФВ    Net flow  $0.00                                                           тФВ
+тФВ      Events  in 0  out 0                                                     тФВ
+тФВ                         Metric provenance (Dune MCP)                         тФВ
+тФВ                    тХ╖        тХ╖      тХ╖        тХ╖                                тФВ
+тФВ   Metric           тФВ Source тФВ Rows тФВ Cached тФВ Note                           тФВ
+тФВ тХ╢тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФ╝тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХ┤ тФВ
+тФВ   funding_rates    тФВ error  тФВ    0 тФВ no     тФВ Dune query 7548438 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ   open_interest    тФВ error  тФВ    0 тФВ no     тФВ Dune query 7552510 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ   volume           тФВ error  тФВ    0 тФВ no     тФВ Dune query 7548324 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ   vault_flows      тФВ error  тФВ    0 тФВ no     тФВ Dune query 7552541 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ   whale_activity   тФВ error  тФВ    0 тФВ no     тФВ Dune query 7552613 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ   long_short_ratio тФВ error  тФВ    0 тФВ no     тФВ Dune query 7552641 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ   cum_funding      тФВ error  тФВ    0 тФВ no     тФВ Dune query 7552648 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ   market_sentiment тФВ error  тФВ    0 тФВ no     тФВ Dune query 7547421 returned    тФВ
+тФВ                    тФВ        тФВ      тФВ        тФВ an error or no data            тФВ
+тФВ                    тХ╡        тХ╡      тХ╡        тХ╡                                тФВ
+тФВ                                    Notes                                     тФВ
+тФВ   - Dune query ids missing for: funding_rates, open_interest, volume,        тФВ
+тФВ   vault_flows, whale_activity, long_short_ratio, cum_funding,                тФВ
+тФВ   market_sentiment (see dune/queries/ for the SQL templates).                тФВ
+тФВ                                                                              тФВ
+тХ░тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХп
+тФПтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБ Final Decision тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФУ
+тФГ                                                                              тФГ
+тФГ  ЁЯЫС  FINAL DECISION                                                          тФГ
+тФГ    Final score  0.000                                                        тФГ
+тФГ         Regime  risk-off                                                     тФГ
+тФГ         Action  RISK_OFF                                                     тФГ
+тФГ    Market bias  NEUTRAL  (strength=0.00)                                     тФГ
+тФГ      Intensity  1.00                                                         тФГ
+тФГ  Short-circuit  YES - L1 BLOCKED on primary=BTC-PERP: ohlcv_unavailable      тФГ
+тФГ  L1 (w=0.25)  score=0.000  rationale=L1 BLOCKED on primary=BTC-PERP:         тФГ
+тФГ               ohlcv_unavailable                                              тФГ
+тФГ  L2 (w=0.35)  score=0.500  rationale=L2 regime=neutral score=0.50 heat=0.50  тФГ
+тФГ               | BTC-PERP: fund=0.0000% OI(1h)=+0.00% L/S=1.00 | ETH-PERP:    тФГ
+тФГ               fund=0.0000% OI(1h)=+0.00% L/S=1.00                            тФГ
+тФГ  L3 (w=0.40)  score=0.000  rationale=skipped (L1 short-circuit)              тФГ
+тФГ                                                                              тФГ
+тФЧтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФЫ
+тХнтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФА Execution Plan тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХо
+тФВ Decision ID  dec-1779376487-0345c1a2                                         тФВ
+тФВ      Action  CLOSE                                                           тФВ
+тФВ      Symbol  BTC-PERP                                                        тФВ
+тФВ  Size (USD)  0                                                               тФВ
+тФВ    Leverage  0                                                               тФВ
+тФВ   Rationale  L1 short-circuit (L1 BLOCKED on primary=BTC-PERP:               тФВ
+тФВ              ohlcv_unavailable)                                              тФВ
+тФВ       Extra  usyc_rotation=deferred_to_day_3, held_sides=unknown             тФВ
+тХ░тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХп
+тХнтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФА On-chain Result тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХо
+тФВ                                 Transactions                                 тФВ
+тФВ                                    тХ╖         тХ╖      тХ╖           тХ╖            тФВ
+тФВ   Tx ID                            тФВ State   тФВ Hash тФВ Sponsored тФВ Explorer   тФВ
+тФВ тХ║тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтФ┐тФБтФБтФБтФБтФБтФБтФБтФБтФБтФБтХ╕ тФВ
+тФВ   dryrun-close-dec-1779376487-034тАж тФВ DRY_RUN тФВ -    тФВ no        тФВ -          тФВ
+тФВ                                    тХ╡         тХ╡      тХ╡           тХ╡            тФВ
+тХ░тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтХп
+> cycle done  score=0.000  action=risk_off

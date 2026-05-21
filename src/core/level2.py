@@ -3,8 +3,8 @@
 Level 2 is the agent's main analytical pillar. By design it consults
 exactly one external service - the **Dune MCP** server (via its
 Bearer-authenticated REST API) - and aggregates the result into a
-structured, actionable on-chain read for the three perp symbols we
-trade (`BTC-PERP`, `ETH-PERP`, `SOL-PERP`).
+structured, actionable on-chain read for the two perp symbols we
+trade (`BTC-PERP`, `ETH-PERP`).
 
 Chain & data source
 -------------------
@@ -12,7 +12,7 @@ The Arc Testnet isn't yet indexed by Dune, so every Level 2 metric
 is computed against a live, high-liquidity EVM chain (`ethereum`
 by default; `base` / `arbitrum` selectable via `Level2Config.chain`).
 The SQL templates target `dex.trades` (multichain spot DEX trades)
-and `erc20_<chain>.evt_Transfer`, with the BTC / ETH / SOL token
+and `erc20_<chain>.evt_Transfer`, with the BTC / ETH token
 addresses passed in as Dune query parameters. The structural
 signal Level 2 cares about (buy/sell imbalance, volume, whale
 flows, sentiment heat) translates 1:1 from spot to perp.
@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 
 
 Regime = Literal["risk_on", "risk_off", "neutral", "transition"]
+MarketBias = Literal["bullish", "bearish", "neutral"]
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@ class Level2Config:
     """Configuration for Level 2 on-chain intelligence."""
 
     symbols: list[str] = field(
-        default_factory=lambda: ["BTC-PERP", "ETH-PERP", "SOL-PERP"]
+        default_factory=lambda: ["BTC-PERP", "ETH-PERP"]
     )
     chain: str = "ethereum"              # Dune chain tag used as a query param
     lookback_hours: int = 24
@@ -181,6 +182,7 @@ class WhaleSnapshot:
     flagged: bool = False
     direction: Literal["accumulating", "distributing", "neutral"] = "neutral"
     notional_usd_change: float = 0.0
+    n_whales: int = 0
     rationale: str = ""
 
 
@@ -237,6 +239,15 @@ class Level2Intelligence:
     vault_flow: VaultFlowSnapshot
     metric_status: dict[str, MetricStatus]
     dune_healthy: bool
+    heat_source: str = "heuristic"  # "dune:<query_id>" | "heuristic"
+    # Directional inference derived from the per-symbol on-chain signals
+    # (funding sign, OI delta, whale direction, L/S ratio, price change,
+    # market heat). Distinct from `regime` which is a *conviction*
+    # bucket - `market_bias` answers "which side?", `regime` answers
+    # "how strongly?". The decision engine maps these onto long/short.
+    market_bias: MarketBias = "neutral"
+    bias_strength: float = 0.0          # 0..1, magnitude of the side vote
+    bias_rationale: str = ""            # short, human-readable summary
     generated_at: float = field(default_factory=time.time)
     cached: bool = False
     notes: list[str] = field(default_factory=list)
@@ -273,6 +284,29 @@ class Level2:
                 "metrics as n/a (DUNE_API_KEY missing in .env)."
             )
             return
+        # Per-metric saved query ids: log every loaded id (so adding a new
+        # DUNE_QUERY_<METRIC>_ID to .env shows up at startup automatically)
+        # and warn for the ones still missing.
+        loaded = self.dune.config.query_ids
+        for metric_name in (
+            "funding_rates",
+            "open_interest",
+            "volume",
+            "vault_flows",
+            "whale_activity",
+            "long_short_ratio",
+            "cum_funding",
+            "market_sentiment",
+        ):
+            qid = loaded.get(metric_name)
+            if qid:
+                logger.info("Loaded {} query ID = {}", metric_name, qid)
+            else:
+                logger.warning(
+                    "DUNE_QUERY_{}_ID not set - {} will be n/a",
+                    metric_name.upper(),
+                    metric_name,
+                )
         ok = await self.dune.ping()
         logger.info("Dune MCP {}", "connected" if ok else "unavailable")
 
@@ -284,11 +318,33 @@ class Level2:
         from src.core.decision_engine import LevelScore
 
         intel = await self.evaluate(market)
+        # ---- L2 conviction (vs L2 heat) ---------------------------------
+        # `intel.score` is the on-chain *heat* in [0, 1] - directional
+        # (1.0 = max-bullish, 0.0 = max-bearish, 0.5 = neutral). That
+        # number is great for the panel but a poor *conviction* metric
+        # because both `0.85` (strong bull) and `0.15` (strong bear)
+        # are equally decisive on-chain. We fold heat into a symmetric
+        # conviction `2*|heat - 0.5|` and then take the max with the
+        # on-chain `bias_strength` (which captures funding / OI /
+        # whale / LSR conviction directly even when heat sits near
+        # 0.5). The directional sign is carried in `direction_sign`.
+        heat_conviction = float(2.0 * abs(intel.market_heat - 0.5))
+        l2_conviction = float(
+            min(1.0, max(heat_conviction, intel.bias_strength))
+        )
+        direction_sign = _bias_to_sign(intel.market_bias)
+        rationale = (
+            f"{intel.rationale} | conviction={l2_conviction:.2f} "
+            f"(heat_conv={heat_conviction:.2f}, "
+            f"bias_strength={intel.bias_strength:.2f}) "
+            f"direction={intel.market_bias}({direction_sign:+d})"
+        )
         return LevelScore(
             level=self.LEVEL,
-            score=intel.score,
-            rationale=intel.rationale,
+            score=l2_conviction,
+            rationale=rationale,
             raw={"l2": _intel_to_dict(intel)},
+            direction_sign=direction_sign,
         )
 
     async def evaluate(self, market: dict[str, Any]) -> Level2Intelligence:
@@ -313,13 +369,43 @@ class Level2:
         vault_flow = self._build_vault_flow(fetches["vault_flows"])
 
         # ---- regime / heat --------------------------------------------
-        sentiment_row = self._first_row(fetches["market_sentiment"].rows)
-        heat = _coerce_float(sentiment_row.get("heat") if sentiment_row else None)
-        if heat is None:
+        # Branch on whether Dune returned a row at all (not on whether heat
+        # is null): if the query ran and gave us a row, the Dune result is
+        # authoritative even when `heat` is null (empty trade window →
+        # treat as neutral 0.5 rather than falling to the heuristic).
+        sentinel_fetch = fetches["market_sentiment"]
+        sentiment_row = self._first_row(sentinel_fetch.rows)
+        if sentiment_row is not None:
+            heat: float = float(
+                _coerce_float(sentiment_row.get("heat")) or 0.5
+            )
+            heat_source = sentinel_fetch.source  # "dune:<query_id>"
+            logger.info(
+                "Market heat from Dune = {:.3f} (query {})",
+                heat,
+                sentinel_fetch.query_id,
+            )
+        else:
             heat = self._heuristic_heat(per_symbol)
+            heat_source = "heuristic"
+            logger.info(
+                "Market heat from heuristic = {:.3f} ({})",
+                heat,
+                sentinel_fetch.note or "market_sentiment not configured",
+            )
         score = float(min(1.0, max(0.0, heat)))
         regime = self._classify_regime(score)
         rationale = self._build_rationale(score, regime, heat, per_symbol)
+
+        # ---- Directional bias (bullish / bearish / neutral) ----------
+        # Side detection lives in Level 2 because every input is on-chain
+        # intelligence (funding, OI, whales, L/S ratio, price change).
+        # The decision engine consumes `market_bias` + `bias_strength`
+        # to decide *which way* to open a position when the score is
+        # decisive enough to act.
+        market_bias, bias_strength, bias_rationale = self._compute_market_bias(
+            per_symbol, score
+        )
 
         # ---- metric_status (provenance map) ---------------------------
         metric_status = {
@@ -344,14 +430,37 @@ class Level2:
             regime=regime,
             rationale=rationale,
             market_heat=float(heat),
+            heat_source=heat_source,
             per_symbol=per_symbol,
             vault_flow=vault_flow,
             metric_status=metric_status,
             dune_healthy=dune_healthy,
+            market_bias=market_bias,
+            bias_strength=bias_strength,
+            bias_rationale=bias_rationale,
             notes=notes,
         )
+        # Demo mode caches Level 2 results so repeated demo runs are
+        # fast, but a transient Dune failure on one metric used to be
+        # "frozen" into the cache for the full TTL (30min by default),
+        # leaving the agent stuck rendering `error` long after Dune
+        # recovered. We only cache when EVERY metric returned a real
+        # Dune row (source starts with "dune:") - any error / n/a
+        # forces the next cycle to re-fetch.
         if self.config.demo_mode:
-            self._cache = (intel, time.time() + self.config.cache_ttl_seconds)
+            errored = [
+                name for name, st in metric_status.items()
+                if st.source == "error"
+            ]
+            if errored:
+                logger.warning(
+                    "Skipping L2 demo cache because {} metric(s) errored: {}",
+                    len(errored), ", ".join(errored),
+                )
+            else:
+                self._cache = (
+                    intel, time.time() + self.config.cache_ttl_seconds
+                )
         return intel
 
     # ------------------------------------------------------------------
@@ -377,10 +486,8 @@ class Level2:
         common_params: dict[str, Any] = {
             "chain": self.config.chain,
             "lookback_hours": self.config.lookback_hours,
-            "symbols": ",".join(symbols),
             "btc_token_address": token_map.get("BTC-PERP", ""),
             "eth_token_address": token_map.get("ETH-PERP", ""),
-            "sol_token_address": token_map.get("SOL-PERP", ""),
             "whale_min_usd": self.config.whale_min_usd,
             "vault_address": self.config.vault_address or "",
             "usdc_address": self.config.usdc_address or "",
@@ -395,6 +502,13 @@ class Level2:
             "cum_funding",
             "market_sentiment",
         )
+        logger.info(
+            "Dune L2 batch | chain={} lookback={}h symbols={} | params={}",
+            self.config.chain,
+            self.config.lookback_hours,
+            symbols,
+            {k: v for k, v in common_params.items() if k != "chain"},
+        )
 
         async def _fetch(name: str) -> tuple[str, MetricFetch]:
             if self.dune is None:
@@ -403,8 +517,17 @@ class Level2:
                     source="n/a",
                     note="DuneMCPClient is None (DUNE_API_KEY missing)",
                 )
+            # `execute=True` is required for every Level-2 metric:
+            # the saved Dune queries are parameterised (chain + per-
+            # symbol token addresses + lookback window), so reading
+            # the `latest_results` snapshot would silently ignore our
+            # parameters and return whatever the user happened to run
+            # last in the Dune UI. `_submit_execution` in the client
+            # transparently retries without unknown params, so this is
+            # robust even when the user's saved query declares a
+            # subset of the template's parameters.
             return name, await self.dune.fetch_metric(
-                name, params=common_params
+                name, params=common_params, execute=True
             )
 
         results = await asyncio.gather(*(_fetch(n) for n in metric_names))
@@ -551,14 +674,25 @@ class Level2:
                     "not configured)."
                 ),
             )
+        # `flagged` may arrive as a bool, an int (0/1) or a varchar
+        # ("true"/"false") depending on the Dune engine version, so
+        # coerce defensively. We also use `n_whales > 0` as a backup
+        # truth source when the column itself is missing.
+        n_whales = int(_coerce_float(row.get("n_whales")) or 0)
+        raw_flag = row.get("flagged", row.get("whale_flagged"))
+        if isinstance(raw_flag, str):
+            flagged = raw_flag.strip().lower() in {"true", "1", "yes"}
+        elif raw_flag is None:
+            flagged = n_whales > 0
+        else:
+            flagged = bool(raw_flag)
         return WhaleSnapshot(
             symbol=symbol,
-            flagged=bool(row.get("flagged") or row.get("whale_flagged")),
+            flagged=flagged,
             direction=str(row.get("direction") or "neutral"),  # type: ignore[arg-type]
-            notional_usd_change=_coerce_float(
-                row.get("notional_usd_change")
-            )
+            notional_usd_change=_coerce_float(row.get("notional_usd_change"))
             or 0.0,
+            n_whales=n_whales,
             rationale=str(row.get("rationale") or ""),
         )
 
@@ -649,6 +783,143 @@ class Level2:
             return "neutral"
         return "transition"
 
+    def _compute_market_bias(
+        self,
+        per_symbol: dict[str, SymbolIntel],
+        market_heat: float,
+    ) -> tuple[MarketBias, float, str]:
+        """Infer directional bias from the per-symbol on-chain signals.
+
+        Returns
+        -------
+        (bias, strength, rationale)
+            * bias - "bullish" | "bearish" | "neutral"
+            * strength - in [0, 1]; how decisively one side outweighs
+              the other (0 = perfectly balanced, 1 = unanimous one-side).
+            * rationale - short human-readable summary listing the
+              dominant signals on each side.
+
+        Signal weights (each contributes up to 1.0 of "vote"):
+          * funding rate sign + magnitude   - longs vs shorts paying
+          * OI 1h / 24h delta sign          - capital flowing in/out
+          * 24h price change                - directional tape
+          * L/S ratio vs 1.0                - aggregator positioning
+          * whale direction                 - large-wallet flow
+          * market_heat extremes (>=0.6 / <=0.4) - tie-breaker
+
+        Bias verdict:
+          * bull_pct  = bull_votes / (bull_votes + bear_votes)
+          * >= 0.65   -> bullish (longs are clearly dominant)
+          * <= 0.35   -> bearish (shorts are clearly dominant)
+          * else      -> neutral
+
+        Strength is the *margin* between the two sides scaled to 0..1
+        so a 9:1 vote yields ~0.8 and a 5:5 vote yields 0.0. This is
+        what the decision engine compares against
+        `MARKET_BIAS_MIN_STRENGTH` to decide whether to open a short.
+        """
+        if not per_symbol:
+            return "neutral", 0.0, "no per-symbol data"
+
+        bull_votes: float = 0.0
+        bear_votes: float = 0.0
+        bull_hits: list[str] = []
+        bear_hits: list[str] = []
+
+        for sym, intel in per_symbol.items():
+            funding = float(intel.funding.current_rate)
+            oi_1h = float(intel.open_interest.delta_1h_pct)
+            oi_24h = float(intel.open_interest.delta_24h_pct)
+            price_change = float(intel.volume.price_change_pct_24h)
+            ls_ratio = float(intel.long_short.long_short_ratio)
+            whale_dir = intel.whales.direction
+
+            # --- Funding: positive = longs pay shorts = bullish positioning;
+            # negative = shorts pay longs = bearish positioning. Scaled
+            # at 5000x so a +0.01% rate adds ~0.5 to the bull side.
+            if funding > 1e-6:
+                bull_votes += min(1.0, funding * 5000.0)
+                bull_hits.append(f"{sym} fund=+{funding*100:.4f}%")
+            elif funding < -1e-6:
+                bear_votes += min(1.0, -funding * 5000.0)
+                bear_hits.append(f"{sym} fund={funding*100:.4f}%")
+
+            # --- OI 1h delta: > +1% = capital flowing into perps quickly.
+            if oi_1h > 1.0:
+                bull_votes += min(1.0, oi_1h / 5.0)
+                bull_hits.append(f"{sym} OI(1h)=+{oi_1h:.2f}%")
+            elif oi_1h < -1.0:
+                bear_votes += min(1.0, -oi_1h / 5.0)
+                bear_hits.append(f"{sym} OI(1h)={oi_1h:.2f}%")
+
+            # --- 24h price change is the tape itself.
+            if price_change > 0.5:
+                bull_votes += min(1.0, price_change / 5.0)
+                bull_hits.append(f"{sym} 24h=+{price_change:.2f}%")
+            elif price_change < -0.5:
+                bear_votes += min(1.0, -price_change / 5.0)
+                bear_hits.append(f"{sym} 24h={price_change:.2f}%")
+
+            # --- L/S ratio: >1.1 = aggregate longs dominate.
+            if ls_ratio > 1.1:
+                bull_votes += min(1.0, (ls_ratio - 1.0))
+                bull_hits.append(f"{sym} L/S={ls_ratio:.2f}")
+            elif ls_ratio < 0.9:
+                bear_votes += min(1.0, (1.0 - ls_ratio))
+                bear_hits.append(f"{sym} L/S={ls_ratio:.2f}")
+
+            # --- Whale direction (only when the metric actually fired).
+            if intel.whales.flagged:
+                if whale_dir == "accumulating":
+                    bull_votes += 1.0
+                    bull_hits.append(f"{sym} whales=accum")
+                elif whale_dir == "distributing":
+                    bear_votes += 1.0
+                    bear_hits.append(f"{sym} whales=distrib")
+
+            # --- 24h OI delta (smaller weight than 1h - confirms regime).
+            if oi_24h > 2.0:
+                bull_votes += min(0.5, oi_24h / 20.0)
+            elif oi_24h < -2.0:
+                bear_votes += min(0.5, -oi_24h / 20.0)
+
+        # --- Market heat extremes are a tie-breaker.
+        if market_heat >= 0.6:
+            bull_votes += (market_heat - 0.5) * 2.0
+            bull_hits.append(f"heat={market_heat:.2f}")
+        elif market_heat <= 0.4:
+            bear_votes += (0.5 - market_heat) * 2.0
+            bear_hits.append(f"heat={market_heat:.2f}")
+
+        total = bull_votes + bear_votes
+        if total <= 1e-6:
+            return "neutral", 0.0, "no decisive on-chain signals"
+
+        bull_pct = bull_votes / total
+        margin = abs(bull_votes - bear_votes) / total  # 0..1
+
+        bias: MarketBias
+        if bull_pct >= 0.65:
+            bias = "bullish"
+        elif bull_pct <= 0.35:
+            bias = "bearish"
+        else:
+            bias = "neutral"
+
+        # Cap strength at 1.0 (margin already in [0, 1]). Use a slight
+        # square-root taper so small margins still register but don't
+        # punch above their weight (e.g. 0.4 raw -> 0.63 strength).
+        strength = float(min(1.0, margin ** 0.5))
+
+        hits = bull_hits if bias == "bullish" else bear_hits if bias == "bearish" else (
+            bull_hits + bear_hits
+        )
+        rationale = (
+            f"bull={bull_votes:.2f} bear={bear_votes:.2f} "
+            f"margin={margin:.2f} | " + ", ".join(hits[:6])
+        )
+        return bias, strength, rationale
+
     def _build_rationale(
         self,
         score: float,
@@ -700,6 +971,15 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _bias_to_sign(bias: str) -> int:
+    """Map an L2 `market_bias` label to a -1/0/+1 directional vote."""
+    if bias == "bullish":
+        return 1
+    if bias == "bearish":
+        return -1
+    return 0
+
+
 def _to_status(name: str, fetch: MetricFetch) -> MetricStatus:
     return MetricStatus(
         name=name,
@@ -712,11 +992,26 @@ def _to_status(name: str, fetch: MetricFetch) -> MetricStatus:
 
 
 def _intel_to_dict(intel: Level2Intelligence) -> dict[str, Any]:
+    heat_conviction = float(2.0 * abs(intel.market_heat - 0.5))
+    l2_conviction = float(
+        min(1.0, max(heat_conviction, intel.bias_strength))
+    )
     return {
         "score": intel.score,
         "market_heat": intel.market_heat,
+        "heat_source": intel.heat_source,
         "regime": intel.regime,
         "rationale": intel.rationale,
+        # Conviction / direction breakdown used by the engine. `score`
+        # above stays as the historical heat for backwards-compat in
+        # the L2 panel; `conviction` is what the engine actually votes
+        # with downstream.
+        "conviction": l2_conviction,
+        "heat_conviction": heat_conviction,
+        "direction_sign": _bias_to_sign(intel.market_bias),
+        "market_bias": intel.market_bias,
+        "bias_strength": intel.bias_strength,
+        "bias_rationale": intel.bias_rationale,
         "generated_at": intel.generated_at,
         "cached": intel.cached,
         "notes": intel.notes,
@@ -776,6 +1071,7 @@ def _intel_to_dict(intel: Level2Intelligence) -> dict[str, Any]:
                     "flagged": s.whales.flagged,
                     "direction": s.whales.direction,
                     "notional_usd_change": s.whales.notional_usd_change,
+                    "n_whales": s.whales.n_whales,
                     "rationale": s.whales.rationale,
                 },
                 "cum_funding": {

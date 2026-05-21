@@ -11,12 +11,11 @@ Chain & data source
 The Arc Testnet isn't indexed by Dune yet, so the saved query
 reconstructs OHLCV from `dex.trades` on a live, high-liquidity EVM
 chain (`ethereum` by default; `base` / `arbitrum` are trivially
-selectable via `DuneMarketDataConfig.chain`). The agent's three
-symbols map to the canonical on-chain wraps of BTC / ETH / SOL:
+selectable via `DuneMarketDataConfig.chain`). The agent's two
+symbols map to the canonical on-chain wraps of BTC / ETH:
 
     BTC-PERP -> WBTC  on ethereum / cbBTC on base
     ETH-PERP -> WETH  on every chain
-    SOL-PERP -> Wormhole-wrapped SOL on every chain
 
 The token-address mapping is supplied here at runtime so the SQL
 template stays chain-agnostic.
@@ -77,15 +76,21 @@ class DuneMarketDataConfig:
 
     chain: str = "ethereum"
     symbols: list[str] = field(
-        default_factory=lambda: ["BTC-PERP", "ETH-PERP", "SOL-PERP"]
+        default_factory=lambda: ["BTC-PERP", "ETH-PERP"]
     )
     intervals: list[str] = field(default_factory=lambda: ["15m", "1h"])
     lookback_hours: int = 48
     cache_ttl_seconds: int = 1800
-    # When True, executes the query (`POST /execute`) instead of just
-    # reading the cached `latest_results`. Use sparingly - executions
-    # consume Dune query credits.
-    execute_each_cycle: bool = False
+    # OHLCV is parameterised (chain + per-symbol token addresses are
+    # supplied at runtime from `.env`), so reading the saved query's
+    # `latest_results` is *wrong*: that endpoint returns whatever was
+    # cached on Dune with whatever params the user happened to pick
+    # last time they ran the query in the UI. We need our own params
+    # to flow through, which only happens via `POST /execute`. The
+    # `DuneMCPClient` already memoises the result for
+    # `cache_ttl_seconds`, so one execution per cycle is the right
+    # cost/freshness trade-off for Level 1.
+    execute_each_cycle: bool = True
     # Per-symbol token addresses on `chain` (e.g. WBTC / WETH / SOL
     # wraps). The OHLCV SQL filters `dex.trades` to rows touching
     # these addresses. Empty values get treated as "metric n/a" so
@@ -189,16 +194,31 @@ class DuneMarketData:
         token_map = {
             k.upper(): v for k, v in (self.config.token_addresses or {}).items()
         }
+        # NOTE: `intervals` is intentionally NOT sent to Dune. The SQL
+        # template hard-codes '15m' / '1h' in the trades_15m / trades_1h
+        # CTEs and never references `{{intervals}}`, so passing it would
+        # only make Dune complain about an unknown parameter and force a
+        # redundant retry. `self.config.intervals` is consumed Python-side
+        # in `_rows_to_frames` for the per-(symbol, interval) split.
         params = {
             "chain": self.config.chain,
-            "symbols": ",".join(self.config.symbols),
-            "intervals": ",".join(self.config.intervals),
             "lookback_hours": self.config.lookback_hours,
             "btc_token_address": token_map.get("BTC-PERP", ""),
             "eth_token_address": token_map.get("ETH-PERP", ""),
-            "sol_token_address": token_map.get("SOL-PERP", ""),
             "min_trade_usd": self.config.min_trade_usd,
         }
+        # Surface every parameter we're about to send to Dune so a missing
+        # token address or wrong chain is visible in the log even before
+        # the response comes back. The `ohlcv` saved query refuses to
+        # produce rows if e.g. `btc_token_address` is empty (no JOIN match),
+        # so this log is the quickest way to spot a misconfiguration.
+        query_id = (self.dune.config.query_ids or {}).get("ohlcv")
+        logger.info(
+            "Dune OHLCV call | query_id={} | execute={} | params={}",
+            query_id,
+            self.config.execute_each_cycle,
+            params,
+        )
         try:
             fetch = await self.dune.fetch_metric(
                 "ohlcv",
@@ -215,9 +235,32 @@ class DuneMarketData:
             return
 
         self._last_fetch = fetch
+        logger.info(
+            "Dune OHLCV result | source={} query_id={} rows={} cached={} note={}",
+            fetch.source,
+            fetch.query_id,
+            len(fetch.rows),
+            fetch.cached,
+            fetch.note,
+        )
         if not fetch.available:
             return
         self._frames = self._rows_to_frames(fetch.rows)
+        # One more line so it's obvious how many bars landed per
+        # (symbol, interval) - this is what Level 1 actually consumes.
+        if self._frames:
+            shape = {
+                f"{sym}/{tf}": int(len(df)) for (sym, tf), df in self._frames.items()
+            }
+            logger.info("Dune OHLCV frames | bars_per_pair={}", shape)
+        else:
+            logger.warning(
+                "Dune OHLCV returned {} rows but no (symbol, interval) "
+                "buckets parsed - check SQL output column names "
+                "(symbol / interval / bucket_time / open / high / low / "
+                "close / volume).",
+                len(fetch.rows),
+            )
 
     @staticmethod
     def _rows_to_frames(
@@ -266,7 +309,15 @@ class DuneMarketData:
 
 
 def _coerce_timestamp(value: Any) -> int | None:
-    """Best-effort coercion to a Unix-epoch *seconds* int."""
+    """Best-effort coercion to a Unix-epoch *seconds* int.
+
+    Handles the timestamp shapes Dune returns:
+    - ISO-8601 strings ("2026-05-20T12:00:00Z" / "2026-05-20T12:00:00+00:00");
+    - Dune's default timestamp render ("2026-05-20 12:00:00.000 UTC")
+      which is *not* valid ISO-8601 because of the " UTC" suffix;
+    - epoch seconds / milliseconds as int or float;
+    - python `datetime` (in case future callers hand us parsed values).
+    """
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -276,16 +327,22 @@ def _coerce_timestamp(value: Any) -> int | None:
             ts /= 1000.0
         return int(ts)
     if isinstance(value, str):
-        # Accept "2026-05-20 12:00:00" / ISO-8601 / "2026-05-20T12:00:00Z"
+        normalised = value.strip()
+        # Dune renders trino timestamps as "2026-05-18 17:15:00.000 UTC".
+        # Drop the trailing tz tag and substitute "+00:00" so
+        # `datetime.fromisoformat` (Python 3.10) accepts it.
+        if normalised.upper().endswith(" UTC"):
+            normalised = normalised[:-4].rstrip() + "+00:00"
+        normalised = normalised.replace("Z", "+00:00")
         try:
             return int(
-                datetime.fromisoformat(value.replace("Z", "+00:00"))
+                datetime.fromisoformat(normalised)
                 .astimezone(timezone.utc)
                 .timestamp()
             )
         except ValueError:
             try:
-                return int(float(value))
+                return int(float(normalised))
             except ValueError:
                 return None
     if isinstance(value, datetime):

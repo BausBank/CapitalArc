@@ -1,400 +1,428 @@
 # CapitalArc
 
-> **The On-Chain Adaptive Portfolio Manager.**
-> Trade when the market is risk-on. Earn yield when it isn't. Fully autonomous, fully on-chain.
+> 🧭 **The on-chain adaptive portfolio manager.**
+> Trades when the market is risk-on. Earns yield when it isn't.
+> Fully autonomous, fully on-chain, fully observable.
+
+[![Hackathon](https://img.shields.io/badge/Agora-Agents%20Hackathon-blueviolet)](https://www.canteen.xyz/)
+[![Built on](https://img.shields.io/badge/Built%20on-Arc%20%C3%97%20Circle-0052FF)](https://www.circle.com/)
+[![Data](https://img.shields.io/badge/Data-Dune%20MCP-FF6E40)](https://dune.com/)
+[![LLM](https://img.shields.io/badge/LLM-Gemini%202.5%20Flash-4285F4)](https://ai.google.dev/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 
 ---
 
-## Overview
+## 🌍 Overview
 
-**CapitalArc** is a fully on-chain AI agent that reads the market regime in real time and adapts capital allocation automatically:
+**CapitalArc** is a fully on-chain AI agent that reads the market regime in real time and reallocates capital autonomously:
 
-- **Risk-On regime** — the agent actively trades on the **Arc Perp DEX**, opening leveraged positions based on a three-level decision engine (technicals, on-chain intelligence, LLM arbitration).
-- **Risk-Off regime** — the agent protects capital by rotating into **USYC** (yield-bearing tokenized USDC), preserving value with native institutional yield while waiting for the next opportunity.
+- 📈 **Risk-on regime** — the agent opens **long or short** leveraged perp positions on the **Arc Perp DEX**, sized by a vol-targeted risk budget.
+- 🛡️ **Risk-off regime** — capital rotates into **USYC** (yield-bearing tokenized USDC), preserving value with native institutional yield while waiting for the next setup.
 
-The system is built end-to-end on the **Arc** stablechain and the full **Circle** stack: CCTP for liquidity routing, Developer-Controlled Wallets for non-custodial execution, Circle Paymaster for gasless UX, and USYC for the risk-off yield leg. Market intelligence is sourced through **Dune MCP** for on-chain flows and **Gemini 2.5 Flash** as the final regime arbiter.
+Decisions come from a **cascading three-level engine** (technicals → on-chain intelligence → LLM arbiter) that separates **conviction** ("do we act?") from **direction** ("which side?"). Execution rides the full **Circle** stack — CCTP for liquidity, Developer-Controlled Wallets for non-custodial signing, Circle Paymaster for gasless UX, USYC for the yield leg — on **Arc**.
 
----
-
-## Positioning — RFB 04: Adaptive Portfolio Manager
-
-This project is built for the **Agora Agents Hackathon (Canteen × Circle on Arc)**, under request **RFB 04 — Adaptive Portfolio Manager**.
-
-CapitalArc directly addresses the brief by delivering:
-
-1. **An autonomous portfolio agent** that decides *what* to hold, *when* to trade, and *when* to step aside — without human intervention.
-2. **Regime-aware allocation** between active perp trading and a safe yield-bearing asset (USYC), instead of a static strategy.
-3. **A full Arc + Circle native execution stack** — every action (trade, rebalance, swap, yield rotation) happens on-chain through Circle's primitives.
-4. **Multi-signal intelligence with an LLM arbiter** — fast technicals, on-chain capital flows (Dune MCP), and Gemini 2.5 Flash as the final, regime-aware judge.
+> Built for the **Agora Agents Hackathon (Canteen × Circle on Arc)**, request **RFB 04 — Adaptive Portfolio Manager**.
 
 ---
 
-## Architecture
+## ✨ Key Features
+
+- 🧠 **Three-level cascading decision engine** — fast deterministic technicals (L1) → on-chain intelligence (L2) → LLM final arbiter (L3, Day 4).
+- ⚖️ **Decoupled conviction & direction** — the engine separates "how strongly do we want to act?" from "which way?", so a high-conviction bearish setup correctly opens a **SHORT**, not a confused close. _(See [Architecture](#-architecture) below.)_
+- 📊 **Volatility-targeted sizing** — `size = equity × target_risk_pct / (stop_atr_mult × ATR%/100)`. The Kelly-fraction-style recipe used by every systematic CTA shop.
+- 🛟 **Gradient drawdown haircut** — intensity smoothly decays as drawdown grows (`× max(0, 1 − (dd/max_dd)^exponent)`), no cliff-edge stops.
+- 🔄 **L1 short-circuit** — any blocking L1 rule (RSI extreme, ATR out-of-band, trend mixed, drawdown breach) bypasses L2/L3 immediately. Saves API budget, stays honest.
+- 🔗 **Dune MCP as the single source of truth** — every signal (L1 OHLCV + 8 L2 metrics) reads through saved Dune queries with per-metric provenance. No CEX feeds. No RPC market-data scraping.
+- 🪞 **Chain-portable** — `DUNE_CHAIN=ethereum|base|arbitrum` is a one-line switch; SQL templates are parameterised by chain + token addresses.
+- ⛽ **Gasless on-chain execution** — Circle DCW + Paymaster, RSA-OAEP-SHA256-encrypted entity secret, sponsored tx on Arc Testnet.
+- 🎛️ **Six-panel rich CLI** — every cycle prints market context, L1, L2, final decision, execution plan and on-chain results with conviction/direction/sizing breakdown.
+- 🧪 **Offline scenario tester** — `python main.py --test-bias bearish --test-conviction 0.52` exercises the live decision branch with synthetic inputs, no Dune/Circle calls required.
+
+---
+
+## 🏛️ Architecture
 
 ### Three-level decision engine
 
 ```
-                +--------------------------------------------------+
-                |               Decision Engine                    |
-                |  +--------+  +--------+  +----------------------+ |
-   Market  ---> |  | L1 TA  |  | L2 OnC |  | L3 Gemini 2.5 Flash  | | ---> Risk score in [0,1]
+                +-----------------------------------------------------+
+                |                  Decision Engine                    |
+                |  +--------+   +--------+   +----------------------+ |
+   Market  ---> |  | L1 TA  |  | L2 OnC |  | L3 Gemini 2.5 Flash  | | ---> (conviction, direction)
    Data        |  | rules  |  | (Dune) |  |    (final arbiter)   | |
-                |  +--------+  +--------+  +----------------------+ |
-                +--------------------------------------------------+
-                                    |
-                                    v
-                +--------------------------------------------------+
-                |             Allocation Router                    |
-                |   score >= RISK_ON_THRESHOLD  -> Arc Perp DEX    |
-                |   score <= RISK_OFF_THRESHOLD -> USYC            |
-                |   otherwise                    -> Hold / Cash    |
-                +--------------------------------------------------+
+                |  +--------+   +--------+   +----------------------+ |
+                +-----------------------------------------------------+
+                                       |
+                                       v
+                +-----------------------------------------------------+
+                |                Allocation Router                    |
+                |  conviction >= RISK_ON + direction != 0 -> Arc Perp |
+                |  conviction <= RISK_OFF                  -> USYC    |
+                |  mid-band + strong direction             -> open    |
+                |  mid-band + neutral                      -> hold    |
+                +-----------------------------------------------------+
+                                       |
+                                       v
+                +-----------------------------------------------------+
+                |  Execution: Circle DCW + Paymaster + Vol-targeted   |
+                |  sizing + Gradient drawdown haircut                 |
+                +-----------------------------------------------------+
 ```
 
-| Level | Signal source                       | Role                                              | Weight |
-|-------|-------------------------------------|---------------------------------------------------|--------|
-| 1     | Price action / technicals           | Fast deterministic rules on OHLCV + funding + OI  | 0.25   |
-| 2     | On-chain flows via **Dune MCP**     | Stablecoin flows, OI delta, whale and bridge data | 0.35   |
-| 3     | **Gemini 2.5 Flash** final arbiter  | Regime classification + final risk score          | 0.40   |
+| Level | Signal source                          | Role                                              | Default weight |
+|-------|----------------------------------------|---------------------------------------------------|----------------|
+| L1    | OHLCV / TA via **Dune `dex.trades`**   | Hard "защита от дурака" rules + trend direction   | 0.25           |
+| L2    | On-chain flows via **Dune MCP**        | Funding, OI, volume, L/S, whales, vault flows     | 0.35           |
+| L3    | **Gemini 2.5 Flash** final arbiter     | Regime + conviction + direction (Day 4)           | 0.40           |
 
-The aggregated score drives the **Risk-On / Risk-Off** switch, which then decides whether capital sits in **Arc Perp positions** or in **USYC**.
+> 🛈 **Synthetic L3 redistribution.** Until Gemini wiring lands on Day 4, the L3 placeholder has its weight **redistributed proportionally to L1+L2** during aggregation — so the placeholder doesn't silently dilute the real signal back into itself. Effective weights are surfaced in the Final Decision panel as `0.25 → 0.42` etc.
+
+### Conviction vs Direction (the core idea)
+
+Every level emits **two** independent values:
+
+- 🎯 **Conviction** ∈ `[0, 1]` — "how strongly do we want to act at all?"
+- ➡️ **Direction** ∈ `{-1, 0, +1}` — "if we act, which side?"
+
+The aggregation:
+
+```
+final_conviction   = Σ (effective_weightᵢ × convictionᵢ)
+direction_strength = | Σ (effective_weightᵢ × convictionᵢ × directionᵢ) / Σ (effective_weightᵢ × convictionᵢ) |
+final_direction    = sign(direction_strength) if strength ≥ θ else 0
+```
+
+Direction votes are weighted by their **own conviction**, so a wishy-washy level can't drag the side.
+
+### Per-level mechanics
+
+| Level | Conviction formula                                              | Direction sign                      |
+|-------|-----------------------------------------------------------------|-------------------------------------|
+| L1    | `avg(per-symbol trend strength)` — no `0.5` floor              | Sign of primary symbol's trend      |
+| L2    | `max(2 × |heat − 0.5|, bias_strength)`                          | Sign of `market_bias` (bullish/bearish/neutral) |
+| L3    | Real Gemini call (Day 4) or synthetic blend of L1+L2 (today)    | Conviction-weighted blend           |
+
+> 💡 **Why `max(2·|heat-0.5|, bias_strength)` for L2?** Heat alone is directional (0.85 = bullish, 0.15 = bearish), so it makes a bad *conviction* signal — both extremes are equally decisive on-chain. The `2·|heat-0.5|` term folds heat into a symmetric conviction; the `max(..., bias_strength)` term catches the case where heat sits near neutral but on-chain signals (funding, OI, whales) point decisively one way.
+
+### Decision rules
+
+```
+conviction ≥ RISK_ON_THRESHOLD AND direction ≠ 0  →  open in direction (full intensity)
+conviction ≤ RISK_OFF_THRESHOLD                   →  close everything (side-agnostic)
+mid-band AND direction_strength ≥ STRONG_BIAS_OPEN →  open at reduced intensity
+                                                       (½ × conviction × direction_strength)
+mid-band AND direction_strength < STRONG_BIAS_OPEN →  hold
+```
+
+The L1 short-circuit always wins: any blocking L1 rule sets `final_conviction = 0`, skips L2/L3, and forces risk-off.
+
+### Position sizing pipeline
+
+When a `risk_on` directive opens a position, the router walks four steps:
+
+1. **Vol-target** — `vol_target_size = (equity × TARGET_RISK_PCT) / (STOP_ATR_MULT × ATR%/100)`. Uses the primary symbol's average ATR% from L1.
+2. **× Intensity** — scaled by `directive.intensity ∈ [0, 1]` (mid-band overrides use `0.5 × conviction × direction_strength`).
+3. **× Drawdown haircut** — `× max(0, 1 − (dd_pct / max_dd_pct) ** DD_HAIRCUT_EXPONENT)`. Exponent 2.0 means 5% dd → 75% size, 9% dd → 19% size, 10% dd → hard close.
+4. **Cap** at `MAX_POSITION_USD`.
+
+Every plan stamps a full `sizing` breakdown onto the Execution Plan panel so the demo answers *"why this size?"* visibly, line by line.
 
 ### Repository layout
 
 ```
 CapitalArc/
-├── main.py           # Entry point: --dry-run / --live, optional --loop
+├── main.py                       # Entry point: --dry-run / --live / --loop / --test-bias
 ├── src/
-│   ├── core/         # DecisionEngine + Level 1/2/3 + ExecutionDirective
-│   ├── data/         # DuneMCPClient + DuneMarketData (OHLCV), ArcOnchainReader
-│   ├── execution/    # ArcPerpExecutor + CircleWallet (DCW + Paymaster)
-│   ├── allocation/   # AllocationRouter: directive -> on-chain action
-│   ├── llm/          # Gemini 2.5 Flash client (final arbiter)
-│   ├── agents/       # Reserved for top-level orchestration helpers
-│   └── utils/        # Settings (pydantic), logging (loguru), rich panels
-├── prompts/          # LLM prompt templates for the Level 3 arbiter
-├── dune/             # Dune MCP SQL templates (Level 1 + 2) + setup README
-│   └── queries/      #   ohlcv.sql, funding_rates.sql, open_interest.sql, ...
-├── scripts/          # One-off scripts: deploy, seed, simulate, backtest
-├── tests/            # Unit & integration tests
-├── .env.example      # Template for environment variables
-├── requirements.txt  # Python dependencies
-├── README.md
-└── AGENTS.md         # Internal agent design and decision-level spec
+│   ├── core/
+│   │   ├── decision_engine.py    # Cascading L1→L2→L3, conviction+direction aggregation
+│   │   ├── level1.py             # Technical hard rules + per-symbol direction
+│   │   ├── level2.py             # On-chain intelligence (Dune MCP only)
+│   │   └── level3.py             # Gemini final arbiter (Day 4)
+│   ├── data/
+│   │   ├── dune_mcp.py           # DuneMCPClient — single source of truth
+│   │   ├── dune_market_data.py   # OHLCV adapter on dex.trades (L1 feed)
+│   │   └── arc_onchain.py        # Arc RPC reader (account state only)
+│   ├── execution/
+│   │   ├── arc_perp_executor.py  # Arc Perp DEX: margin, positions, ledger reads
+│   │   └── circle_wallet.py      # Circle DCW + Paymaster + RSA-OAEP signing
+│   ├── allocation/
+│   │   └── allocation_router.py  # Vol-targeted sizing + DD haircut + side routing
+│   ├── llm/
+│   │   └── gemini_client.py      # Google AI Studio client (Level 3)
+│   └── utils/
+│       ├── config.py             # Pydantic settings (sole .env reader)
+│       ├── console.py            # Six-panel rich renderer
+│       └── logging.py            # Loguru sinks
+├── dune/
+│   ├── README.md                 # SQL templates + column contracts (deep dive)
+│   └── queries/                  # ohlcv.sql, funding_rates.sql, ... (9 templates)
+├── prompts/                      # Gemini arbiter prompt templates
+├── scripts/                      # One-off ops (Circle wallet creation, etc.)
+├── tests/                        # pytest + pytest-asyncio
+├── .env.example                  # Documented template — never commit real keys
+├── requirements.txt
+├── AGENTS.md                     # Internal agent spec (source of truth)
+└── README.md
 ```
 
 ---
 
-## Tech Stack
+## 📅 Current Status
 
-**Chain & Infrastructure**
-- **Arc** — stablechain, primary execution layer
-- **Arc Perp DEX** — active trading venue (risk-on leg)
+### ✅ Day 1 — Scaffolding
 
-**Circle Stack**
-- **CCTP v2** — cross-chain USDC transfers and liquidity routing
-- **Developer-Controlled Wallets (DCW)** — non-custodial programmable wallets
-- **Circle Paymaster** — gasless transactions, sponsored UX
-- **USYC** — yield-bearing tokenized USDC (risk-off leg)
+- Three-level architecture in place with stable public interfaces.
+- Secret hygiene: `.env.example` template + git-ignored `.env`.
+- `AGENTS.md` describes the cascade + risk-on/off split.
 
-**Intelligence & Data**
-- **Dune MCP** — the **single source of truth** for both Level 1 (OHLCV / TA) and Level 2 (on-chain intelligence). Queries currently target a live, high-liquidity EVM chain (`DUNE_CHAIN=ethereum` by default; `base` / `arbitrum` selectable) because Arc Testnet isn't indexed by Dune yet.
-- **Arc RPC** — used **only** for non-trading account state (wallet, vault TVL, agent margin); never feeds trading signals
-- **Gemini 2.5 Flash** (Google AI Studio) — LLM final arbiter (Level 3)
+### ✅ Day 2 — Live Circle / Arc execution
 
-**Backend**
-- **Python 3.11+**
-- `web3.py`, `eth-account` — chain interaction
-- `httpx`, `aiohttp` — async HTTP
-- `pydantic`, `pydantic-settings` — typed configuration and schemas
-- `pandas`, `numpy`, `ta` — Level 1 signal processing
-- `mcp`, `dune-client` — Level 2 on-chain data
-- `google-generativeai` — Level 3 Gemini client
-- `apscheduler` — strategy scheduling loop
-- `loguru` — structured logging
+- **`ArcPerpExecutor`** wired against the real Arc Perp DEX stack on Arc Testnet (`ClearingHouse 0x70a06946…`, `USDCCollateralVault 0x75E4FBFB…`, `MarketRegistry 0x9cED23e4…`, `PositionLedger 0xd6D77291…`).
+- **Live margin moves** via Circle DCW `contractExecution` with **RSA-OAEP-SHA256** entity-secret encryption (fresh ciphertext per request).
+- **Circle Paymaster** sponsorship wired via `gasPolicyId`; `TxResult.sponsored` flips to `True` when policy is configured.
+- **`--dry-run` / `--live` / `--loop`** with strict pre-flight checks and Arcscan explorer links per tx.
 
----
+### ✅ Day 3 — Real signals & decision engine (this commit)
 
-## Current Status
+The agent now produces **honest, financially-grounded decisions** end-to-end on live on-chain data.
 
-### Day 1 — Completed
+- **L1 — Technical hard rules** (`src/core/level1.py`)
+  - OHLCV for `BTC-PERP` / `ETH-PERP` on `15m` + `1h`, reconstructed from Dune's multichain `dex.trades` via `DuneMarketData`.
+  - Four hard veto rules (`trend_mixed`, `rsi_overbought/oversold`, `atr_too_low/high`, `drawdown_breach`).
+  - Emits per-symbol `direction_sign` (+1/0/-1) and `atr_pct_avg` for downstream vol-targeting.
+  - Conviction = average per-symbol trend strength (no `+0.5` floor — a weak trend produces weak conviction, as it should).
 
-- Repository initialised, `.gitignore` and `.env.example` in place
-- Three-level architecture (L1 technical rules, L2 Dune MCP, L3 Gemini 2.5 Flash) reflected in code structure
-- Stub classes with stable public interfaces:
-  - `DecisionEngine`, `Level1`, `Level2`, `Level3` in `src/core/`
-  - `GeminiClient` in `src/llm/`
-- Secrets cleanly separated: real keys in local `.env`, only placeholders in `.env.example`
-- Twitter sentiment and xAI/Grok layers fully removed
-- `AGENTS.md` updated to the 3-level model
+- **L2 — On-chain intelligence** (`src/core/level2.py`)
+  - **9/9 Dune queries live** (provenance map renders `dune:<id>` for every metric in the L2 panel).
+  - Conviction = `max(2·|heat-0.5|, bias_strength)` — symmetric for longs and shorts.
+  - Direction inferred from funding / OI / 24h price / L/S / whales / heat extremes.
+  - Vault TVL + net deposit/withdrawal flow over the lookback window.
+  - `DEMO_MODE` caches the full payload for `DEMO_CACHE_TTL_SECONDS` (30 min default).
 
-### Day 2 — Completed
+- **DecisionEngine — conviction + direction aggregation** (`src/core/decision_engine.py`)
+  - L1 short-circuit (any blocking reason → `final_conviction = 0`, L2/L3 skipped).
+  - Synthetic L3 weight redistributed to L1+L2 proportionally (configurable).
+  - Direction is a conviction-weighted vote across levels.
+  - Mid-band strong-direction override opens at reduced intensity.
 
-The agent can now move real capital on Arc Testnet through Circle DCW.
+- **AllocationRouter — vol-targeted sizing + gradient drawdown haircut** (`src/allocation/allocation_router.py`)
+  - Solves `size = (equity × risk) / (stop × ATR/100)` using L1's primary-symbol ATR%.
+  - Drawdown haircut is gradient, not cliff (`exponent = 2.0` default).
+  - Full sizing attribution stamped onto every `ExecutionPlan.extra["sizing"]`.
 
-- **`ArcPerpExecutor`** (`src/execution/arc_perp_executor.py`) — wired
-  against the real Arc Perp DEX stack on Arc Testnet (verified contracts
-  deployed by `0x880bd26A...`): `ClearingHouse 0x70a06946…`,
-  `USDCCollateralVault 0x75E4FBFB…`, `MarketRegistry 0x9cED23e4…`,
-  `PositionLedger 0xd6D77291…`. The venue is order-book + on-chain batch
-  settlement (dYdX v3 style); margin moves are pure on-chain and live
-  today, EIP-712 order signing lands on Day 3 once the matcher URL is
-  available.
-- **Live margin moves**: `deposit_margin` / `withdraw_margin` execute real
-  `USDCCollateralVault.deposit / withdraw` transactions through Circle
-  DCW. `get_margin` / `get_position` read on-chain state via `web3.py`
-  against the public Arc Testnet RPC.
-- **`CircleWallet`** (`src/execution/circle_wallet.py`) — real
-  **RSA-OAEP-SHA256** encryption of the entity secret with Circle's
-  cached public key (fresh ciphertext per request, as Circle requires).
-  Circle **Paymaster** / Gas Station policy is wired via `gasPolicyId`
-  on the contractExecution body; `TxResult.sponsored` flips to `True`
-  when a policy is configured.
-- **`AllocationRouter`** — turns the `DecisionResult` into `open_position`
-  or `close_position`; in live mode, if the off-chain matcher URL isn't
-  set, it gracefully degrades to a margin-deposit so capital still lands
-  on the perp venue.
-- **`main.py`** — `--dry-run` (default), `--live` (with strict pre-flight
-  checks: refuses to start unless `CIRCLE_API_KEY`, `CIRCLE_ENTITY_SECRET`,
-  `CIRCLE_AGENT_WALLET_ID`, `ARC_PERP_ROUTER_ADDRESS` and
-  `ARC_PERP_VAULT_ADDRESS` are present), `--loop` for repeated cycles,
-  Arcscan explorer links printed for every tx, automatic polling of
-  Circle tx state to a terminal status.
-- **Day-1 setup script** (`scripts/create_circle_wallet.py`) — already
-  creates a named Circle DCW wallet on `ARC-TESTNET`.
+- **Six-panel rich CLI** — Market Context, L1, L2, Final Decision (with effective-weights and per-level direction), Execution Plan (with sizing pipeline), On-chain Result.
 
-**Default mode remains `--dry-run`**, which logs the exact Circle DCW
-`contractExecution` payload (including Paymaster hints) without touching
-the chain. Flip to `--live` once the Arc Testnet wallet is funded with
-USDC.
+- **Offline scenario tester** — `--test-bias bearish --test-bias-strength 0.86 --test-conviction 0.52` exercises the real decision branch with synthetic inputs; no Dune/Circle/router calls.
 
-### Day 3 — Completed
+### 🚧 Day 4 — Planned
 
-Level 1 (technical hard rules) and Level 2 (on-chain intelligence)
-are both fully wired and feed a cascading `DecisionEngine`. By design
-the agent has exactly **one market-data source**: **Dune MCP**. Both
-Level 1 (OHLCV / TA) and Level 2 (funding, OI, volume, vault flows,
-whales, L/S, cum funding, market sentiment) read through saved Dune
-queries. Arc RPC is still used, but **only** for non-trading account
-state (wallet, vault TVL, agent margin) - it never feeds the
-decision engine.
-
-> **Data path:** Arc Testnet is not yet indexed by Dune Analytics, so
-> the saved queries point at a live, high-liquidity EVM chain
-> (`DUNE_CHAIN=ethereum` by default; `base` and `arbitrum` are wired
-> out of the box). The agent's symbols (`BTC-PERP / ETH-PERP /
-> SOL-PERP`) map to the canonical on-chain wraps of BTC / ETH / SOL
-> on that chain (WBTC or cbBTC, WETH, Wormhole-SOL). Switching chains
-> is a one-line `.env` change because every SQL template is
-> parameterised by chain + token addresses. When Arc lands on Dune,
-> flip `DUNE_CHAIN=arc` and the rest of the pipeline is unchanged.
-
-- **Level 1 — Technical hard rules** (`src/core/level1.py`)
-  - OHLCV for **BTC-PERP / ETH-PERP / SOL-PERP** on `15m` and `1h`
-    is reconstructed from Dune's multichain `dex.trades` table
-    through the **`DuneMarketData`** adapter
-    (`src/data/dune_market_data.py`), which wraps `DuneMCPClient`
-    and runs the `ohlcv` saved query (`dune/queries/ohlcv.sql`).
-    The adapter executes one Dune call per cycle for *every*
-    `(symbol, interval)` combination, then fan-outs the rows to
-    per-symbol pandas DataFrames so the indicator stack stays
-    unchanged.
-  - When `DUNE_QUERY_OHLCV_ID` isn't configured (or the query
-    returns no rows), Level 1 emits an `ohlcv_unavailable` block
-    that explicitly cites the Dune source (`source=n/a / dune:<id>`,
-    bars returned vs required) - never invents data.
-  - Four hard rules ("защита от дурака") that can each veto a trade:
-    1. **Trend filter** — `close > EMA9 > EMA21` (or mirror down) must
-       hold on *both* 15m and 1h; otherwise `trend_mixed` blocks.
-    2. **RSI extreme** — `RSI(14) ≥ L1_RSI_OVERBOUGHT` (default 70) or
-       `≤ L1_RSI_OVERSOLD` (default 30) blocks the trade.
-    3. **Volatility band** — `ATR%` (ATR / price) must lie inside
-       `[L1_ATR_PCT_MIN, L1_ATR_PCT_MAX]` (defaults 0.15% / 6.00%).
-    4. **Account drawdown** — current `unrealized_pnl / margin`
-       breaching `MAX_DRAWDOWN_PCT` forces a flat outcome.
-  - `Level1Decision` carries a structured list of `Level1Reason`s
-    (`code`, `severity`, `message`, `symbol`, `timeframe`) plus a
-    per-symbol `SymbolReadout` with the latest indicator snapshot.
-
-- **Level 2 — On-chain intelligence (Dune MCP only)**
-  (`src/core/level2.py`)
-  - Sourced **exclusively** from Dune MCP via the new
-    `DuneMCPClient` (`src/data/dune_mcp.py`). Speaks the same
-    Bearer-authenticated surface the Dune MCP server exposes to
-    LLMs (`execute_query`, `latest_results`, `ping`), plus a
-    high-level `fetch_metric(name, params)` that resolves each
-    metric to a saved Dune query id (configurable per metric via
-    `DUNE_QUERY_*_ID` env vars).
-  - Per-symbol metrics: funding rate (current + 8h / 24h delta +
-    weighted average + annualised %), open interest (current +
-    1h / 4h / 24h deltas), volume + 1h-vs-24h spike detection,
-    long/short ratio with inferred bias, cumulative funding paid /
-    received over the window, whale-activity flag with rationale.
-    `volume`, `whale_activity`, `vault_flows`, `market_sentiment`
-    are computed straight from `dex.trades` and
-    `erc20_<chain>.evt_Transfer`. `funding_rates`, `open_interest`,
-    `long_short_ratio` and `cum_funding` are clearly labelled
-    **spot-derived proxies** that capture the same structural signal
-    (buy-vs-sell imbalance, rolling-USD volume, unique-wallet ratio,
-    signed aggressor flow). When a real perp-DEX schema lands on
-    Dune for Arc / Base, the underlying source swaps without
-    touching the rest of the pipeline.
-  - Vault-level metrics: TVL + net deposits / withdrawals over the
-    recent window for the configurable `DUNE_PERP_VAULT_ADDRESS`
-    (defaults to `ARC_PERP_VAULT_ADDRESS`).
-  - A market-wide **heat score** in `[0, 1]` labels the regime as
-    `risk_on` / `risk_off` / `neutral` / `transition`. When the
-    `market_sentiment` Dune query is configured, its `heat` is used
-    directly; otherwise the engine falls back to a heuristic blend
-    of funding, OI 1h delta, 24h price change and L/S.
-  - **Per-metric provenance.** Every metric records its source
-    (`dune:<query_id>` when it ran, `n/a` with an instructive note
-    when the corresponding `DUNE_QUERY_*_ID` isn't set, `error` if
-    Dune was unreachable). The L2 panel renders this provenance map
-    so demos and live runs are honest about what's actually on-chain.
-  - **SQL templates ship in `dune/queries/`** — `funding_rates.sql`,
-    `open_interest.sql`, `volume.sql`, `vault_flows.sql`,
-    `whale_activity.sql`, `long_short_ratio.sql`, `cum_funding.sql`,
-    `market_sentiment.sql`, each documented with its expected
-    parameters and column contract. Save them in your Dune
-    workspace, set the query ids in `.env`, and Level 2 starts
-    returning live numbers.
-  - `DEMO_MODE` caches the full `Level2Intelligence` payload for
-    `DEMO_CACHE_TTL_SECONDS` (default 30 min) so demo loops are fast
-    and idempotent.
-
-- **DecisionEngine — cascading L1 → L2 with short-circuit**
-  (`src/core/decision_engine.py`)
-  - If Level 1 blocks (`Level1Decision.passes == False`), Level 2 is
-    **not** called and the engine emits `final_score = 0.0`,
-    `regime = "risk-off"`, `short_circuited = True` with the explicit
-    L1 block reason. The `AllocationRouter` distinguishes a
-    short-circuit risk-off (legitimate close) from stale data
-    (denied).
-  - When L1 passes, L2 runs. Level 3 is left as a deterministic
-    placeholder (synthetic re-weight of L1 + L2) until Day 4 wires
-    Gemini 2.5 Flash as the final arbiter — the engine already
-    accepts a `Level3` instance and the briefing path is in place.
-  - Side inference: positive 24h price change on a majority of
-    symbols → `long`, negative → `short`.
-
-- **Rich visualisation** (`src/utils/console.py`, `main.py`)
-  - Every decision cycle prints six panels: **Market Context**
-    (with Arc latest block + vault TVL + agent margin / PnL /
-    drawdown), **Level 1 — Technical Hard Rules**, **Level 2 — On-chain
-    Intelligence (Dune MCP only)** with a **Metric provenance** table,
-    **Final Decision**, **Execution Plan** and **On-chain Result**.
-    Panels colour-code regime, trend, severity, source-availability
-    and tx state.
-
-- **Config & env**
-  - New settings: `OHLCV_LOOKBACK_HOURS`, `DUNE_CHAIN`
-    (`ethereum` / `base` / `arbitrum`), `DUNE_LOOKBACK_HOURS`,
-    `DUNE_TOKEN_{BTC,ETH,SOL,USDC}_ADDRESS` (overrides for the
-    built-in chain map), `DUNE_PERP_VAULT_ADDRESS` (vault watched
-    by `vault_flows`), `DUNE_WHALE_MIN_USD`, and one
-    `DUNE_QUERY_*_ID` per metric (now including `DUNE_QUERY_OHLCV_ID`
-    for Level 1). Removed: all `BINANCE_*` settings, the
-    `ARC_PERP_TRADE_EVENT_SIG / ARC_PERP_*_DECIMALS /
-    ARC_PERP_OHLCV_LOOKBACK_BLOCKS` family (no more direct Arc-RPC
-    OHLCV scraping), and the old `DUNE_CHAIN_TAG=arc` default
-    (replaced by `DUNE_CHAIN=ethereum`).
-
-### Day 4 — Planned
-
-- **Level 3 — real Gemini 2.5 Flash arbitration** (`src/core/level3.py`
-  + `src/llm/gemini_client.py`)
-  - Pin temperature low, force strict JSON: `{"score": float, "regime":
-    str, "rationale": str}`.
-  - Feed `ArbiterBriefing { l1_score, l1_rationale, l2_score,
-    l2_rationale, market_snapshot }`.
-
-- **Trading wire-up** (`src/execution/arc_perp_executor.py`)
-  - Set `ARC_PERP_MATCHER_URL` in `.env` once published in
-    `#agora-hackers`.
-  - Sign EIP-712 `OrderTypes.Order` with `eth-account`, POST signed
-    orders to the matcher.
-  - Decode `PositionLedger.getPosition` into the `Position` dataclass.
-
-- **Risk-off leg — USYC rotation** (`src/allocation/allocation_router.py`)
-  - On `risk_off`, withdraw USDC margin from the perp vault and route
-    into USYC.
-
-- **Observability**
-  - Persist every `DecisionResult` + `ExecutionPlan` to a local JSONL
-    log so we can replay the agent's day.
-
-**Definition of done for Day 4:** the agent runs end-to-end on real
-signals + Gemini arbitration, opens / closes a real perp position on
-Arc Testnet on `--live`, and rotates into USYC on a risk-off flip.
+- **Real Gemini 2.5 Flash arbitration** (`src/llm/gemini_client.py`): pinned low temperature, strict JSON `{score, direction, regime, rationale}`, briefing rendered from L1+L2.
+- **EIP-712 `OrderTypes.Order` signing** + matcher POST (`ARC_PERP_MATCHER_URL`) for full `open_position` on `--live`.
+- **USYC rotation** on risk-off: withdraw vault margin → USYC mint.
+- **JSONL decision log** for replay / backtest.
 
 ---
 
-## What a cycle looks like
+## ⚡ Quick Start
 
-Every cycle prints six panels to the terminal:
-
-```
-─── CapitalArc  mode=DRY-RUN  env=dev ───
-
-┌── Market Context ──────────────────────┐
-│  Time, mode, symbols, RPC, agent       │
-│  wallet, account ID, L1 timeframes     │
-└────────────────────────────────────────┘
-┌── Level 1 - Technical Hard Rules ──────┐
-│  PASS / BLOCKED verdict, score,        │
-│  indicators table (EMA9/21, RSI, ATR%, │
-│  trend) and reasons table.             │
-└────────────────────────────────────────┘
-┌── Level 2 - On-chain Intel (Dune MCP) ─┐
-│  regime, heat, Dune MCP health,        │
-│  per-symbol funding / OI / volume /    │
-│  L-S / whales / cum funding,           │
-│  vault TVL + net flow, plus a          │
-│  per-metric provenance map (dune:id /  │
-│  n/a / error) so the data path is      │
-│  honest at a glance.                   │
-└────────────────────────────────────────┘
-┌── Final Decision ──────────────────────┐
-│  final score, regime, action, side,    │
-│  intensity, per-level breakdown        │
-└────────────────────────────────────────┘
-┌── Execution Plan ──────────────────────┐
-│  decision_id, action, symbol, size,    │
-│  leverage, rationale                   │
-└────────────────────────────────────────┘
-┌── On-chain Result ─────────────────────┐
-│  tx_id, state, hash, sponsored,        │
-│  Arcscan explorer link                 │
-└────────────────────────────────────────┘
-```
-
-## Quick Start
+### 1. Install
 
 ```bash
 git clone <repo-url>
 cd CapitalArc
 
 python -m venv .venv
-.venv\Scripts\activate         # Windows
-# source .venv/bin/activate    # macOS / Linux
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
 
 pip install -r requirements.txt
 cp .env.example .env
-# Fill the keys in .env (Arc, Circle, Dune, Gemini).
+# Edit .env: Arc RPC + Circle DCW + Dune API key + saved query ids
+```
 
-# Dry-run (no on-chain transactions, just logs the would-be calls):
+### 2. Wire up Dune (one-time)
+
+Save the SQL templates from [`dune/queries/`](./dune/queries) to your Dune workspace and paste each query id into `.env`. See [Dune Queries Setup](#-dune-queries-setup) below.
+
+### 3. Run
+
+```bash
+# 🟢 Dry-run (default — no on-chain tx, just logs the would-be calls):
 python main.py
 
-# Loop in dry-run mode at DECISION_INTERVAL_SECONDS:
+# 🔁 Loop every DECISION_INTERVAL_SECONDS:
 python main.py --loop
 
-# Live execution (only after the Arc Perp router + Circle creds are real):
+# 🔴 Live execution (requires CIRCLE_API_KEY + CIRCLE_ENTITY_SECRET +
+#                    CIRCLE_AGENT_WALLET_ID + ARC_PERP_ROUTER_ADDRESS):
 python main.py --live
+```
+
+### 4. Offline scenario tester (`--test-bias`)
+
+Probe the decision engine with synthetic inputs — no Dune, no Circle, no chain. Useful for sanity-checking thresholds and the strong-direction override before deploying.
+
+```bash
+# Bearish setup with mid-band conviction → STRONG-DIRECTION override → SHORT
+python main.py --test-bias bearish --test-bias-strength 0.86 --test-conviction 0.52
+
+# High-conviction bullish → RISK_ON LONG
+python main.py --test-bias bullish --test-bias-strength 0.80 --test-conviction 0.75
+
+# Neutral mid-band → HOLD
+python main.py --test-bias neutral --test-bias-strength 0.10 --test-conviction 0.50
+```
+
+Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, configured-vs-effective weights) and the **DECISION** panel (action, side, aggregate direction, final conviction, intensity, plain-English `why`).
+
+### 5. What a live cycle looks like
+
+```
+─── CapitalArc  mode=DRY-RUN  env=dev ───
+
+┌── Market Context ──────────────────────┐
+│  Time, mode, symbols, RPC, agent       │
+│  wallet, account ID, L1 timeframes,    │
+│  Arc latest block, vault TVL, margin   │
+└────────────────────────────────────────┘
+┌── Level 1 — Technical Hard Rules ──────┐
+│  PASS / BLOCKED verdict, conviction,   │
+│  indicators table (EMA9/21, RSI, ATR%, │
+│  trend) and reasons table.             │
+└────────────────────────────────────────┘
+┌── Level 2 — On-chain Intel (Dune MCP) ─┐
+│  regime, conviction = max(heat_conv,   │
+│  bias_strength), per-symbol funding /  │
+│  OI / volume / L-S / whales / cum fund │
+│  + per-metric provenance map.          │
+└────────────────────────────────────────┘
+┌── Final Decision ──────────────────────┐
+│  conviction, aggregate direction       │
+│  (with strength), action, side, L2     │
+│  bias, intensity, per-level vote table │
+│  (configured w → effective w).         │
+└────────────────────────────────────────┘
+┌── Execution Plan ──────────────────────┐
+│  decision_id, action, symbol, size,    │
+│  leverage, conviction, sizing pipeline │
+│  (vol-target → intensity → DD haircut  │
+│  → final).                             │
+└────────────────────────────────────────┘
+┌── On-chain Result ─────────────────────┐
+│  tx_id, state, hash, sponsored,        │
+│  Arcscan explorer link.                │
+└────────────────────────────────────────┘
 ```
 
 ---
 
-## License
+## 🗺️ Roadmap
+
+| Phase | Status | Highlights |
+|-------|--------|------------|
+| **Day 1** | ✅ | Scaffolding, secret hygiene, 3-level interfaces |
+| **Day 2** | ✅ | Circle DCW + Paymaster live; Arc Perp DEX margin moves on Testnet |
+| **Day 3** | ✅ | L1 + L2 wired to Dune MCP (9/9 queries live); conviction/direction split; vol-targeted sizing; gradient drawdown haircut |
+| **Day 4** | 🚧 | Real Gemini 2.5 Flash L3 arbiter; EIP-712 perp orders; USYC rotation; JSONL decision log |
+| **Post-hack** | 💡 | Per-symbol routing (open BTC long while ETH is flat); on-chain DSL for declaring strategies; arc-native Dune dataset when indexed |
+
+---
+
+## 🧰 Tech Stack
+
+**Chain & infrastructure**
+- 🏗️ **Arc** stablechain (Testnet today, mainnet on launch)
+- 🎯 **Arc Perp DEX** — `ClearingHouse` + `USDCCollateralVault` + `MarketRegistry` + `PositionLedger`
+
+**Circle stack**
+- 🌉 **CCTP v2** — cross-chain USDC routing
+- 🔐 **Developer-Controlled Wallets** — non-custodial programmable signing
+- ⛽ **Circle Paymaster** — gasless / sponsored transactions
+- 🪙 **USYC** — yield-bearing tokenized USDC (risk-off leg)
+
+**Intelligence & data**
+- 🔭 **Dune MCP** — single source of truth for L1 OHLCV + L2 on-chain intelligence (Ethereum / Base / Arbitrum supported out of the box)
+- 🧱 **Arc RPC** — account state only (wallet, vault TVL, agent margin)
+- 🤖 **Gemini 2.5 Flash** — Level 3 final arbiter (Day 4)
+
+**Backend**
+- 🐍 Python 3.10+
+- `web3.py`, `eth-account`, `eth-abi` — chain interaction
+- `httpx`, `aiohttp`, `tenacity` — async HTTP with rate-limit retries
+- `pydantic`, `pydantic-settings` — strongly-typed config
+- `pandas`, `numpy`, `ta` — L1 indicator math
+- `mcp`, `dune-client` — L2 on-chain data
+- `google-generativeai` — L3 LLM client
+- `loguru` — structured logging
+- `rich` — six-panel terminal UI
+- `apscheduler` — loop scheduling
+
+---
+
+## 🔬 Dune Queries Setup
+
+CapitalArc sources **all** market analysis (L1 OHLCV + L2 on-chain intelligence) **exclusively** from Dune MCP. The agent queries a fixed set of saved Dune queries by id; SQL templates ship under [`dune/queries/`](./dune/queries) for you to save into your own Dune workspace.
+
+### Why Ethereum / Base / Arbitrum and not Arc Testnet?
+
+Arc Testnet is not yet indexed in the public Dune catalog (no `arc.dex.trades`, no `erc20_arc.evt_Transfer`). Until it lands, CapitalArc points its decision engine at a live, high-liquidity EVM chain via Dune's multichain `dex.trades` table. Every SQL template is parameterised by `{{chain}}` and per-symbol token addresses, so switching chains is a one-line `.env` change.
+
+| Symbol     | Ethereum mainnet | Base                       | Arbitrum One |
+|------------|------------------|----------------------------|--------------|
+| `BTC-PERP` | WBTC             | cbBTC                      | WBTC         |
+| `ETH-PERP` | WETH             | WETH (`0x4200…0006`)       | WETH         |
+| USDC       | Circle USDC      | native USDC                | native USDC  |
+
+Defaults live in `src/utils/config.py::_DEFAULT_TOKEN_ADDRESSES`. Override any of them via `DUNE_TOKEN_{BTC,ETH,USDC}_ADDRESS` in `.env`.
+
+### Saved queries (9/9 live)
+
+Save each SQL file in your Dune workspace and paste the resulting numeric id into `.env`:
+
+| Level | Metric             | Env var                          | SQL template                                              |
+|-------|--------------------|----------------------------------|-----------------------------------------------------------|
+| L1    | `ohlcv`            | `DUNE_QUERY_OHLCV_ID`            | [`dune/queries/ohlcv.sql`](./dune/queries/ohlcv.sql)                       |
+| L2    | `market_sentiment` | `DUNE_QUERY_MARKET_SENTIMENT_ID` | [`dune/queries/market_sentiment.sql`](./dune/queries/market_sentiment.sql) |
+| L2    | `volume`           | `DUNE_QUERY_VOLUME_ID`           | [`dune/queries/volume.sql`](./dune/queries/volume.sql)                     |
+| L2    | `funding_rates`    | `DUNE_QUERY_FUNDING_RATES_ID`    | [`dune/queries/funding_rates.sql`](./dune/queries/funding_rates.sql)       |
+| L2    | `open_interest`    | `DUNE_QUERY_OPEN_INTEREST_ID`    | [`dune/queries/open_interest.sql`](./dune/queries/open_interest.sql)       |
+| L2    | `vault_flows`      | `DUNE_QUERY_VAULT_FLOWS_ID`      | [`dune/queries/vault_flows.sql`](./dune/queries/vault_flows.sql)           |
+| L2    | `whale_activity`   | `DUNE_QUERY_WHALE_ACTIVITY_ID`   | [`dune/queries/whale_activity.sql`](./dune/queries/whale_activity.sql)     |
+| L2    | `long_short_ratio` | `DUNE_QUERY_LONG_SHORT_RATIO_ID` | [`dune/queries/long_short_ratio.sql`](./dune/queries/long_short_ratio.sql) |
+| L2    | `cum_funding`      | `DUNE_QUERY_CUM_FUNDING_ID`      | [`dune/queries/cum_funding.sql`](./dune/queries/cum_funding.sql)           |
+
+Startup logs print `Loaded <metric> query ID = <id>` for every loaded query, so any drift between `.env` and what Python actually sees is visible immediately — no need to grep.
+
+### Honest provenance everywhere
+
+Every metric records its source: `dune:<query_id>` when the query ran, `n/a` (with an instructive note pointing at the missing env var) when the id isn't set, or `error` if Dune was unreachable. The L2 panel renders this provenance map so demos and live runs are honest about what's actually on-chain. **The agent never invents data** — Level 1 honestly blocks on `ohlcv_unavailable` if `DUNE_QUERY_OHLCV_ID` isn't configured.
+
+### Spot-derived perp proxies (clearly labelled)
+
+L2 measures funding / OI / L/S / cumulative funding even though `dex.trades` is a spot tape. Each is computed as a **proxy** that captures the same structural signal:
+
+| Metric              | Proxy                                                                                                |
+|---------------------|------------------------------------------------------------------------------------------------------|
+| Funding rate        | Buy-vs-sell USD imbalance over 8h, scaled to a per-8h funding-rate equivalent (0.05% / 1.0 imbalance)|
+| Open interest       | Rolling-USD volume + 1h / 4h / 24h deltas                                                            |
+| Long/short ratio    | `sum(buy_usd) / sum(sell_usd)`, with unique-wallet counts for the account columns                    |
+| Cumulative funding  | Net signed aggressor flow scaled across the lookback window                                          |
+| Whale activity      | Spot DEX trades above `DUNE_WHALE_MIN_USD`, signed accumulating / distributing                       |
+| Vault flows         | ERC-20 `Transfer` events into / out of `DUNE_PERP_VAULT_ADDRESS`                                     |
+| Market sentiment    | `0.5 + 0.25 × mean(imbalance) + 0.5 × clip(mean(24h price change), ±0.25)`                          |
+
+When a real perp-DEX schema lands on Dune (Arc, Synthetix V3 perps, etc.), swap the `dex.trades` source for the perp's `fills` / `funding_events` table — the rest of the pipeline is unchanged.
+
+### Free-tier safety nets
+
+L2 fans out 8 metric calls + L1 fans out 1 OHLCV call in parallel each cycle. On Dune's free tier the burst hits HTTP 429 quickly; the client caps in-flight requests with a semaphore (`DUNE_MAX_CONCURRENT_REQUESTS=2` by default) and retries 429s with exponential backoff (`DUNE_RATE_LIMIT_*` knobs). Bump concurrency to 6–8 on a paid plan.
+
+### Full column contracts & SQL gotchas
+
+The full per-query column contract (what every column means, types, gotchas around `varbinary` casts and Trino reserved keywords) lives in **[`dune/README.md`](./dune/README.md)** — saved separately so the SQL files and their docs stay co-located.
+
+---
+
+## 📜 License
 
 To be defined before the hackathon submission.

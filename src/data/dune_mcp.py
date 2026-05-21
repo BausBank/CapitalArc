@@ -43,24 +43,11 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 
 from src.utils.logging import logger
-
-
-# Lifecycle events fired by the client for every metric fetch. Used
-# by the rich-progress reporter in `main.py` to render real-time
-# per-metric progress bars without piggy-backing on stderr logs.
-#   "start"      - fetch_metric() entered for this metric
-#   "submitted"  - Dune accepted the /execute POST (or cache hit / latest_results landed)
-#   "completed"  - rows are in hand
-#   "cached"     - the metric came back from the in-process cache
-#   "n/a"        - the metric has no DUNE_QUERY_*_ID configured
-#   "error"      - Dune returned an error / no rows / unknown metric
-MetricEvent = str
-MetricEventCallback = Callable[[str, MetricEvent], None]
 
 
 # Dune's REST API returns HTTP 400 with a body like
@@ -163,17 +150,6 @@ class DuneMCPClient:
         self._semaphore = asyncio.Semaphore(
             max(1, int(config.max_concurrent_requests))
         )
-        # Optional progress hook fired at every metric lifecycle event;
-        # the clean-mode CLI in `main.py` plugs into this to render
-        # rich-progress bars per metric without grepping stderr logs.
-        self.on_metric_event: MetricEventCallback | None = None
-
-    def _fire(self, metric: str | None, event: MetricEvent) -> None:
-        if metric and self.on_metric_event is not None:
-            try:
-                self.on_metric_event(metric, event)
-            except Exception:  # noqa: BLE001 - never let UI break a fetch
-                logger.debug("metric event hook raised for {} ({})", metric, event)
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -228,13 +204,11 @@ class DuneMCPClient:
         *,
         limit: int = 1000,
         use_cache: bool = True,
-        metric: str | None = None,
     ) -> DuneQueryResult | None:
         """Return the latest cached execution of `query_id`."""
         if use_cache:
             hit = self._cache_get(query_id)
             if hit is not None:
-                self._fire(metric, "cached")
                 return hit
         client = await self._ensure_client()
         resp = await self._get_with_rate_limit(
@@ -266,7 +240,6 @@ class DuneMCPClient:
         params: dict[str, Any] | None = None,
         wait: bool = True,
         use_cache: bool = True,
-        metric: str | None = None,
     ) -> DuneQueryResult | None:
         """Execute `query_id` and (optionally) wait for results."""
         if use_cache:
@@ -277,7 +250,6 @@ class DuneMCPClient:
                     query_id,
                     hit.row_count,
                 )
-                self._fire(metric, "cached")
                 return hit
 
         # Dune's `query_parameters` map expects string values
@@ -293,10 +265,6 @@ class DuneMCPClient:
         execution_id = await self._submit_execution(query_id, query_params)
         if execution_id is None:
             return None
-        # Fire "submitted" only once we have an execution_id so a
-        # rejected /execute (HTTP 400 / 401 / 5xx) doesn't bump the
-        # progress bar past the running state.
-        self._fire(metric, "submitted")
         if not wait:
             return DuneQueryResult(
                 query_id=query_id,
@@ -553,9 +521,7 @@ class DuneMCPClient:
             of our queries are scheduled and `latest_results` is much
             cheaper.
         """
-        self._fire(metric, "start")
         if metric not in METRIC_NAMES:
-            self._fire(metric, "error")
             return MetricFetch(
                 metric=metric,
                 source="error",
@@ -563,7 +529,6 @@ class DuneMCPClient:
             )
         query_id = self.config.query_ids.get(metric)
         if not query_id:
-            self._fire(metric, "n/a")
             return MetricFetch(
                 metric=metric,
                 source="n/a",
@@ -576,20 +541,16 @@ class DuneMCPClient:
             )
 
         if execute:
-            result = await self.execute_query(
-                query_id, params=params or {}, metric=metric
-            )
+            result = await self.execute_query(query_id, params=params or {})
         else:
-            result = await self.latest_results(query_id, metric=metric)
+            result = await self.latest_results(query_id)
         if result is None:
-            self._fire(metric, "error")
             return MetricFetch(
                 metric=metric,
                 source="error",
                 query_id=query_id,
                 note=f"Dune query {query_id} returned an error or no data",
             )
-        self._fire(metric, "completed")
         return MetricFetch(
             metric=metric,
             source=f"dune:{query_id}",

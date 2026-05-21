@@ -18,17 +18,16 @@ CapitalArc points its decision engine at a live, high-liquidity EVM
 chain via Dune's multichain `dex.trades` table.
 
 Every SQL template ships with a `{{chain}}` parameter and is otherwise
-chain-agnostic. The agent's three symbols map to the canonical
-on-chain wraps of BTC / ETH / SOL on the chosen chain:
+chain-agnostic. The agent's two symbols map to the canonical on-chain
+wraps of BTC / ETH on the chosen chain:
 
 | Symbol     | Ethereum mainnet      | Base                  | Arbitrum One        |
 |------------|-----------------------|-----------------------|---------------------|
 | `BTC-PERP` | WBTC                  | cbBTC                 | WBTC                |
 | `ETH-PERP` | WETH                  | WETH (`0x4200...0006`)| WETH                |
-| `SOL-PERP` | Wormhole-wrapped SOL  | Wormhole-wrapped SOL  | Wormhole-wrapped SOL|
 
 The token addresses are pre-loaded by `src/utils/config.py`. You can
-override any of them via `DUNE_TOKEN_{BTC,ETH,SOL,USDC}_ADDRESS` in
+override any of them via `DUNE_TOKEN_{BTC,ETH,USDC}_ADDRESS` in
 `.env` to point at a different wrap, fork or sidechain.
 
 To switch chains, set `DUNE_CHAIN=base` (or `arbitrum`) in `.env`
@@ -43,8 +42,8 @@ The same SQL covers every supported chain.
    1. **New query** → paste the SQL.
    2. **Add query parameters** the SQL references (see the header
       comment in each file). The common set is `chain`,
-      `lookback_hours`, `btc_token_address`, `eth_token_address`,
-      `sol_token_address`. Set defaults that match your `DUNE_CHAIN`.
+      `lookback_hours`, `btc_token_address`, `eth_token_address`.
+      Set defaults that match your `DUNE_CHAIN`.
    3. **Save** the query. Dune assigns a numeric query id (visible in
       the URL: `https://dune.com/queries/<id>`).
    4. (Optional but recommended.) Set a **schedule** so the query
@@ -107,7 +106,7 @@ Multi-row result: one row per `(symbol, interval, bucket_time)`.
 
 | Column        | Type                                  | Notes                                |
 |---------------|---------------------------------------|--------------------------------------|
-| `symbol`      | text                                  | `BTC-PERP` / `ETH-PERP` / `SOL-PERP` |
+| `symbol`      | text                                  | `BTC-PERP` / `ETH-PERP`              |
 | `interval`    | text                                  | `15m` / `1h`                         |
 | `bucket_time` | timestamp / int (epoch seconds or ms) | UTC bucket left-edge                 |
 | `open`        | double                                | first trade price in the bucket      |
@@ -121,7 +120,7 @@ Multi-row result: one row per `(symbol, interval, bucket_time)`.
 
 | Column                  | Type    | Notes                                                          |
 |-------------------------|---------|----------------------------------------------------------------|
-| `symbol`                | text    | `BTC-PERP` / `ETH-PERP` / `SOL-PERP`                          |
+| `symbol`                | text    | `BTC-PERP` / `ETH-PERP`                                       |
 | `current_rate`          | double  | spot-imbalance-derived per-8h funding equivalent              |
 | `rate_8h_change`        | double  | current minus previous 8h imbalance rate                       |
 | `rate_24h_change`       | double  | current minus 16-24h imbalance rate                            |
