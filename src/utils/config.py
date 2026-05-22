@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -174,12 +174,59 @@ class Settings(BaseSettings):
     L1_KLINES_LIMIT: int = 150
     L1_REQUIRE_TF_AGREEMENT: bool = True
 
-    # ---------- Gemini (Level 3) ----------
-    GEMINI_API_KEY: str | None = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
-    GEMINI_TEMPERATURE: float = 0.2
-    GEMINI_MAX_OUTPUT_TOKENS: int = 1024
-    GEMINI_TIMEOUT_SECONDS: int = 30
+    # ---------- OpenRouter (Level 3 final arbiter) ----------
+    # OpenRouter is the LLM gateway in front of Level 3. Setting
+    # OPENROUTER_API_KEY is the ONLY toggle needed to switch L3 from
+    # synthetic-placeholder mode to real Claude arbitration. When
+    # unset, the engine emits a synthetic L3 whose weight is
+    # redistributed back to L1+L2 (see REDISTRIBUTE_SYNTHETIC_L3_WEIGHT).
+    #
+    # We migrated from Google's Gemini SDK (geo-locked away from
+    # multiple user regions with `400 FAILED_PRECONDITION`) to
+    # OpenRouter because the latter routes through their own
+    # infrastructure and stays accessible globally. The default
+    # upstream model is Anthropic's Claude Sonnet 4.6; swap to any
+    # other slug listed on https://openrouter.ai/models with a
+    # one-line `.env` change.
+    OPENROUTER_API_KEY: str | None = None
+    OPENROUTER_MODEL: str = "anthropic/claude-sonnet-4.6"
+    OPENROUTER_TEMPERATURE: float = 0.2
+    # 2048 leaves the critical-mode 5-section rationale room to breathe
+    # (Market Context / Key Signals Analysis / Contradictions & Risks /
+    # My Independent View / Final Recommendation typically lands at
+    # 600-1100 output tokens; 1024 starts truncating it on long signals
+    # tables). Standard mode rarely uses more than ~300 tokens, so the
+    # extra budget is free in that mode.
+    OPENROUTER_MAX_TOKENS: int = 2048
+    OPENROUTER_TIMEOUT_SECONDS: int = 60
+    # Bounded retry for transient failures (429 rate-limit, 5xx
+    # upstream, malformed JSON). Hard failures (auth, model-not-found,
+    # policy denial) raise immediately so the operator sees the
+    # actionable diagnosis without waiting through backoff windows.
+    OPENROUTER_MAX_RETRIES: int = 2
+    OPENROUTER_BACKOFF_SECONDS: float = 2.0
+    # Optional analytics headers (visible on
+    # https://openrouter.ai/activity).
+    OPENROUTER_REFERER: str = "https://github.com/capitalarc/capitalarc"
+    OPENROUTER_APP_TITLE: str = "CapitalArc"
+
+    # ---------- Level 3 mode (critical | standard) ----------
+    # Critical mode (default) makes Claude behave as an *independent*
+    # senior risk manager: it is allowed to disagree with L1+L2 when
+    # signals are weak or contradictory, and its rationale follows a
+    # strict 5-section template (Market Context / Key Signals Analysis /
+    # Contradictions & Risks / My Independent View / Final
+    # Recommendation) so the demo always shows *how* the decision was
+    # reached, not just *what* it is.
+    #
+    # Standard mode is the original "trader voice" prompt: concise 1-2
+    # sentence rationale with short technical tags. Useful for high-
+    # frequency runs where the structured rationale is overkill.
+    #
+    # Each mode resolves a distinct prompt file under `prompts/`:
+    #   critical -> prompts/level3_arbiter_critical.md
+    #   standard -> prompts/level3_arbiter_standard.md
+    L3_MODE: Literal["critical", "standard"] = "critical"
 
     # ---------- Risk & Allocation ----------
     RISK_ON_THRESHOLD: float = 0.6

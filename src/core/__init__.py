@@ -9,7 +9,7 @@ Levels
 ------
 - `Level1` - fast deterministic technical rules on OHLCV / funding data.
 - `Level2` - on-chain intelligence sourced via the Dune MCP server.
-- `Level3` - Gemini 2.5 Flash acting as the final narrative arbiter.
+- `Level3` - Claude Sonnet 4.6 (via OpenRouter) as the final arbiter.
 """
 
 from src.core.decision_engine import (
@@ -42,8 +42,9 @@ from src.core.level2 import (
 )
 from src.core.level3 import (
     ArbiterBriefing,
-    GeminiFinalArbiter,
+    ArbiterResponse,
     Level3,
+    Level3Arbiter,
     Level3Config,
 )
 
@@ -71,7 +72,8 @@ __all__ = [
     "VaultFlowSnapshot",
     "MetricStatus",
     "Level3",
+    "Level3Arbiter",
     "Level3Config",
     "ArbiterBriefing",
-    "GeminiFinalArbiter",
+    "ArbiterResponse",
 ]

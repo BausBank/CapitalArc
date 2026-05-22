@@ -50,17 +50,20 @@ from src.allocation.allocation_router import AllocationConfig, AllocationRouter
 from src.core.decision_engine import DecisionEngine, LevelScore
 from src.core.level1 import Level1, Level1Config
 from src.core.level2 import Level2, Level2Config
+from src.core.level3 import ArbiterBriefing, Level3, Level3Config
 from src.data.arc_onchain import ArcOnchainConfig, ArcOnchainReader
 from src.data.dune_market_data import DuneMarketData, DuneMarketDataConfig
 from src.data.dune_mcp import DuneMCPClient, DuneMCPClientConfig
 from src.execution.arc_perp_executor import ArcPerpConfig, ArcPerpExecutor
 from src.execution.circle_wallet import CircleWallet, CircleWalletConfig
+from src.llm.openrouter_client import OpenRouterClient, OpenRouterClientConfig
 from src.utils.config import Settings, get_settings
 from src.utils.console import (
     execution_plan_panel,
     final_decision_panel,
     level1_panel,
     level2_panel,
+    level3_panel,
     market_context_panel,
     onchain_result_panel,
 )
@@ -154,10 +157,65 @@ def _build_arc_reader(settings: Settings) -> ArcOnchainReader:
     )
 
 
+def _build_level3(settings: Settings) -> tuple[Level3 | None, OpenRouterClient | None]:
+    """Build the real OpenRouter-backed Level 3 if ``OPENROUTER_API_KEY`` is set.
+
+    Returns a ``(level3, client)`` pair so the caller can ``aclose()``
+    the underlying httpx pool on shutdown. When no API key is present,
+    returns ``(None, None)`` and the engine falls back to the synthetic
+    L3 placeholder (whose weight is then redistributed back to L1+L2).
+    This keeps demos running without an OpenRouter key while making the
+    upgrade to real arbitration a single ``.env`` change.
+
+    The underlying upstream model is whatever ``OPENROUTER_MODEL``
+    resolves to (default: ``anthropic/claude-sonnet-4.6``); switch
+    providers by changing that env var alone.
+    """
+    if not settings.OPENROUTER_API_KEY:
+        logger.info(
+            "OPENROUTER_API_KEY not set - Level 3 will run as synthetic "
+            "placeholder (weight redistributed to L1+L2)."
+        )
+        return None, None
+    client = OpenRouterClient(
+        OpenRouterClientConfig(
+            api_key=settings.OPENROUTER_API_KEY,
+            model=settings.OPENROUTER_MODEL,
+            temperature=settings.OPENROUTER_TEMPERATURE,
+            max_tokens=settings.OPENROUTER_MAX_TOKENS,
+            timeout_seconds=settings.OPENROUTER_TIMEOUT_SECONDS,
+            max_retries=settings.OPENROUTER_MAX_RETRIES,
+            backoff_seconds=settings.OPENROUTER_BACKOFF_SECONDS,
+            referer=settings.OPENROUTER_REFERER,
+            app_title=settings.OPENROUTER_APP_TITLE,
+        )
+    )
+    logger.info(
+        "Level 3 wired with OpenRouter | model={} mode={} temperature={} "
+        "timeout={}s",
+        settings.OPENROUTER_MODEL,
+        settings.L3_MODE,
+        settings.OPENROUTER_TEMPERATURE,
+        settings.OPENROUTER_TIMEOUT_SECONDS,
+    )
+    level3 = Level3(
+        client=client,
+        config=Level3Config(
+            model=settings.OPENROUTER_MODEL,
+            temperature=settings.OPENROUTER_TEMPERATURE,
+            max_output_tokens=settings.OPENROUTER_MAX_TOKENS,
+            timeout_seconds=settings.OPENROUTER_TIMEOUT_SECONDS,
+            mode=settings.L3_MODE,
+        ),
+    )
+    return level3, client
+
+
 def _build_engine(
     settings: Settings,
     market_data: DuneMarketData,
     dune: DuneMCPClient | None,
+    level3: Level3 | None,
 ) -> DecisionEngine:
     level1 = Level1(
         Level1Config(
@@ -200,7 +258,7 @@ def _build_engine(
     return DecisionEngine(
         level1=level1,
         level2=level2,
-        level3=None,  # Level 3 (Gemini final arbiter) lands on Day 4
+        level3=level3,
         weights=settings.level_weights,
         risk_on_threshold=settings.RISK_ON_THRESHOLD,
         risk_off_threshold=settings.RISK_OFF_THRESHOLD,
@@ -318,7 +376,10 @@ async def run_once(dry_run: bool) -> None:
     dune = _build_dune(settings)
     market_data = _build_dune_market_data(settings, dune=dune)
     onchain = _build_arc_reader(settings)
-    engine = _build_engine(settings, market_data=market_data, dune=dune)
+    level3, openrouter_client = _build_level3(settings)
+    engine = _build_engine(
+        settings, market_data=market_data, dune=dune, level3=level3
+    )
     router = _build_router(settings, executor=executor, dry_run=dry_run)
 
     try:
@@ -341,8 +402,10 @@ async def run_once(dry_run: bool) -> None:
 
         l1_raw = decision.level_score(1).raw.get("l1", {}) if decision.level_score(1) else {}
         l2_raw = decision.level_score(2).raw.get("l2", {}) if decision.level_score(2) else {}
+        l3_raw = decision.level_score(3).raw.get("l3", {}) if decision.level_score(3) else {}
         console.print(level1_panel(l1_raw, decision.level_score(1).score))
         console.print(level2_panel(l2_raw, decision.level_score(2).score))
+        console.print(level3_panel(l3_raw, decision.level_score(3).score if decision.level_score(3) else 0.0))
         console.print(final_decision_panel(decision))
 
         plan = await router.route(decision)
@@ -371,6 +434,8 @@ async def run_once(dry_run: bool) -> None:
         await wallet.aclose()
         if dune is not None:
             await dune.aclose()
+        if openrouter_client is not None:
+            await openrouter_client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -421,24 +486,163 @@ def _explain_decision(
     )
 
 
+def _briefing_from_test_inputs(
+    *,
+    settings: Settings,
+    bias: str,
+    strength: float,
+    conviction: float,
+    direction_sign: int,
+    l1_score: LevelScore,
+    l2_score: LevelScore,
+) -> ArbiterBriefing:
+    """Build an ``ArbiterBriefing`` from synthetic ``--test-bias`` inputs.
+
+    The briefing is what the real :class:`Level3` (Gemini) consumes.
+    We populate it with values that are *consistent* with the test
+    inputs (bias, strength, conviction, direction) so Gemini sees a
+    coherent narrative rather than zeros. The per-symbol metrics are
+    plausible synthetic numbers shaped by ``direction_sign`` - bearish
+    setups carry negative funding / falling OI / distributing whales
+    and so on, so Gemini's verdict reflects the requested scenario.
+    """
+    primary_symbol = (settings.perp_symbols or ["BTC-PERP"])[0]
+    # Sign-aware synthetic metrics: positive when bullish, negative when
+    # bearish, near-zero when neutral. Keeps the briefing internally
+    # consistent so Gemini doesn't see contradictory signals.
+    sgn = float(direction_sign)
+    funding = 0.00015 * sgn        # +/-0.015% spot-derived funding rate
+    oi_1h = 1.5 * sgn              # +/-1.5% OI 1h delta
+    oi_24h = 4.0 * sgn             # +/-4% OI 24h delta
+    price_24h = 2.5 * sgn          # +/-2.5% 24h price change
+    ls_ratio = 1.0 + 0.3 * sgn     # 1.3 bullish, 0.7 bearish
+    whale_dir = (
+        "accumulating" if direction_sign > 0
+        else "distributing" if direction_sign < 0
+        else "neutral"
+    )
+    market_heat = 0.5 + 0.2 * sgn  # 0.7 bull / 0.5 neutral / 0.3 bear
+
+    return ArbiterBriefing(
+        primary_symbol=primary_symbol,
+        level1_conviction=float(conviction),
+        level1_direction_sign=int(direction_sign),
+        level1_rationale=l1_score.rationale,
+        level1_passes=True,
+        level1_raw={
+            "passes": True,
+            "score": conviction,
+            "per_symbol": {
+                primary_symbol: {
+                    "trend": (
+                        "up" if direction_sign > 0
+                        else "down" if direction_sign < 0
+                        else "flat"
+                    ),
+                    "passes": True,
+                    "atr_pct_avg": 1.2,
+                }
+            },
+        },
+        level2_conviction=float(conviction),
+        level2_direction_sign=int(direction_sign),
+        level2_rationale=l2_score.rationale,
+        level2_market_bias=bias,
+        level2_bias_strength=float(strength),
+        level2_market_heat=float(market_heat),
+        level2_regime=(
+            "risk_on" if direction_sign > 0
+            else "risk_off" if direction_sign < 0
+            else "neutral"
+        ),
+        level2_raw={
+            "market_bias": bias,
+            "bias_strength": strength,
+            "market_heat": market_heat,
+            "regime": "risk_on" if direction_sign > 0 else "risk_off" if direction_sign < 0 else "neutral",
+            "per_symbol": {
+                primary_symbol: {
+                    "funding": {
+                        "current_rate": funding,
+                        "annualised_pct": funding * 3 * 365 * 100,
+                        "rate_8h_change": funding * 0.2,
+                    },
+                    "open_interest": {
+                        "current_value_usd": 1_000_000.0,
+                        "delta_1h_pct": oi_1h,
+                        "delta_4h_pct": oi_1h * 2,
+                        "delta_24h_pct": oi_24h,
+                    },
+                    "volume": {
+                        "last_price": 60000.0 if primary_symbol == "BTC-PERP" else 3000.0,
+                        "price_change_pct_24h": price_24h,
+                        "spike_detected": False,
+                    },
+                    "long_short": {
+                        "long_short_ratio": ls_ratio,
+                        "long_account_pct": 0.5 + 0.1 * sgn,
+                        "inferred_bias": (
+                            "long" if direction_sign > 0
+                            else "short" if direction_sign < 0
+                            else "balanced"
+                        ),
+                    },
+                    "whales": {
+                        "flagged": direction_sign != 0,
+                        "direction": whale_dir,
+                        "n_whales": 3 if direction_sign != 0 else 0,
+                    },
+                }
+            },
+            "vault_flow": {
+                "tvl_usdc": 2_500_000.0,
+                "net_flow_usdc": 50_000.0 * sgn,
+                "window_hours": 24,
+            },
+        },
+        market_snapshot={
+            "symbol": primary_symbol,
+            "symbols": settings.perp_symbols or ["BTC-PERP", "ETH-PERP"],
+            "account_margin_usdc": 1000.0,
+            "account_unrealized_pnl_usdc": 0.0,
+            "account_drawdown_pct": 0.0,
+            "dune_chain": settings.dune_chain,
+        },
+    )
+
+
 async def run_test_bias(
-    bias: str, strength: float, conviction: float
+    bias: str,
+    strength: float,
+    conviction: float,
+    *,
+    real_sonnet: bool = False,
 ) -> None:
     """Offline scenario test for the conviction/direction engine.
 
-    Synthesises L1, L2 and L3 `LevelScore`s with the requested
-    `conviction` + `direction` (derived from `bias`) and exercises the
-    real `_aggregate / _aggregate_direction / _build_directive`
+    Synthesises L1, L2 and L3 ``LevelScore``s with the requested
+    ``conviction`` + ``direction`` (derived from ``bias``) and exercises
+    the real ``_aggregate / _aggregate_direction / _build_directive``
     pipeline. Skips Dune, Circle and the AllocationRouter so the test
     stays fast and offline.
 
-    Note: with the new conviction/direction split, the input `bias`
-    sets every level's `direction_sign`, `strength` is the per-level
-    "magnitude of direction" used only as a tag, and `conviction` is
-    the per-level conviction score that the engine will then aggregate
-    into `final_score`. With three equal-conviction levels and L3
-    redistribution, the aggregate conviction equals the input
-    conviction - which is what the test typically wants to probe.
+    Parameters
+    ----------
+    bias
+        ``"bearish" | "bullish" | "neutral"`` - the L2 directional vote.
+    strength
+        L2 ``bias_strength`` in ``[0, 1]``.
+    conviction
+        Per-level synthetic conviction in ``[0, 1]``. With L3
+        redistribution, the aggregate conviction equals this value.
+    real_sonnet
+        When ``True``, replace the synthetic L3 placeholder with a
+        real round-trip via :class:`Level3` (Claude Sonnet 4.6 via
+        OpenRouter by default; swap upstream model with
+        ``OPENROUTER_MODEL``). Requires ``OPENROUTER_API_KEY`` in
+        ``.env``; raises ``SystemExit`` otherwise. When ``False``
+        (default) the test runs offline - useful for fast iteration
+        on thresholds.
     """
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
@@ -466,38 +670,82 @@ async def run_test_bias(
         redistribute_synthetic_l3_weight=settings.REDISTRIBUTE_SYNTHETIC_L3_WEIGHT,
     )
 
-    # Synthetic LevelScores: all three levels carry the same conviction
-    # + direction so the test probes the score-classification branch
-    # cleanly. L3 is marked synthetic so its weight is redistributed,
-    # making the aggregate conviction == input conviction.
-    scores = [
-        LevelScore(
-            level=1,
-            score=conviction,
-            rationale="synthetic L1 (test)",
+    # Synthetic LevelScores: L1 + L2 carry the same conviction +
+    # direction so the test probes the score-classification branch
+    # cleanly. L3 starts as the synthetic placeholder (so its weight
+    # is redistributed and the aggregate conviction == input
+    # conviction); when `--real-sonnet` is passed we overwrite the
+    # third element below with the actual Claude verdict.
+    l1_score = LevelScore(
+        level=1,
+        score=conviction,
+        rationale="synthetic L1 (test)",
+        direction_sign=direction_sign,
+    )
+    l2_score = LevelScore(
+        level=2,
+        score=conviction,
+        rationale=f"synthetic L2 bias={bias} strength={strength:.2f}",
+        raw={
+            "l2": {
+                "market_bias": bias,
+                "bias_strength": strength,
+                "conviction": conviction,
+            }
+        },
+        direction_sign=direction_sign,
+    )
+    l3_score: LevelScore = LevelScore(
+        level=3,
+        score=conviction,
+        rationale="synthetic L3 (test)",
+        raw={
+            "l3": {
+                "synthetic": True,
+                "mode": settings.L3_MODE,
+                "provider": "synthetic",
+                "model": None,
+            }
+        },
+        direction_sign=direction_sign,
+    )
+
+    # ---- --real-sonnet: replace synthetic L3 with a real LLM call --
+    # Routes through OpenRouter to the model named by OPENROUTER_MODEL
+    # (default: anthropic/claude-sonnet-4.6).
+    openrouter_client_for_cleanup: OpenRouterClient | None = None
+    if real_sonnet:
+        level3, openrouter_client_for_cleanup = _build_level3(settings)
+        if level3 is None:
+            raise SystemExit(
+                "--real-sonnet requires OPENROUTER_API_KEY to be set in "
+                ".env (no key found; the synthetic placeholder would "
+                "have been used). Set OPENROUTER_API_KEY and retry. "
+                "Get a key at https://openrouter.ai/keys"
+            )
+        briefing = _briefing_from_test_inputs(
+            settings=settings,
+            bias=bias,
+            strength=strength,
+            conviction=conviction,
             direction_sign=direction_sign,
-        ),
-        LevelScore(
-            level=2,
-            score=conviction,
-            rationale=f"synthetic L2 bias={bias} strength={strength:.2f}",
-            raw={
-                "l2": {
-                    "market_bias": bias,
-                    "bias_strength": strength,
-                    "conviction": conviction,
-                }
-            },
-            direction_sign=direction_sign,
-        ),
-        LevelScore(
-            level=3,
-            score=conviction,
-            rationale="synthetic L3 (test)",
-            raw={"l3": {"synthetic": True}},
-            direction_sign=direction_sign,
-        ),
-    ]
+            l1_score=l1_score,
+            l2_score=l2_score,
+        )
+        logger.info(
+            "--real-sonnet: calling OpenRouter ({}) with synthetic "
+            "briefing (bias={}, strength={:.2f}, conviction={:.2f})...",
+            settings.OPENROUTER_MODEL, bias, strength, conviction,
+        )
+        try:
+            l3_score = await level3.score(briefing)
+        finally:
+            # Close the OpenRouter client's underlying httpx pool to
+            # avoid "unclosed connector" warnings on process exit.
+            if openrouter_client_for_cleanup is not None:
+                await openrouter_client_for_cleanup.aclose()
+
+    scores = [l1_score, l2_score, l3_score]
 
     effective = engine._effective_weights(scores)
     final_score = engine._aggregate(scores, effective)
@@ -580,6 +828,18 @@ async def run_test_bias(
             box=box.ROUNDED,
         )
     )
+    # ---- Level 3 (Claude via OpenRouter) panel: real verdict / synthetic
+    l3_raw = l3_score.raw.get("l3", {}) or {}
+    l3_kind = "real" if real_sonnet else "synthetic"
+    l3_persona = str(l3_raw.get("mode") or settings.L3_MODE)
+    console.print(
+        Rule(
+            f"[bold]Level 3 - Claude Final Arbiter "
+            f"({l3_kind}, mode={l3_persona.upper()})[/]",
+            style="magenta" if real_sonnet else "yellow",
+        )
+    )
+    console.print(level3_panel(l3_raw, l3_score.score))
     console.print(
         Panel(
             decision,
@@ -655,6 +915,22 @@ def main() -> None:
             "aggregate conviction equals this value."
         ),
     )
+    parser.add_argument(
+        "--real-sonnet",
+        "--real-gemini",  # legacy alias; kept silently for muscle memory
+        dest="real_sonnet",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the real Level 3 arbiter (Claude Sonnet 4.6 via "
+            "OpenRouter) for --test-bias instead of the synthetic "
+            "placeholder. Requires OPENROUTER_API_KEY in .env. Default "
+            "off - the synthetic L3 runs offline and instantly. Turn on "
+            "to exercise the actual LLM round-trip end-to-end with a "
+            "coherent synthetic briefing. (`--real-gemini` is accepted "
+            "as a deprecated alias from the pre-OpenRouter days.)"
+        ),
+    )
     args = parser.parse_args()
 
     if args.test_bias is not None:
@@ -663,6 +939,7 @@ def main() -> None:
                 bias=args.test_bias,
                 strength=args.test_bias_strength,
                 conviction=args.test_conviction,
+                real_sonnet=args.real_sonnet,
             )
         )
         return

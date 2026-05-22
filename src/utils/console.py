@@ -478,6 +478,314 @@ def level2_panel(l2_raw: dict[str, Any], score: float) -> Panel:
 
 
 # ---------------------------------------------------------------------------
+# Panel: Level 3 (final arbiter — Claude Sonnet 4.6 via OpenRouter)
+# ---------------------------------------------------------------------------
+
+
+_LEVEL3_PANEL_TITLE = "[bold]Level 3 - FINAL ARBITER (SONNET 4.6)[/]"
+
+# Recognised section headers in the critical-mode 5-section rationale.
+# When present in the rationale text, the panel paints them in bright-
+# cyan bold so the user can scan the verdict at a glance. Unknown
+# headers fall through to the default white body styling.
+_CRITICAL_SECTION_HEADERS: tuple[str, ...] = (
+    "Market Context:",
+    "Key Signals Analysis:",
+    "Contradictions & Risks:",
+    "Contradictions and Risks:",
+    "My Independent View:",
+    "Final Recommendation:",
+)
+
+
+def _pretty_model_name(slug: str | None) -> str:
+    """Render a model slug as a short, presentation-friendly label.
+
+    Examples
+    --------
+    >>> _pretty_model_name("anthropic/claude-sonnet-4.6")
+    'Sonnet-4.6'
+    >>> _pretty_model_name("anthropic/claude-opus-4.5")
+    'Opus-4.5'
+    >>> _pretty_model_name("openai/gpt-4o")
+    'Gpt-4o'
+    >>> _pretty_model_name(None)
+    'Unknown'
+
+    Strategy: drop the vendor prefix (``anthropic/`` etc.), strip the
+    ``claude-`` family prefix for Anthropic, then title-case the
+    leading hyphenated segment. Leaves the version suffix intact.
+    """
+    if not slug:
+        return "Unknown"
+    tail = slug.split("/", 1)[-1]
+    for prefix in ("claude-",):
+        if tail.startswith(prefix):
+            tail = tail[len(prefix):]
+            break
+    parts = tail.split("-", 1)
+    parts[0] = parts[0].capitalize()
+    return "-".join(parts)
+
+
+def level3_panel(l3_raw: dict[str, Any], score: float) -> Panel:
+    """Render the Level 3 final-arbiter verdict (Claude via OpenRouter).
+
+    ``l3_raw`` follows the shape stamped by :class:`Level3Arbiter`:
+
+        {
+            "provider":  "openrouter" | "synthetic",
+            "model":     "anthropic/claude-sonnet-4.6" | None,
+            "latency_ms": float,
+            "synthetic": bool,
+            "fallback":  bool,                # True when the arbiter errored
+            "response":  ArbiterResponse.model_dump(),
+            "raw_response": <dict>,           # only on success
+            "error": <str>,                   # only on fallback
+            "fallback_reason": <str>,         # only on fallback
+        }
+
+    For an L1 short-circuit the raw is just ``{"skipped": True}``.
+    """
+    if l3_raw.get("skipped"):
+        return Panel(
+            Text("Level 3 skipped (Level 1 short-circuit).", style="yellow"),
+            title=_LEVEL3_PANEL_TITLE + "  [yellow](skipped)[/]",
+            border_style="yellow",
+            box=box.ROUNDED,
+        )
+
+    is_synth = bool(l3_raw.get("synthetic"))
+    is_fallback = bool(l3_raw.get("fallback"))
+    response = l3_raw.get("response") or {}
+    model_slug = l3_raw.get("model")
+    model_pretty = _pretty_model_name(model_slug)
+    latency_ms = float(l3_raw.get("latency_ms", 0))
+    # Active L3 persona ("critical" or "standard"). Older payloads
+    # might omit the key, so default to "critical" (the current
+    # default) to keep section-aware rendering on.
+    mode = str(l3_raw.get("mode") or "critical").lower()
+
+    # ---------- Header / status ---------------------------------------
+    summary = Table.grid(padding=(0, 2))
+    summary.add_column(style="bold cyan", justify="right")
+    summary.add_column(style="white")
+
+    # Provider row: short, clean and consistent across success / fallback
+    # / synthetic states. Format: `Agent Sonnet-4.6, 1234ms` for the
+    # happy path; the failure modes wear a status tag in front so the
+    # operator notices at a glance without losing the agent identity.
+    if is_synth:
+        provider_label = "[bold yellow]Synthetic[/] (OPENROUTER_API_KEY unset)"
+        border = "yellow"
+    elif is_fallback:
+        provider_label = (
+            f"[bold red]FALLBACK[/]  Agent {model_pretty}, "
+            f"{latency_ms:.0f}ms"
+        )
+        border = "red"
+    else:
+        provider_label = (
+            f"[bold green]Agent {model_pretty}[/], {latency_ms:.0f}ms"
+        )
+        border = "green"
+
+    summary.add_row("Provider", provider_label)
+
+    # Mode badge: "CRITICAL" (red-bold, the demanding risk-manager
+    # persona) or "STANDARD" (cyan, the legacy trader-voice prompt).
+    # Always visible so the operator knows which prompt produced the
+    # verdict.
+    mode_label = {
+        "critical": Text("CRITICAL", style="bold bright_red"),
+        "standard": Text("STANDARD", style="bold cyan"),
+    }.get(mode, Text(mode.upper(), style="white"))
+    summary.add_row("Mode", mode_label)
+
+    direction = str(response.get("direction", "neutral"))
+    direction_label = {
+        "long": Text("LONG", style="bold green"),
+        "short": Text("SHORT", style="bold red"),
+        "neutral": Text("NEUTRAL", style="yellow"),
+    }.get(direction, Text(direction.upper(), style="white"))
+    regime = str(response.get("regime", "hold"))
+    summary.add_row("Direction", direction_label)
+    summary.add_row(
+        "Regime", Text(regime, style=_colour_for_regime(regime)),
+    )
+    conviction = float(response.get("conviction", score))
+    intensity = float(response.get("recommended_intensity", 0.0))
+    summary.add_row("Conviction", f"[bold]{conviction:.3f}[/]")
+    summary.add_row("Recommended intensity", f"{intensity:.3f}")
+
+    # ---------- Rationale (visually highlighted block) -----------------
+    # The rationale is the human-readable "why" - bump it into a
+    # high-visibility panel with a bright cyan border. In critical
+    # mode the rationale is a 5-section structured block; we paint
+    # each known section header in bold bright-cyan so the user can
+    # scan the verdict at a glance without re-reading the whole
+    # block. In standard mode it's a single prose paragraph, rendered
+    # in bold white. Always rendered in English (system prompt
+    # enforces it).
+    rationale = str(response.get("rationale") or "(no rationale)").strip()
+    rationale_panel = Panel(
+        _format_rationale_text(rationale),
+        title="[bold bright_cyan]Rationale[/]",
+        border_style="bright_cyan",
+        box=box.HEAVY,
+        padding=(0, 1),
+    )
+
+    # ---------- Key factors --------------------------------------------
+    # Defensive parsing - tolerate the various shapes Claude can leak:
+    # missing key, list-of-strings, list-of-dicts, comma-separated
+    # string, mixed-type list. Always emit at least one tag.
+    factors = _normalise_key_factors(response.get("key_factors"))
+    if factors:
+        factors_table = Table(
+            title="[bold bright_cyan]Key factors[/]",
+            box=box.MINIMAL,
+            expand=True,
+            show_header=False,
+            padding=(0, 1),
+        )
+        # First column = colored bullet so it doesn't read as a
+        # missing-value dash; second column = the factor text in white.
+        factors_table.add_column(style="bold bright_yellow", width=2, justify="center")
+        factors_table.add_column(style="white")
+        for f in factors:
+            factors_table.add_row("•", f)
+    else:
+        factors_table = Table.grid()
+        factors_table.add_row(Text("(no factors)", style="dim"))
+
+    # ---------- Optional fallback / synthetic notes --------------------
+    children: list[Any] = [summary, rationale_panel, factors_table]
+    if is_fallback:
+        err = str(l3_raw.get("error") or l3_raw.get("fallback_reason") or "")[:400]
+        children.append(
+            Panel(
+                Text(
+                    "Arbiter call failed - safely held flat. Engine fell "
+                    "back to conviction=0, direction=neutral, "
+                    "regime=hold.\n\n"
+                    f"reason: {err}",
+                    style="red",
+                ),
+                title="Fallback details",
+                border_style="red",
+                box=box.MINIMAL,
+            )
+        )
+    if is_synth:
+        children.append(
+            Panel(
+                Text(
+                    "Level 3 is in placeholder mode. Set "
+                    "OPENROUTER_API_KEY in .env to enable real Claude "
+                    "Sonnet 4.6 arbitration via OpenRouter. The "
+                    "placeholder's weight is redistributed to L1+L2 by "
+                    "the engine.",
+                    style="yellow",
+                ),
+                title="Synthetic L3",
+                border_style="yellow",
+                box=box.MINIMAL,
+            )
+        )
+
+    return Panel(
+        Group(*children),
+        title=_LEVEL3_PANEL_TITLE,
+        border_style=border,
+        box=box.ROUNDED,
+    )
+
+
+def _format_rationale_text(rationale: str) -> Text:
+    """Render the L3 rationale with section-aware styling.
+
+    Critical-mode rationales follow a 5-section template (``Market
+    Context:``, ``Key Signals Analysis:``, ``Contradictions & Risks:``,
+    ``My Independent View:``, ``Final Recommendation:``); we paint
+    those headers in bold bright-cyan so they pop out of the block
+    while the body stays in bold white. Standard-mode rationales are
+    a single prose paragraph and render exactly as before — the
+    helper degrades gracefully when no recognised header is present.
+
+    Bullet lines (``- ...`` / ``* ...`` / ``• ...``) get a subtle
+    yellow bullet marker for readability inside the Key Signals
+    Analysis section.
+    """
+    text = Text(justify="left")
+    lines = rationale.splitlines()
+    if not lines:
+        text.append("(no rationale)", style="dim white")
+        return text
+    for idx, raw_line in enumerate(lines):
+        line = raw_line.rstrip()
+        stripped = line.lstrip()
+        is_header = any(
+            stripped.startswith(header)
+            for header in _CRITICAL_SECTION_HEADERS
+        )
+        if is_header:
+            # Drop the trailing colon's whitespace tail but keep the
+            # header text including the colon.
+            text.append(stripped, style="bold bright_cyan")
+        elif stripped.startswith(("- ", "* ", "• ")):
+            # Replace the raw bullet glyph with a colored unicode dot
+            # so the list reads cleanly inside the panel.
+            indent_len = len(line) - len(stripped)
+            text.append(" " * indent_len)
+            text.append("• ", style="bold bright_yellow")
+            text.append(stripped[2:], style="white")
+        else:
+            text.append(line, style="bold white")
+        if idx < len(lines) - 1:
+            text.append("\n")
+    return text
+
+
+def _normalise_key_factors(raw: Any) -> list[str]:
+    """Coerce ``response.key_factors`` into a clean ``list[str]``.
+
+    The ``ArbiterResponse`` Pydantic validator already enforces a
+    list-of-strings on the inbound side, but the panel is fed the
+    serialized ``model_dump()`` and we still occasionally see odd
+    shapes leak through (empty list, list of empties, comma-separated
+    single string). This helper makes the panel render robust to all
+    of them so a flaky Claude response never produces a wall of
+    empty bullets in the demo.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        # "factor a, factor b, factor c" -> ["factor a", "factor b", "factor c"]
+        return [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+    if not isinstance(raw, (list, tuple)):
+        return [str(raw).strip()] if str(raw).strip() else []
+    cleaned: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            # Some models return [{"tag": "x"}, ...] or [{"factor": "x"}].
+            text = str(
+                item.get("tag")
+                or item.get("factor")
+                or item.get("name")
+                or item.get("text")
+                or ""
+            ).strip()
+        else:
+            text = str(item).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Panel: Final Decision
 # ---------------------------------------------------------------------------
 

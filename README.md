@@ -7,7 +7,7 @@
 [![Hackathon](https://img.shields.io/badge/Agora-Agents%20Hackathon-blueviolet)](https://www.canteen.xyz/)
 [![Built on](https://img.shields.io/badge/Built%20on-Arc%20%C3%97%20Circle-0052FF)](https://www.circle.com/)
 [![Data](https://img.shields.io/badge/Data-Dune%20MCP-FF6E40)](https://dune.com/)
-[![LLM](https://img.shields.io/badge/LLM-Gemini%202.5%20Flash-4285F4)](https://ai.google.dev/)
+[![LLM](https://img.shields.io/badge/LLM-Claude%20Sonnet%204.6%20via%20OpenRouter-d97757)](https://openrouter.ai/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 
 ---
@@ -27,7 +27,7 @@ Decisions come from a **cascading three-level engine** (technicals → on-chain 
 
 ## ✨ Key Features
 
-- 🧠 **Three-level cascading decision engine** — fast deterministic technicals (L1) → on-chain intelligence (L2) → LLM final arbiter (L3, Day 4).
+- 🧠 **Three-level cascading decision engine** — fast deterministic technicals (L1) → on-chain intelligence (L2) → Claude Sonnet 4.6 final arbiter (L3, via OpenRouter) with strict JSON verdict + Pydantic-validated safe-HOLD fallback.
 - ⚖️ **Decoupled conviction & direction** — the engine separates "how strongly do we want to act?" from "which way?", so a high-conviction bearish setup correctly opens a **SHORT**, not a confused close. _(See [Architecture](#-architecture) below.)_
 - 📊 **Volatility-targeted sizing** — `size = equity × target_risk_pct / (stop_atr_mult × ATR%/100)`. The Kelly-fraction-style recipe used by every systematic CTA shop.
 - 🛟 **Gradient drawdown haircut** — intensity smoothly decays as drawdown grows (`× max(0, 1 − (dd/max_dd)^exponent)`), no cliff-edge stops.
@@ -35,7 +35,8 @@ Decisions come from a **cascading three-level engine** (technicals → on-chain 
 - 🔗 **Dune MCP as the single source of truth** — every signal (L1 OHLCV + 8 L2 metrics) reads through saved Dune queries with per-metric provenance. No CEX feeds. No RPC market-data scraping.
 - 🪞 **Chain-portable** — `DUNE_CHAIN=ethereum|base|arbitrum` is a one-line switch; SQL templates are parameterised by chain + token addresses.
 - ⛽ **Gasless on-chain execution** — Circle DCW + Paymaster, RSA-OAEP-SHA256-encrypted entity secret, sponsored tx on Arc Testnet.
-- 🎛️ **Six-panel rich CLI** — every cycle prints market context, L1, L2, final decision, execution plan and on-chain results with conviction/direction/sizing breakdown.
+- 🎛️ **Seven-panel rich CLI** — every cycle prints market context, L1, L2, **L3 Claude verdict** (provider, model, latency, active `Mode` badge, section-coloured structured rationale, bulleted key factors), final decision, execution plan and on-chain results with conviction/direction/sizing breakdown.
+- 🧑‍⚖️ **Two L3 personas via `L3_MODE`** — `critical` (default; independent senior-risk-manager persona with veto authority and a mandatory 5-section rationale `Market Context → Key Signals Analysis → Contradictions & Risks → My Independent View → Final Recommendation`) or `standard` (concise trader voice, 1-2 sentence rationale). One-line `.env` swap; nothing else changes.
 - 🧪 **Offline scenario tester** — `python main.py --test-bias bearish --test-conviction 0.52` exercises the live decision branch with synthetic inputs, no Dune/Circle calls required.
 
 ---
@@ -48,8 +49,8 @@ Decisions come from a **cascading three-level engine** (technicals → on-chain 
                 +-----------------------------------------------------+
                 |                  Decision Engine                    |
                 |  +--------+   +--------+   +----------------------+ |
-   Market  ---> |  | L1 TA  |  | L2 OnC |  | L3 Gemini 2.5 Flash  | | ---> (conviction, direction)
-   Data        |  | rules  |  | (Dune) |  |    (final arbiter)   | |
+   Market  ---> |  | L1 TA  |  | L2 OnC |  | L3 Claude Sonnet 4.6 | | ---> (conviction, direction)
+   Data         |  | rules  |  | (Dune) |  |    (final arbiter)   | |
                 |  +--------+   +--------+   +----------------------+ |
                 +-----------------------------------------------------+
                                        |
@@ -73,9 +74,9 @@ Decisions come from a **cascading three-level engine** (technicals → on-chain 
 |-------|----------------------------------------|---------------------------------------------------|----------------|
 | L1    | OHLCV / TA via **Dune `dex.trades`**   | Hard "защита от дурака" rules + trend direction   | 0.25           |
 | L2    | On-chain flows via **Dune MCP**        | Funding, OI, volume, L/S, whales, vault flows     | 0.35           |
-| L3    | **Gemini 2.5 Flash** final arbiter     | Regime + conviction + direction (Day 4)           | 0.40           |
+| L3    | **Claude Sonnet 4.6** (via OpenRouter) | Conviction + direction + regime + intensity       | 0.40           |
 
-> 🛈 **Synthetic L3 redistribution.** Until Gemini wiring lands on Day 4, the L3 placeholder has its weight **redistributed proportionally to L1+L2** during aggregation — so the placeholder doesn't silently dilute the real signal back into itself. Effective weights are surfaced in the Final Decision panel as `0.25 → 0.42` etc.
+> 🛈 **Synthetic L3 redistribution.** When `OPENROUTER_API_KEY` is unset (or the arbiter errors and falls back to a safe HOLD), the L3 placeholder has its weight **redistributed proportionally to L1+L2** during aggregation — so the placeholder doesn't silently dilute the real signal back into itself. Once `OPENROUTER_API_KEY` is configured and Claude returns a clean verdict, L3 votes with its full configured weight (`0.40` by default). Effective weights are surfaced in the Final Decision panel as `0.25 → 0.42` etc.
 
 ### Conviction vs Direction (the core idea)
 
@@ -100,7 +101,7 @@ Direction votes are weighted by their **own conviction**, so a wishy-washy level
 |-------|-----------------------------------------------------------------|-------------------------------------|
 | L1    | `avg(per-symbol trend strength)` — no `0.5` floor              | Sign of primary symbol's trend      |
 | L2    | `max(2 × |heat − 0.5|, bias_strength)`                          | Sign of `market_bias` (bullish/bearish/neutral) |
-| L3    | Real Gemini call (Day 4) or synthetic blend of L1+L2 (today)    | Conviction-weighted blend           |
+| L3    | Claude Sonnet 4.6 `conviction ∈ [0, 1]` (strict JSON)            | Claude `direction ∈ {long, short, neutral}` |
 
 > 💡 **Why `max(2·|heat-0.5|, bias_strength)` for L2?** Heat alone is directional (0.85 = bullish, 0.15 = bearish), so it makes a bad *conviction* signal — both extremes are equally decisive on-chain. The `2·|heat-0.5|` term folds heat into a symmetric conviction; the `max(..., bias_strength)` term catches the case where heat sits near neutral but on-chain signals (funding, OI, whales) point decisively one way.
 
@@ -137,7 +138,7 @@ CapitalArc/
 │   │   ├── decision_engine.py    # Cascading L1→L2→L3, conviction+direction aggregation
 │   │   ├── level1.py             # Technical hard rules + per-symbol direction
 │   │   ├── level2.py             # On-chain intelligence (Dune MCP only)
-│   │   └── level3.py             # Gemini final arbiter (Day 4)
+│   │   └── level3.py             # Claude Sonnet 4.6 final arbiter (L3_MODE-aware)
 │   ├── data/
 │   │   ├── dune_mcp.py           # DuneMCPClient — single source of truth
 │   │   ├── dune_market_data.py   # OHLCV adapter on dex.trades (L1 feed)
@@ -148,7 +149,7 @@ CapitalArc/
 │   ├── allocation/
 │   │   └── allocation_router.py  # Vol-targeted sizing + DD haircut + side routing
 │   ├── llm/
-│   │   └── gemini_client.py      # Google AI Studio client (Level 3)
+│   │   └── openrouter_client.py  # OpenRouter HTTP client (Level 3)
 │   └── utils/
 │       ├── config.py             # Pydantic settings (sole .env reader)
 │       ├── console.py            # Six-panel rich renderer
@@ -156,7 +157,9 @@ CapitalArc/
 ├── dune/
 │   ├── README.md                 # SQL templates + column contracts (deep dive)
 │   └── queries/                  # ohlcv.sql, funding_rates.sql, ... (9 templates)
-├── prompts/                      # Gemini arbiter prompt templates
+├── prompts/                      # Level 3 arbiter system prompts
+│   ├── level3_arbiter_critical.md   # Default — independent risk-manager voice
+│   └── level3_arbiter_standard.md   # Concise trader voice
 ├── scripts/                      # One-off ops (Circle wallet creation, etc.)
 ├── tests/                        # pytest + pytest-asyncio
 ├── .env.example                  # Documented template — never commit real keys
@@ -214,9 +217,42 @@ The agent now produces **honest, financially-grounded decisions** end-to-end on 
 
 - **Offline scenario tester** — `--test-bias bearish --test-bias-strength 0.86 --test-conviction 0.52` exercises the real decision branch with synthetic inputs; no Dune/Circle/router calls.
 
-### 🚧 Day 4 — Planned
+### ✅ Day 4 — Real Claude Sonnet 4.6 final arbiter (via OpenRouter)
 
-- **Real Gemini 2.5 Flash arbitration** (`src/llm/gemini_client.py`): pinned low temperature, strict JSON `{score, direction, regime, rationale}`, briefing rendered from L1+L2.
+CapitalArc now talks to **Anthropic Claude Sonnet 4.6** as the cascade's final arbiter, routed through **OpenRouter**'s OpenAI-compatible HTTP gateway. L1 and L2 hand it a structured Markdown briefing (primary symbol, account drawdown, per-symbol funding / OI / volume / L/S / whales / vault flows, market bias and strength); Claude replies with a **strict JSON verdict** validated by Pydantic.
+
+- **`src/llm/openrouter_client.py` — production-grade async client.**
+  - Async `generate_json(...)` round-trip via `httpx.AsyncClient` POST `/v1/chat/completions`, pinned `temperature=0.2`, `max_tokens=2048` to fit the structured rationale; "JSON only" enforced via system prompt + user-prompt trailer + permissive parser.
+  - Bounded retry with exponential backoff on 429 / 5xx / network blips (`OPENROUTER_MAX_RETRIES`, `OPENROUTER_BACKOFF_SECONDS`); hard failures (401 auth, 404 model, 402 payment, 403 policy) bypass retry and surface immediately with an actionable diagnosis via `OpenRouterAPIError`.
+  - Defensive parsing: handles both plain-string `content` and OpenAI-style content-parts lists, strips stray ```` ```json ```` fences, rejects non-object payloads, surfaces timeouts as `RuntimeError` so the arbiter can always fall back safely.
+
+- **`src/core/level3.py` — final arbiter with hard contract + two personas.**
+  - `ArbiterResponse` (Pydantic): `{conviction, direction, regime, recommended_intensity, rationale, key_factors}` — enums + range-validated, rationale up to 4000 chars so the structured layout fits comfortably.
+  - **Two modes selected by `L3_MODE` in `.env`** (one-line swap, nothing else changes):
+    - **`critical` (default).** Claude wears the persona of an **independent senior risk manager** with explicit veto authority over L1 + L2 — it is *allowed and encouraged* to disagree when signals are weak, contradictory or fragile. The rationale follows a **mandatory 5-section template**:
+      ```
+      Market Context:        → what the market is doing right now
+      Key Signals Analysis:  → 3-5 bullets, each citing a concrete number
+      Contradictions & Risks:→ explicit L1/L2 disagreements + fragility
+      My Independent View:   → first-person opinion ("I agree…", "I push back…")
+      Final Recommendation:  → verdict + intensity rationale
+      ```
+      Baked-in decision principles: skepticism is the baseline, quality over direction, drawdown ≥ 5% clamps intensity to ≤ 0.5, ATR% > 4% clamps intensity, longs and shorts are symmetric. System prompt: [`prompts/level3_arbiter_critical.md`](./prompts/level3_arbiter_critical.md).
+    - **`standard`.** Concise trader voice, 1-2 sentence rationale plus 2-4 short technical tags. Useful for high-frequency loops where the structured rationale is overkill. System prompt: [`prompts/level3_arbiter_standard.md`](./prompts/level3_arbiter_standard.md).
+  - On schema violation or any LLM error → **safe neutral HOLD** (`conviction=0`, `direction=neutral`, `regime=hold`); never trades on malformed JSON. Synthetic + fallback rationales follow the active mode's format so the panel stays visually consistent whether Claude is wired or errored.
+  - On `OPENROUTER_API_KEY` unset → synthetic placeholder; `DecisionEngine` redistributes its weight to L1+L2 (unchanged from Day 3).
+  - **English** rationale + English descriptive `key_factors` everywhere (`"converging bearish signals (funding -16.4%, OI -4%, whales distributing)"` rather than terse one-word tags).
+
+- **`DecisionEngine` cascade upgrade.** Builds a rich `ArbiterBriefing` (full L1 + L2 raw payloads + market context) and asks Level 3 under the active persona. When a real Claude verdict lands, L3's weight stops being redistributed — Claude votes with its **full configured weight** (`0.40` by default). The Final Decision panel contrasts configured weights vs effective weights so the demo never lies about which level decided what.
+
+- **Six-panel rich CLI gets a seventh — `Level 3 — FINAL ARBITER (SONNET 4.6)`.** Renders provider (`Agent Sonnet-4.6, <latency>ms` for the happy path, `SYNTHETIC` or `FALLBACK` for the safety paths), the active **`Mode` badge** (red-bold `CRITICAL` or cyan `STANDARD`), validated verdict, the structured rationale with each section header painted in bold bright-cyan, and a clean bulleted `key_factors` list. Fallbacks render in red with the underlying error reason.
+
+- **Tests** (`tests/test_openrouter_client.py` + `tests/test_level3_arbiter.py`, 34 total). JSON parsing, message-text extraction (string + content-parts list), HTTP status-error mapping, Pydantic validation, synthetic placeholder, malformed-payload fallback, raised-exception fallback, prompt rendering, mode-based prompt-path resolution for both `critical` and `standard`, on-disk template integrity for both modes, mode-specific user-prompt instructions, long 5-section rationale acceptance, full L1→L2→L3 cascade aggregation with both real and synthetic L3.
+
+- **End-to-end smoke.** `python main.py --test-bias bearish --test-bias-strength 0.86 --test-final-score 0.52 --real-sonnet` runs the live OpenRouter round-trip with a coherent synthetic briefing — Claude (in critical mode) produces a full 5-section rationale, can independently nudge conviction up or down vs L1/L2's suggestion, flags contradictions explicitly, and returns descriptive `key_factors`.
+
+### 🚧 Day 5 — Planned
+
 - **EIP-712 `OrderTypes.Order` signing** + matcher POST (`ARC_PERP_MATCHER_URL`) for full `open_position` on `--live`.
 - **USYC rotation** on risk-off: withdraw vault margin → USYC mint.
 - **JSONL decision log** for replay / backtest.
@@ -271,9 +307,14 @@ python main.py --test-bias bullish --test-bias-strength 0.80 --test-conviction 0
 
 # Neutral mid-band → HOLD
 python main.py --test-bias neutral --test-bias-strength 0.10 --test-conviction 0.50
+
+# 🧑‍⚖️ Same as above, but also call the real Claude Sonnet 4.6 arbiter
+# end-to-end (requires OPENROUTER_API_KEY). Critical mode by default —
+# Claude returns a full 5-section structured rationale.
+python main.py --test-bias bearish --test-bias-strength 0.86 --test-conviction 0.52 --real-sonnet
 ```
 
-Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, configured-vs-effective weights) and the **DECISION** panel (action, side, aggregate direction, final conviction, intensity, plain-English `why`).
+Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, configured-vs-effective weights), the **Level 3** panel (with the active `Mode` badge — `CRITICAL` or `STANDARD` — and section-coloured rationale when real Claude is wired) and the **DECISION** panel (action, side, aggregate direction, final conviction, intensity, plain-English `why`).
 
 ### 5. What a live cycle looks like
 
@@ -295,6 +336,15 @@ Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, c
 │  bias_strength), per-symbol funding /  │
 │  OI / volume / L-S / whales / cum fund │
 │  + per-metric provenance map.          │
+└────────────────────────────────────────┘
+┌── Level 3 — FINAL ARBITER (SONNET 4.6) ┐
+│  provider (Agent Sonnet-4.6, latency / │
+│  SYNTHETIC / FALLBACK), Mode badge     │
+│  (CRITICAL / STANDARD), strict JSON    │
+│  verdict (conviction, direction,       │
+│  regime, recommended_intensity),       │
+│  structured 5-section rationale,       │
+│  bulleted key_factors.                 │
 └────────────────────────────────────────┘
 ┌── Final Decision ──────────────────────┐
 │  conviction, aggregate direction       │
@@ -323,7 +373,8 @@ Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, c
 | **Day 1** | ✅ | Scaffolding, secret hygiene, 3-level interfaces |
 | **Day 2** | ✅ | Circle DCW + Paymaster live; Arc Perp DEX margin moves on Testnet |
 | **Day 3** | ✅ | L1 + L2 wired to Dune MCP (9/9 queries live); conviction/direction split; vol-targeted sizing; gradient drawdown haircut |
-| **Day 4** | 🚧 | Real Gemini 2.5 Flash L3 arbiter; EIP-712 perp orders; USYC rotation; JSONL decision log |
+| **Day 4** | ✅ | Real Claude Sonnet 4.6 L3 arbiter via OpenRouter; two `L3_MODE` personas (`critical` default with 5-section rationale + veto authority, `standard` for trader-voice); strict JSON verdict + Pydantic; safe HOLD fallback; seventh rich panel with mode badge; 34 smoke tests |
+| **Day 5** | 🚧 | EIP-712 perp orders; USYC rotation; JSONL decision log |
 | **Post-hack** | 💡 | Per-symbol routing (open BTC long while ETH is flat); on-chain DSL for declaring strategies; arc-native Dune dataset when indexed |
 
 ---
@@ -343,7 +394,7 @@ Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, c
 **Intelligence & data**
 - 🔭 **Dune MCP** — single source of truth for L1 OHLCV + L2 on-chain intelligence (Ethereum / Base / Arbitrum supported out of the box)
 - 🧱 **Arc RPC** — account state only (wallet, vault TVL, agent margin)
-- 🤖 **Gemini 2.5 Flash** — Level 3 final arbiter (Day 4)
+- 🤖 **Claude Sonnet 4.6** (via **OpenRouter**) — Level 3 final arbiter with strict-JSON verdict (Pydantic-validated)
 
 **Backend**
 - 🐍 Python 3.10+
@@ -352,9 +403,9 @@ Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, c
 - `pydantic`, `pydantic-settings` — strongly-typed config
 - `pandas`, `numpy`, `ta` — L1 indicator math
 - `mcp`, `dune-client` — L2 on-chain data
-- `google-generativeai` — L3 LLM client
+- `httpx` (above) — L3 OpenRouter HTTP client
 - `loguru` — structured logging
-- `rich` — six-panel terminal UI
+- `rich` — seven-panel terminal UI
 - `apscheduler` — loop scheduling
 
 ---

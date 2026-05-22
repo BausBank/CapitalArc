@@ -298,15 +298,24 @@ class DecisionEngine:
         l2_score: LevelScore,
         context: dict[str, Any],
     ) -> LevelScore:
+        """Build the arbiter briefing and call Level 3.
+
+        When ``self.level3 is None`` we synthesise a placeholder
+        directly here so the cascade always emits three `LevelScore`s.
+        `_effective_weights` then redistributes the placeholder's
+        weight back to L1+L2 (unless explicitly disabled).
+
+        When ``self.level3`` is a real :class:`Level3`, we hand it a
+        richly-populated :class:`ArbiterBriefing` built from the L1/L2
+        ``raw`` payloads + the current market context. The arbiter
+        itself decides whether to call Gemini, validate the response
+        and how to fall back on errors - the engine only consumes the
+        resulting :class:`LevelScore`.
+        """
         if self.level3 is None:
             # Synthetic L3 = conviction-weighted re-blend of L1 + L2.
-            # We compute and surface it for UI/aggregation consistency,
-            # but `_effective_weights` will redistribute the L3 weight
-            # back to L1+L2 (unless explicitly disabled) so this
-            # placeholder doesn't silently dilute the real signal.
             l1c, l2c = float(l1_score.score), float(l2_score.score)
             value = 0.5 * l1c + 0.5 * l2c
-            # Direction follows the conviction-weighted sign of L1+L2.
             l1d = int(getattr(l1_score, "direction_sign", 0) or 0)
             l2d = int(getattr(l2_score, "direction_sign", 0) or 0)
             weighted_dir = l1c * l1d + l2c * l2d
@@ -317,7 +326,7 @@ class DecisionEngine:
             else:
                 dsign = 0
             rationale_tag = (
-                "synthetic re-weight of L1+L2 (Gemini arbiter wired Day 4)"
+                "synthetic re-weight of L1+L2 (no Gemini client wired)"
             )
             if self.redistribute_synthetic_l3_weight:
                 rationale_tag += " - 0% effective weight (redistributed)"
@@ -329,11 +338,32 @@ class DecisionEngine:
                 direction_sign=dsign,
             )
 
+        # ---- Build the rich briefing for Gemini -------------------------
+        l1_raw = (l1_score.raw or {}).get("l1", {}) or {}
+        l2_raw = (l2_score.raw or {}).get("l2", {}) or {}
+        primary_symbol = (
+            context.get("symbol")
+            or (context.get("symbols") or ["BTC-PERP"])[0]
+        )
         briefing = ArbiterBriefing(
-            level1_score=l1_score.score,
+            primary_symbol=primary_symbol,
+            level1_conviction=float(l1_score.score),
+            level1_direction_sign=int(
+                getattr(l1_score, "direction_sign", 0) or 0
+            ),
             level1_rationale=l1_score.rationale,
-            level2_score=l2_score.score,
+            level1_passes=bool(l1_raw.get("passes", True)),
+            level1_raw=l1_raw,
+            level2_conviction=float(l2_score.score),
+            level2_direction_sign=int(
+                getattr(l2_score, "direction_sign", 0) or 0
+            ),
             level2_rationale=l2_score.rationale,
+            level2_market_bias=str(l2_raw.get("market_bias", "neutral")),
+            level2_bias_strength=float(l2_raw.get("bias_strength", 0.0) or 0.0),
+            level2_market_heat=float(l2_raw.get("market_heat", 0.5) or 0.5),
+            level2_regime=str(l2_raw.get("regime", "neutral")),
+            level2_raw=l2_raw,
             market_snapshot=context,
         )
         return await self.level3.score(briefing)

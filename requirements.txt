@@ -39,8 +39,12 @@ ta==0.11.0
 mcp==1.0.0
 dune-client==1.7.7
 
-# --- Level 3: Gemini 2.5 Flash (final arbiter) ---
-google-generativeai==0.8.3
+# --- Level 3: Claude Sonnet 4.6 via OpenRouter (final arbiter) ---
+# OpenRouter is a thin OpenAI-compatible HTTP gateway in front of
+# Anthropic / OpenAI / Mistral / etc., so no provider SDK is needed -
+# we just call /v1/chat/completions with httpx (already pinned above).
+# Switch upstream model via OPENROUTER_MODEL in .env (default:
+# anthropic/claude-sonnet-4.6).
 
 # --- Utilities ---
 rich==13.7.1
