@@ -29,7 +29,27 @@ class Settings(BaseSettings):
     # ---------- General ----------
     APP_ENV: str = "dev"
     LOG_LEVEL: str = "INFO"
-    DECISION_INTERVAL_SECONDS: int = 60
+    # Wall-clock interval between consecutive **full** decision cycles
+    # in ``--loop`` mode. The full cycle runs the entire L1 + L2 + L3
+    # pipeline (Dune + OpenRouter), the AllocationRouter and the
+    # PositionManager. Default 600 s (10 minutes) is tuned for live
+    # trading: it bounds OpenRouter (Sonnet 4.6) and Dune MCP API
+    # costs without missing meaningful market moves on the 15m/1h
+    # timeframes the L1 cascade uses. Set to 0 to remove the sleep
+    # entirely (back-to-back cycles - useful for offline replay).
+    DECISION_INTERVAL_SECONDS: int = 600
+    # Wall-clock interval between consecutive **fast** cycles in
+    # ``--loop`` mode. The fast cycle runs ONLY the PositionManager
+    # (Fast Path stewardship - dynamic SL/TP, trailing stop, time exit,
+    # breakeven, daily-DD, vol spike); it does NOT touch L1/L2/L3,
+    # Dune or OpenRouter. Native TP/SL trigger orders submitted on
+    # the venue at open time are also untouched - the fast cycle only
+    # issues ``close_position`` / ``partial_close`` when the off-chain
+    # rules fire. Default 120 s (2 minutes) gives a 5x oversampling vs
+    # the full cycle, so adverse moves are caught minutes before the
+    # next full re-arbitration. Set to 0 to disable the fast cycle
+    # entirely (single-speed loop on ``DECISION_INTERVAL_SECONDS``).
+    DECISION_FAST_INTERVAL_SECONDS: int = 120
     # When True, Level 2 caches Dune / Binance / on-chain results for
     # DEMO_CACHE_TTL_SECONDS so a demo run is fast and idempotent.
     DEMO_MODE: bool = True
@@ -47,7 +67,83 @@ class Settings(BaseSettings):
     ARC_CHAIN_ID: int | None = None
     ARC_EXPLORER_URL: str | None = None
 
-    # ---------- Arc Perp DEX ----------
+    # ---------- Hyperliquid Testnet (PRIMARY TRADING VENUE) ----------
+    # Real trading happens here. Arc + Circle stay on the treasury /
+    # yield leg (USYC, CCTP, Paymaster). The split is:
+    #   - Risk-off : capital sits in USYC on Arc (yields interest).
+    #   - Risk-on  : CCTP moves USDC Arc -> Arbitrum -> Hyperliquid
+    #                bridge, then HyperliquidExecutor opens the perp.
+    # Funded via the Hyperliquid testnet faucet at
+    # https://app.hyperliquid-testnet.xyz - no real capital at risk.
+    #
+    # ⚠ Execution-vs-data URL split (Day 5+):
+    # We deliberately separate the two endpoints. ``HYPERLIQUID_API_URL``
+    # is the **execution** URL - every order signed by the SDK and
+    # every account-specific read (margin, positions, fills for OUR
+    # wallet) goes here. It MUST point at the venue where our funds
+    # live (testnet for safety today; mainnet only after manual
+    # roll-out approval). ``HYPERLIQUID_DATA_API_URL`` below is the
+    # **market-data** URL and SHOULD stay on mainnet so any Level-2
+    # analytics that reads market-wide signals (real perp OI / funding
+    # / L-S from Hyperliquid's Info API) sees honest production data,
+    # not the thin testnet tape.
+    HYPERLIQUID_API_URL: str = "https://api.hyperliquid-testnet.xyz"
+    # Market-data Info API root. ALWAYS mainnet by default. Used (or
+    # reserved for) any caller that reads market-wide intelligence
+    # rather than our own account state - e.g. a future Level-2
+    # adapter that calls Hyperliquid's ``meta`` /
+    # ``metaAndAssetCtxs`` endpoints for real perp OI / funding /
+    # asset-context. Keeping it pinned to mainnet decouples
+    # "where we trade" from "where we read the market", so that
+    # flipping ``HYPERLIQUID_API_URL`` to testnet for safe live-test
+    # runs never silently degrades L2 to the testnet's lower-liquidity
+    # tape.
+    #
+    # As of Day 6, the :class:`HyperliquidIntelligenceAdapter` reads
+    # from this URL to overlay real perp ``funding`` /
+    # ``open_interest`` / ``volume`` / ``cum_funding`` on top of the
+    # Dune-derived proxies in Level 2 (see
+    # ``HYPERLIQUID_INTELLIGENCE_ENABLED`` below for the kill switch).
+    HYPERLIQUID_DATA_API_URL: str = "https://api.hyperliquid.xyz"
+    # Master switch for the HyperliquidIntelligenceAdapter overlay.
+    # When True (default), Level 2 replaces its spot-DEX-derived perp
+    # proxies (funding / OI / volume / cum_funding) with real
+    # Hyperliquid Info-API readings from ``HYPERLIQUID_DATA_API_URL``
+    # (mainnet). When False, Level 2 stays on the pure-Dune path -
+    # useful for A/B comparison or when debugging the HL integration.
+    # The overlay is per-symbol and per-metric: any failure (whole
+    # HL outage, single coin missing) transparently falls back to
+    # the Dune proxy for the affected slot, so flipping this OFF is
+    # only ever a manual operator decision, not an automatic fail.
+    HYPERLIQUID_INTELLIGENCE_ENABLED: bool = True
+    # EVM private key the agent signs Hyperliquid orders with. For
+    # testnet, generate a fresh key and faucet it on the testnet
+    # bridge. NEVER commit a real key - keep it in a per-host .env
+    # outside source control.
+    HYPERLIQUID_PRIVATE_KEY: str | None = None
+    # Master account address being traded. Leave empty to default to
+    # the signer's own address (typical single-wallet setup). Set
+    # only when running the signer as an API-wallet sub-key allowed
+    # to trade on behalf of a different master account.
+    HYPERLIQUID_ACCOUNT_ADDRESS: str | None = None
+    # Optional Hyperliquid vault address (multi-strat or PnL-shared
+    # vault). Leave empty for the single-signer case.
+    HYPERLIQUID_VAULT_ADDRESS: str | None = None
+    # Hard caps applied BEFORE the SDK call regardless of router
+    # output. Belt-and-braces vs runaway sizing bugs.
+    HYPERLIQUID_MAX_LEVERAGE: int = 5
+    HYPERLIQUID_MAX_POSITION_USD: float = 10000.0
+    HYPERLIQUID_DEFAULT_SLIPPAGE_BPS: int = 50
+    # Take-profit / stop-loss thresholds applied by PositionManager
+    # when the cycle directive doesn't carry per-trade overrides.
+    HYPERLIQUID_DEFAULT_TAKE_PROFIT_PCT: float = 0.02   # +2%
+    HYPERLIQUID_DEFAULT_STOP_LOSS_PCT: float = 0.015    # -1.5%
+    # When True, ``open_position`` uses the SDK's ``market_open``
+    # helper (immediate fill at best book price). When False, the
+    # executor posts a marketable limit at mid +/- slippage.
+    HYPERLIQUID_USE_MARKET_ORDERS: bool = True
+
+    # ---------- Arc Perp DEX (DEPRECATED - kept for treasury reads) ----------
     # ClearingHouse - entry contract for batch settlement (settleBatch).
     ARC_PERP_ROUTER_ADDRESS: str | None = None
     # USDCCollateralVault - holds USDC margin (deposit / withdraw).
@@ -57,7 +153,10 @@ class Settings(BaseSettings):
     # PositionLedger - per-(accountId, marketId) position state (getPosition).
     ARC_PERP_POSITION_LEDGER_ADDRESS: str | None = None
     # Off-chain matching engine endpoint for EIP-712 OrderTypes.Order POSTs.
-    # Wiring lands on Day 3 once the matcher URL is published in #agora-hackers.
+    # DEPRECATED: Arc Perp DEX is no longer the trading venue (matcher spec
+    # was never published). Trading has migrated to Hyperliquid Testnet -
+    # see HYPERLIQUID_* settings below. Kept only so legacy treasury code
+    # still compiles.
     ARC_PERP_MATCHER_URL: str | None = None
     ARC_PERP_MAX_LEVERAGE: int = 3
     # CapitalArc trades two perps: BTC-PERP and ETH-PERP. SOL-PERP was
@@ -86,10 +185,54 @@ class Settings(BaseSettings):
     CIRCLE_PAYMASTER_URL: str | None = None
     CIRCLE_PAYMASTER_POLICY_ID: str | None = None
 
-    # ---------- USYC ----------
+    # ---------- USYC (yield-bearing risk-off leg) ----------
+    # When the engine flips to ``risk_off`` (low conviction / neutral
+    # direction) the AllocationRouter closes the perp position, pulls
+    # margin out of the Arc Perp vault and rotates the freed USDC into
+    # USYC so the capital keeps earning ~T-bill yield while we wait
+    # for the next risk-on setup. When the engine flips back to
+    # ``risk_on`` we redeem just enough USYC to fund the new perp
+    # entry. Leaving any of the three address fields below blank turns
+    # the rotation leg into a graceful no-op - the router will still
+    # close perps but will skip the USYC mint / redeem with an
+    # explanatory note in the ExecutionPlan (no hard failure).
     USYC_TOKEN_ADDRESS: str | None = None
     USYC_MINT_CONTRACT_ADDRESS: str | None = None
+    # Smallest single USDC -> USYC rotation we will submit. Below this
+    # we skip the rotation to avoid spamming the chain (and Circle's
+    # rate limits) with sub-economic dust transactions.
     USYC_MIN_ROTATION_AMOUNT: float = 100.0
+    # Safety net: hard cap on any single USYC mint or redeem, in USD.
+    # A runaway decision-engine loop is therefore always financially
+    # bounded on testnet.
+    USYC_MAX_ROTATION_AMOUNT: float = 100000.0
+    # Free USDC reserve to keep in the agent wallet at all times.
+    # The risk-off path will mint USYC only with `free_usdc - reserve`,
+    # so non-sponsored gas fallbacks and the next perp entry's
+    # initial-margin call never hit a "wallet is empty" state.
+    USYC_USDC_RESERVE_USD: float = 50.0
+    # When False, the AllocationRouter skips the entire USYC leg even
+    # if the contracts are configured. Use this to demo a perp-only
+    # build of the agent without re-blanking USYC addresses in .env.
+    USYC_ENABLED: bool = True
+    # When True, a risk-off directive (Daily-DD kill-switch, RISK_OFF
+    # action, etc.) will close every open perp AND withdraw all
+    # remaining USDC margin from Hyperliquid back to the signer's
+    # Arbitrum address. When False (default for safety), risk-off
+    # only CLOSES positions and leaves the freed USDC sitting in the
+    # perp sub-account so the agent can re-enter on the next
+    # risk-on cycle without a 1-block bridge round-trip - and, more
+    # importantly, so that a buggy PnL/equity read can never
+    # auto-drain the testnet vault.  The USYC mint leg is also
+    # skipped when withdraws are disabled (there's nothing freed on
+    # Arc to mint with). Re-enable explicitly with
+    # ``RISK_OFF_WITHDRAW=true`` once the full risk-off-to-treasury
+    # path has been validated end-to-end.
+    RISK_OFF_WITHDRAW: bool = False
+    # Optional ABI overrides if the deployed USYC on Arc uses
+    # non-standard mint / redeem function names.
+    USYC_MINT_SIGNATURE: str = "mint(uint256)"
+    USYC_REDEEM_SIGNATURE: str = "redeem(uint256)"
 
     # ---------- USDC ----------
     USDC_TOKEN_ADDRESS: str | None = None
@@ -162,17 +305,26 @@ class Settings(BaseSettings):
     DUNE_QUERY_MARKET_SENTIMENT_ID: int | None = None
 
     # ---------- Level 1 thresholds (technical hard rules) ----------
+    # NOTE (Day 5 testing): the ATR band and TF-agreement defaults
+    # below are intentionally **loosened** so the HyperliquidExecutor /
+    # PositionManager / AllocationRouter pipeline can be exercised
+    # against live signals without L1 short-circuiting every cycle on
+    # currently-quiet markets. These are **testing defaults**; tighten
+    # back to the conservative values (ATR_PCT_MIN=0.15,
+    # ATR_PCT_MAX=6.0, REQUIRE_TF_AGREEMENT=true) before going to
+    # mainnet. The same loosened defaults are mirrored in
+    # ``.env.example`` and ``.env`` with a clearly labelled comment.
     L1_RSI_OVERBOUGHT: float = 70.0
     L1_RSI_OVERSOLD: float = 30.0
-    L1_ATR_PCT_MIN: float = 0.15      # too quiet -> skip
-    L1_ATR_PCT_MAX: float = 6.0       # too wild -> skip
+    L1_ATR_PCT_MIN: float = 0.05      # was 0.15 (TESTING ONLY)
+    L1_ATR_PCT_MAX: float = 12.0      # was 6.0  (TESTING ONLY)
     L1_EMA_FAST: int = 9
     L1_EMA_SLOW: int = 21
     L1_RSI_PERIOD: int = 14
     L1_ATR_PERIOD: int = 14
     L1_TIMEFRAMES: str = "15m,1h"
     L1_KLINES_LIMIT: int = 150
-    L1_REQUIRE_TF_AGREEMENT: bool = True
+    L1_REQUIRE_TF_AGREEMENT: bool = False  # was True (TESTING ONLY)
 
     # ---------- OpenRouter (Level 3 final arbiter) ----------
     # OpenRouter is the LLM gateway in front of Level 3. Setting
@@ -255,6 +407,69 @@ class Settings(BaseSettings):
     # behaviour where synthetic L3 votes with its configured weight.
     REDISTRIBUTE_SYNTHETIC_L3_WEIGHT: bool = True
 
+    # ---------- Level 3 override of a Level 1 block ----------
+    # By default the cascade short-circuits the moment Level 1 blocks
+    # (saves API budget, keeps the agent on the safe side). When
+    # ``ALLOW_L3_TO_OVERRIDE_L1`` is True AND a real OpenRouter L3 is
+    # wired, the engine instead asks Level 3 to inspect the L1 block
+    # reasons + per-symbol indicators + the Level 2 on-chain payload,
+    # and only short-circuits if L3 *also* declines the trade.
+    #
+    # This lets Claude critically audit a borderline L1 veto (e.g.
+    # ATR sitting on the edge of the band, single-timeframe trend
+    # disagreement) instead of having the rule-based gate decide
+    # unilaterally. Hard blocks (``drawdown_breach``,
+    # ``ohlcv_unavailable``) are NEVER overrideable - drawdown is
+    # sacred and missing data means we can't trade safely.
+    #
+    # ``L3_OVERRIDE_MIN_CONVICTION`` is the floor L3 must clear to
+    # actually open the trade; anything below it is treated as a
+    # decline-to-override and the engine short-circuits as normal.
+    ALLOW_L3_TO_OVERRIDE_L1: bool = True
+    L3_OVERRIDE_MIN_CONVICTION: float = 0.55
+
+    # ---------- L3 aggression / calibration (Day 6+) ----------
+    # The critical-mode L3 prompt was tuned to be "skeptical by
+    # default" to prevent reckless trading on weak signals. In
+    # production this proved over-conservative: L3 was holding even
+    # when L1 passed AND L2 conviction >= 0.7, citing single
+    # contradictions (cross-asset ATR, n=3 whales, flat OI in a
+    # continuation) that would not move a real desk's verdict.
+    #
+    # ``L3_AGGRESSION`` is the operator's master knob:
+    #
+    #   * ``conservative`` - legacy Day-4 behaviour, conviction and
+    #     intensity scaled to 0.90, no HOLD-rescue rule. Use when
+    #     drawdown is elevated or you want to debug a noisy market.
+    #   * ``balanced`` (DEFAULT) - no calibration multipliers; L3's
+    #     verdict goes through as-is. The prompt itself is rewritten
+    #     to use a concrete decision matrix instead of vague
+    #     skepticism, so "balanced" with the new prompt is roughly
+    #     as aggressive as "aggressive" was under the old prompt -
+    #     but with auditable rules.
+    #   * ``aggressive`` - conviction ×1.10, intensity ×1.15, and
+    #     a HOLD-rescue rule: if Claude returns ``regime="hold"``
+    #     but L1.passes AND L2.conviction >= L3_HOLD_RESCUE_L2_MIN,
+    #     the engine flips it to a low-intensity OPEN aligned with
+    #     L2's direction. Use only when you explicitly want the
+    #     agent to lean into convergent signals.
+    #
+    # The calibration is applied in code AFTER ``ArbiterResponse``
+    # validation - never in the prompt - so the audit trail is
+    # deterministic and reversible.
+    L3_AGGRESSION: Literal["conservative", "balanced", "aggressive"] = (
+        "balanced"
+    )
+    # Minimum L2 conviction required to trigger the HOLD-rescue
+    # rule under L3_AGGRESSION=aggressive. 0.65 reflects the
+    # smoke-test pattern where L2 was firing 0.70-0.80 conviction
+    # bullish but L3 was still holding.
+    L3_HOLD_RESCUE_L2_MIN: float = 0.65
+    # Intensity to use when the HOLD-rescue rule fires. Deliberately
+    # small - we're overriding Claude's judgement, so size
+    # conservatively.
+    L3_HOLD_RESCUE_INTENSITY: float = 0.30
+
     # ---------- Short-selling controls ----------
     # When True, shorts use the same sizing pipeline as longs
     # (recommended). Flip to False + tune SHORT_SIZE_MULTIPLIER if
@@ -262,15 +477,46 @@ class Settings(BaseSettings):
     SYMMETRIC_SHORT_SIZING: bool = True
     SHORT_SIZE_MULTIPLIER: float = 1.0
 
-    # ---------- Position sizing (vol-targeted + DD haircut) ----------
+    # ---------- Position sizing (equity-% risk + vol-targeted + DD haircut) ----------
     # Default notional fallback when equity/ATR aren't available
     # (typical first dry-run cycle before any margin is deposited).
     BASE_POSITION_USD: float = 1000.0
     MAX_POSITION_USD: float = 10000.0
-    # Fraction of equity to risk per trade under a `STOP_ATR_MULT * ATR`
-    # adverse move. 0.02 = 2% (textbook default).
+    # PRIMARY operator-friendly knob: percentage of CURRENT equity to
+    # risk on a single trade, under a `STOP_ATR_MULT * ATR` adverse
+    # move. Operator-friendly format (1.0 = 1%, NOT a fraction).
+    # When set, this value WINS over the legacy ``TARGET_RISK_PCT``
+    # fraction below. Sensible range: 0.5 .. 2.0 (textbook).
+    #
+    #   * 0.5  - very conservative; ideal for live capital ramp-up
+    #   * 1.0  - balanced (DEFAULT)
+    #   * 2.0  - aggressive; only with proven edge + small account
+    #
+    # Combined with ATR%, the resulting notional is:
+    #
+    #   notional = equity * (risk_pct/100)
+    #              / (stop_atr_mult * atr_pct/100)
+    #
+    # i.e. equity * risk_pct / (stop_atr_mult * atr_pct). All four
+    # inputs are exposed so operators can dial conservatively without
+    # touching the L3 prompt or the engine weights.
+    RISK_PER_TRADE_PCT: float | None = 1.0
+    # LEGACY fraction-form knob; only consulted when
+    # ``RISK_PER_TRADE_PCT`` is None. 0.02 = 2% (textbook default).
+    # Kept for backward compatibility with existing .env files.
     TARGET_RISK_PCT: float = 0.02
-    # Stop distance in ATR multiples.
+    # ---- Per-asset risk multipliers ----
+    # Multiplier applied to the resolved per-trade risk for each
+    # symbol bucket. 1.0 = full risk; 0.5 = half-size on this asset.
+    # Lets operators express "I trust the BTC setup more than the
+    # ETH setup" or "shrink any ALT to half risk" without touching
+    # the engine. Sane bands: 0.25 .. 1.5.
+    RISK_PER_TRADE_MULT_BTC: float = 1.0
+    RISK_PER_TRADE_MULT_ETH: float = 1.0
+    RISK_PER_TRADE_MULT_DEFAULT: float = 1.0
+    # Stop distance in ATR multiples (used in the sizing denominator
+    # AND by the Fast Path's dynamic stop-loss when
+    # USE_DYNAMIC_ATR_TPSL is on - one knob for both consumers).
     STOP_ATR_MULT: float = 1.5
     # ATR% floor used in the sizing denominator to avoid divide-by-zero
     # / absurdly large sizes when ATR collapses to near-zero. Should
@@ -284,6 +530,286 @@ class Settings(BaseSettings):
     # target, intensity, haircut, etc.) onto each ExecutionPlan so the
     # console panel can show the "why" behind each size.
     EXPLAIN_SIZING: bool = True
+
+    @property
+    def resolved_risk_per_trade_frac(self) -> float:
+        """Return the per-trade risk as a fraction in [0, 1].
+
+        Prefers the operator-friendly ``RISK_PER_TRADE_PCT`` (1.0 =
+        1%); falls back to the legacy ``TARGET_RISK_PCT`` fraction
+        when not set. Clamped to a sane range so a stray ``50.0``
+        in .env doesn't blow up the sizing denominator.
+        """
+        if self.RISK_PER_TRADE_PCT is not None:
+            frac = float(self.RISK_PER_TRADE_PCT) / 100.0
+        else:
+            frac = float(self.TARGET_RISK_PCT)
+        # Clamp: 0.05% (sanity floor) .. 5% (hard ceiling; anything
+        # above is almost certainly a unit error).
+        return max(0.0005, min(0.05, frac))
+
+    def risk_multiplier_for_symbol(self, symbol: str) -> float:
+        """Resolve the per-asset risk multiplier for ``symbol``.
+
+        Pattern-matches by leading token (BTC / ETH) and falls back
+        to ``RISK_PER_TRADE_MULT_DEFAULT`` for anything else. Symbol
+        is matched case-insensitively against the part before the
+        first ``-`` / ``/`` separator so ``BTC-PERP`` / ``BTC/USD``
+        / ``btc-perp`` all hit the same bucket.
+        """
+        if not symbol:
+            return float(self.RISK_PER_TRADE_MULT_DEFAULT)
+        head = symbol.strip().upper().split("-")[0].split("/")[0]
+        if head == "BTC":
+            return float(self.RISK_PER_TRADE_MULT_BTC)
+        if head == "ETH":
+            return float(self.RISK_PER_TRADE_MULT_ETH)
+        return float(self.RISK_PER_TRADE_MULT_DEFAULT)
+
+    # ============================================================
+    # Position management (PositionManager - two-tier stewardship)
+    # ============================================================
+    # The PositionManager runs on EVERY cycle, BEFORE the regime
+    # dispatch, with TWO independent paths:
+    #
+    #   * Fast Path  (always runs, no LLM, ~ms): dynamic ATR-based
+    #     TP/SL, partial TP, breakeven, trailing stop, vol-spike
+    #     filter, time-based exit, portfolio-wide daily-DD guard.
+    #     Driven entirely by Level 1 indicators + executor state.
+    #
+    #   * Smart Path (LLM, ~1s): a per-position Claude review
+    #     triggered ONLY by meaningful changes (price moved
+    #     N x ATR since last check, funding spike, whale spike,
+    #     time-since-last-review elapsed). L3 can override or
+    #     veto Fast-Path decisions within bounds.
+    #
+    # All percent fields are operator-friendly *percentages*
+    # (3.0 = 3%); converted to Decimal fractions inside
+    # :meth:`PositionManager.from_settings`.
+
+    # ---------- Legacy fixed-pct triggers (fallback when no ATR) ----------
+    # The Fast Path prefers DYNAMIC, ATR-based triggers (TP_ATR_MULT
+    # below); these fixed-pct values are used as a fall-back when the
+    # primary symbol's ATR% is unavailable (e.g. Dune outage). Set
+    # any of them to 0 to fully disable the corresponding trigger,
+    # or use the ENABLE_* flags below to keep telemetry visible
+    # while muting the action.
+    # Native venue TP/SL trigger orders are also submitted at open
+    # time using these percentages (or the dynamic ATR equivalents,
+    # see USE_DYNAMIC_ATR_TPSL). +3.5% / -2.0% is a textbook 1.75:1
+    # reward-to-risk envelope - tighten in choppy markets, widen in
+    # trends. Set to 0 to mute that side of the trigger.
+    TAKE_PROFIT_PCT: float = 3.5           # +3.5% (fallback close + native TP)
+    STOP_LOSS_PCT: float = 2.0             # -2.0% (fallback close + native SL)
+    TRAILING_STOP_PCT: float = 1.0         # fallback trail width
+    # Conviction floor below which a *profitable* position is closed
+    # to lock in gains. Deep losers are caught by STOP_LOSS_PCT first.
+    MIN_CONVICTION_TO_HOLD: float = 0.45
+    # Profit threshold required for the re-evaluation trigger to fire.
+    # Prevents flattening a slightly-underwater position just because
+    # conviction wobbled briefly.
+    RE_EVAL_MIN_PROFIT_PCT: float = 0.5    # 0.5%
+    # When True (default), an open position is flipped the moment the
+    # engine emits an opposite-side directive (close + reopen on the
+    # same cycle).
+    AUTO_FLIP_ON_SIDE_CHANGE: bool = True
+
+    # ---------- Dynamic ATR-based TP / SL (preferred path) ----------
+    # When the primary symbol's ATR% is available from L1, the Fast
+    # Path computes TP/SL as multiples of the LIVE ATR rather than
+    # fixed percentages, so the agent breathes with volatility.
+    #
+    #   sl_price = entry +/- (SL_ATR_MULT      * ATR)   (1.0-1.5)
+    #   tp_price = entry +/- (TP_ATR_MULT      * ATR)   (2.5-3.5)
+    #
+    # Recomputed every cycle, so a position that was sized in a
+    # quiet market gracefully widens its stop when vol picks up.
+    USE_DYNAMIC_ATR_TPSL: bool = True
+    SL_ATR_MULT: float = 1.2                # stop distance = 1.2 * ATR
+    TP_ATR_MULT: float = 3.0                # full TP distance = 3.0 * ATR
+    # Trailing stop distance in ATR multiples; clamped to a sane
+    # minimum so a quiet market doesn't produce a trail tighter
+    # than the spread.
+    TRAIL_ATR_MULT: float = 1.5
+
+    # ---------- Partial take-profit (scaling out) ----------
+    # When a position hits the partial-TP target (PARTIAL_TP_ATR_MULT
+    # x ATR in our favour), close PARTIAL_TP_FRACTION of the size
+    # and let the remainder ride to the full TP. Disables itself
+    # when PARTIAL_TP_FRACTION <= 0 or >= 1.
+    ENABLE_PARTIAL_TAKE_PROFIT: bool = True
+    PARTIAL_TP_ATR_MULT: float = 1.5        # first scale-out at ~+1.5 ATR
+    PARTIAL_TP_FRACTION: float = 0.50       # close 50% of the position
+
+    # ---------- Breakeven move ----------
+    # Once profit reaches BREAKEVEN_TRIGGER_ATR_MULT * ATR, advance
+    # the effective SL to entry + BREAKEVEN_BUFFER_PCT (so we never
+    # give back the trade). Stamped onto state - no on-chain order
+    # change; the dynamic stop branch reads it on subsequent cycles.
+    ENABLE_BREAKEVEN: bool = True
+    BREAKEVEN_TRIGGER_ATR_MULT: float = 1.0   # arm BE at +1 ATR
+    BREAKEVEN_BUFFER_PCT: float = 0.05        # lock in 0.05% past entry
+
+    # ---------- Volatility filter (live ATR spike) ----------
+    # If the current ATR% jumps to VOL_SPIKE_MULT x the ATR% snapshot
+    # we took at position open, react: either CLOSE (safest) or
+    # TIGHTEN_STOP (advisory). Default = TIGHTEN_STOP. Set spike
+    # threshold to 0 to disable.
+    ENABLE_VOL_FILTER: bool = True
+    VOL_SPIKE_MULT: float = 1.8               # 1.8x = ATR almost doubled
+    VOL_SPIKE_ACTION: Literal["close", "tighten_stop"] = "tighten_stop"
+
+    # ---------- Time-based exit ----------
+    # Maximum hours we hold a perp open. Stops a trade from drifting
+    # forever after its thesis has evaporated. Set 0 to disable.
+    MAX_POSITION_HOLD_HOURS: float = 24.0
+
+    # ---------- Daily / global drawdown guard ----------
+    # Portfolio-wide PnL kill switch. Tracked in-process across cycles
+    # (rebuilt on restart). When the rolling realised+unrealised PnL
+    # since session start (or since the last UTC midnight rollover)
+    # crosses DAILY_LOSS_LIMIT_PCT of starting equity, the manager
+    # forces a full risk-off and refuses to re-open until the operator
+    # confirms (today = until the next process restart).
+    ENABLE_DAILY_DD_GUARD: bool = True
+    DAILY_LOSS_LIMIT_PCT: float = 5.0          # 5% of session starting equity
+
+    # ---------- Per-asset ATR caps (1h) ----------
+    # Hard ATR% ceiling per symbol on the 1h timeframe. Above the cap
+    # the manager refuses to OPEN a fresh position and trims an
+    # existing one to <= 50% size. Mirrors the per-asset bands in the
+    # L3 critical-mode prompt so Fast Path + LLM agree on regimes.
+    PER_ASSET_ATR_CAP_BTC_1H: float = 3.0      # BTC -> <= 3% ATR
+    PER_ASSET_ATR_CAP_ETH_1H: float = 4.0      # ETH -> <= 4% ATR
+    PER_ASSET_ATR_CAP_DEFAULT_1H: float = 4.0  # any other coin
+
+    # ---------- Smart Path (L3 review trigger gates) ----------
+    # The Smart Path is expensive (one LLM round-trip per fired
+    # trigger), so we only invoke it on MATERIAL change. Each gate
+    # below is OR-combined: any single trigger fires the review.
+    ENABLE_SMART_PATH: bool = True
+    # Price moved by N x ATR since the last L3 review on this
+    # position -> review. 1.5-2.0 x ATR is the textbook "material
+    # move" envelope.
+    L3_REVIEW_TRIGGER_PRICE_ATR_MULT: float = 1.5
+    # Funding rate magnitude (per-8h fraction) above which the L3 is
+    # called even if price hasn't moved. 0.0005 = 0.05% per 8h.
+    L3_REVIEW_TRIGGER_FUNDING_RATE: float = 0.0005
+    # Number of large-trade whales seen in the L2 window. 5+ matches
+    # the L3 prompt's "real signal" threshold.
+    L3_REVIEW_TRIGGER_WHALE_COUNT: int = 5
+    # OI delta magnitude (over 1h) above which we re-arbitrate.
+    L3_REVIEW_TRIGGER_OI_DELTA_PCT: float = 4.0
+    # Wall-clock minimum between forced reviews. We trigger at LEAST
+    # once every N minutes per position so the LLM stays in the
+    # loop even on a quiet market.
+    L3_REVIEW_MIN_INTERVAL_MINUTES: float = 30.0
+    # Wall-clock MAXIMUM between reviews - regardless of any other
+    # gate, we re-arbitrate at least once every N minutes per open
+    # position. Belt-and-braces vs forever-stale L3 verdicts.
+    L3_REVIEW_MAX_INTERVAL_MINUTES: float = 120.0
+    # When True, the Smart Path verdict can override the Fast Path
+    # decision (e.g. veto a close, set a custom stop). Set False to
+    # treat L3 as advisory only (Fast Path always wins).
+    L3_CAN_OVERRIDE_FAST_PATH: bool = True
+    # Minimum age (minutes) before a brand-new position is eligible
+    # for a Smart-Path review. Stops the LLM from reviewing every
+    # new open immediately - let the Fast Path observe the entry
+    # first. 10 min is roughly one full --loop cycle at the default
+    # DECISION_INTERVAL_SECONDS=600.
+    L3_FIRST_REVIEW_DELAY_MINUTES: float = 10.0
+
+    # ---------- HOLD-rescue (per-position) ----------
+    # NB: a HARD floor of 25 minutes on the per-position Smart-Path
+    # cooldown is enforced inside PositionManager regardless of any
+    # .env value (see ``_HARD_COOLDOWN_FLOOR_MINUTES``). Operators
+    # can configure values BELOW the floor but the manager will
+    # silently uphold the floor for cost-safety.
+    #
+    # When unset, ENABLE_HOLD_RESCUE auto-resolves to True iff
+    # L3_AGGRESSION=aggressive (mirrors the main-engine semantics).
+    # ENABLE_HOLD_RESCUE: bool = True
+    # Minimum L2 conviction (on this position's symbol, opposite
+    # direction by default) required to trigger the rescue. Falls
+    # back to L3_HOLD_RESCUE_L2_MIN (the main-engine equivalent)
+    # when unset. Sensible bands: 0.55 .. 0.80.
+    # HOLD_RESCUE_L2_MIN: float = 0.65
+    # When unset, HOLD_RESCUE_DIRECTION_MODE auto-resolves to "any"
+    # under L3_AGGRESSION=aggressive (allows the LLM to scale into
+    # a strong trend, not just bail) and to "opposite" otherwise
+    # (rescue only on a contradiction).
+    # HOLD_RESCUE_DIRECTION_MODE: Literal["opposite", "any"] = "opposite"
+    HOLD_RESCUE_COOLDOWN_MINUTES: float = 20.0
+
+    # ---------- HOLD-must-be-earned (periodic re-audit) ----------
+    # When True (auto-on under aggressive), a position that has been
+    # HOLDing for >= HOLD_MUST_BE_EARNED_MINUTES forces a fresh
+    # Smart-Path review even if no other gate fired. The intent:
+    # HOLD shouldn't be a "we forgot about you" default - we should
+    # be regularly auditing whether each open slot is still earned.
+    # Suppressed when the previous Smart Path verdict was already
+    # an explicit HOLD (avoids hitting the same answer twice in a
+    # row).
+    # HOLD_MUST_BE_EARNED: bool = True
+    HOLD_MUST_BE_EARNED_MINUTES: float = 45.0
+
+    # ---------- Global LLM budget (cost-safety rails, Day-6+) ----------
+    # Hard ceilings on the AGGREGATE Smart-Path call volume across
+    # all positions and across cycles. The per-position cooldown
+    # ladder (hard floor + first-review delay + aggression shift +
+    # rescue cooldown) bounds how often a single position can wake
+    # the LLM. These ceilings sit ON TOP of that, bounding the TOTAL
+    # call count so a multi-position cycle with N simultaneous fired
+    # gates can never produce N round-trips.
+    #
+    # When more candidates fire than fit in ``LLM_MAX_PER_CYCLE``,
+    # the manager keeps the highest-priority ones (HOLD-rescue >
+    # close-audit > HOLD-must-be-earned > periodic > price/funding/
+    # whale/OI > first-review) and skips the rest with telemetry.
+    # When ``LLM_MAX_PER_HOUR`` is exhausted, ALL Smart-Path calls
+    # are skipped regardless of trigger severity.
+    #
+    # Defaults are tuned for the default DECISION_INTERVAL_SECONDS
+    # = 600 (10-min cycles): up to 2 Smart-Path round-trips per
+    # cycle and 8 per rolling hour. At a 6-cycle/hr cadence with 2
+    # positions, that's at most 12 fires "wanted" vs 8 allowed.
+    # Operators should raise these only after observing actual call
+    # rates via the panel's `Smart-Path usage` row.
+    LLM_MAX_PER_CYCLE: int = 2
+    LLM_MAX_PER_HOUR: int = 8
+
+    # ---------- Conservative-mode hardening (Day-6+) ----------
+    # Two flags that make conservative meaningfully more cautious
+    # than just "raise the override threshold". Both auto-resolve
+    # to True when L3_AGGRESSION=conservative, but can be set
+    # explicitly to override that default.
+    #
+    # L3_CONSERVATIVE_VETO_ONLY:
+    # When True under conservative, the LLM is allowed to VETO
+    # Fast-Path closes (smart=hold downgrades close -> hold), but
+    # NOT allowed to UPGRADE a Fast-Path HOLD into a close (smart=
+    # close_full/partial). HOLD-rescue is exempt because rescue is
+    # explicitly the operator asking the LLM to act on
+    # contradiction. Net effect: conservative mode treats the LLM
+    # strictly as a brake, never as an accelerator.
+    #
+    # L3_REQUIRE_MULTI_TRIGGER:
+    # When True under conservative, Smart Path requires >= 2
+    # corroborating gates on the same position before invocation.
+    # A single price-move or single funding spike isn't enough -
+    # we want at least two independent signals before paying for
+    # an OpenRouter round-trip. Rescue is exempt (it has its own
+    # cooldown bookkeeping). First-review doesn't count as
+    # corroboration.
+    #
+    # L3_CONSERVATIVE_VETO_ONLY: bool = True   (auto under conservative)
+    # L3_REQUIRE_MULTI_TRIGGER: bool = True    (auto under conservative)
+
+    # ---------- Per-trigger feature flags (legacy + new) ----------
+    # Useful for muting an individual trigger during debugging without
+    # zeroing out its threshold (keeps panel telemetry intact).
+    ENABLE_TRAILING_STOP: bool = True
+    ENABLE_RE_EVALUATION: bool = True
 
     @field_validator("*", mode="before")
     @classmethod

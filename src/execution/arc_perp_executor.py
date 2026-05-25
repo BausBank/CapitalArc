@@ -215,11 +215,20 @@ class ArcPerpExecutor:
         amount_usd: Decimal,
         decision_id: str | None = None,
     ) -> TxResult:
-        """Deposit USDC margin into `USDCCollateralVault`."""
+        """Deposit USDC margin into `USDCCollateralVault`.
+
+        On-chain effect (live): ``USDC.approve(vault, amount)`` is
+        already in place (or sponsored by Paymaster); this call invokes
+        ``vault.deposit(accountId, amount)`` which pulls USDC from the
+        wallet and credits the agent's perp account.
+        """
         if not self.config.vault_address:
             raise RuntimeError(
                 "ARC_PERP_VAULT_ADDRESS is not set; cannot deposit margin."
             )
+        if amount_usd <= 0:
+            logger.info("ArcPerp.deposit_margin skipped (amount={})", amount_usd)
+            return self._noop_tx("deposit_margin_skipped", decision_id, amount_usd)
         amount_units = self._to_usdc_units(amount_usd)
         account_id = self._account_id()
         req = TxRequest(
@@ -234,8 +243,9 @@ class ArcPerpExecutor:
             },
         )
         logger.info(
-            "ArcPerp.deposit_margin | accountId={} amount={} USDC decision={}",
-            account_id, amount_usd, decision_id,
+            "ArcPerp.deposit_margin | accountId={} amount={} USDC decision={} "
+            "dry_run={}",
+            account_id, amount_usd, decision_id, self.dry_run,
         )
         return await self.wallet.send_contract_execution(req)
 
@@ -244,11 +254,18 @@ class ArcPerpExecutor:
         amount_usd: Decimal,
         decision_id: str | None = None,
     ) -> TxResult:
-        """Withdraw USDC margin from `USDCCollateralVault`."""
+        """Withdraw USDC margin from `USDCCollateralVault` back to the wallet.
+
+        Used by the AllocationRouter's risk-off flow: close perps,
+        withdraw the freed margin, then rotate it into USYC.
+        """
         if not self.config.vault_address:
             raise RuntimeError(
                 "ARC_PERP_VAULT_ADDRESS is not set; cannot withdraw margin."
             )
+        if amount_usd <= 0:
+            logger.info("ArcPerp.withdraw_margin skipped (amount={})", amount_usd)
+            return self._noop_tx("withdraw_margin_skipped", decision_id, amount_usd)
         amount_units = self._to_usdc_units(amount_usd)
         account_id = self._account_id()
         req = TxRequest(
@@ -263,10 +280,32 @@ class ArcPerpExecutor:
             },
         )
         logger.info(
-            "ArcPerp.withdraw_margin | accountId={} amount={} USDC decision={}",
-            account_id, amount_usd, decision_id,
+            "ArcPerp.withdraw_margin | accountId={} amount={} USDC decision={} "
+            "dry_run={}",
+            account_id, amount_usd, decision_id, self.dry_run,
         )
         return await self.wallet.send_contract_execution(req)
+
+    async def withdraw_all_margin(
+        self,
+        decision_id: str | None = None,
+    ) -> TxResult:
+        """Drain the vault: read current balance and withdraw it all.
+
+        Convenience wrapper used by the AllocationRouter's risk-off
+        path. Returns a no-op TxResult when there's nothing to
+        withdraw - the router treats that as success.
+        """
+        margin = await self.get_margin()
+        logger.info(
+            "ArcPerp.withdraw_all_margin | current margin={} USDC decision={}",
+            margin, decision_id,
+        )
+        if margin <= 0:
+            return self._noop_tx(
+                "withdraw_all_margin_skipped", decision_id, Decimal("0")
+            )
+        return await self.withdraw_margin(margin, decision_id=decision_id)
 
     # ------------------------------------------------------------------
     # Trading (open / close) - order signing lands on Day 3
@@ -283,12 +322,16 @@ class ArcPerpExecutor:
     ) -> TxResult:
         """Open a perp position.
 
-        Day 2 behaviour:
-            - Dry-run: logs the planned EIP-712 order (no signature).
-            - Live: routes margin via `deposit_margin` (so capital actually
-              moves on-chain), then raises a clear `NotImplementedError`
-              if `ARC_PERP_MATCHER_URL` is not configured. With the matcher
-              URL set, Day 3 will sign + POST the order here.
+        NOTE
+        ----
+        Arc Perp DEX is no longer the trading venue for CapitalArc
+        (the matcher spec was never published). This method is kept
+        for treasury / dry-run telemetry only and ALWAYS raises a
+        ``NotImplementedError`` in ``--live``. Trading has migrated to
+        :class:`HyperliquidExecutor`. See ``AGENTS.md`` for details.
+
+        Dry-run behaviour is unchanged so legacy demo scripts can
+        still see a planned-order log line.
         """
         lev = self._cap_leverage(leverage)
         slip = slippage_bps if slippage_bps is not None else self.config.default_slippage_bps
@@ -317,24 +360,11 @@ class ArcPerpExecutor:
                 raw={"planned_order": planned},
             )
 
-        # Live: allocate margin into the perp vault now so capital is in place.
-        margin_to_deposit = self._margin_for_size(size_usd, lev)
-        deposit_res = await self.deposit_margin(margin_to_deposit, decision_id=decision_id)
-        logger.info(
-            "ArcPerp.open_position live margin deposit | tx_id={} state={} hash={}",
-            deposit_res.tx_id, deposit_res.state, deposit_res.tx_hash,
-        )
-
-        if not self.config.matcher_url:
-            raise NotImplementedError(
-                "ARC_PERP_MATCHER_URL is not configured. Margin was deposited "
-                "but EIP-712 order routing to the off-chain matcher lands on "
-                "Day 3. Set ARC_PERP_MATCHER_URL in .env to enable trading."
-            )
-
-        # Day 3: sign EIP-712 OrderTypes.Order, POST to self.config.matcher_url.
         raise NotImplementedError(
-            "EIP-712 order signing + matcher submission is Day 3 work."
+            "ArcPerpExecutor.open_position is no longer used in --live - "
+            "trading has migrated to HyperliquidExecutor. ArcPerpExecutor "
+            "remains only for Arc treasury moves (deposit_margin / "
+            "withdraw_margin) used by the legacy AllocationRouter path."
         )
 
     async def close_position(
@@ -343,7 +373,13 @@ class ArcPerpExecutor:
         slippage_bps: int | None = None,
         decision_id: str | None = None,
     ) -> TxResult:
-        """Close an open perp position."""
+        """Close an open perp position.
+
+        Same migration note as :meth:`open_position`. Returns
+        ``SKIPPED`` in ``--live`` so legacy AllocationRouter callers
+        (if any are still wired to ``ArcPerpExecutor``) can complete
+        their risk-off pipeline without raising.
+        """
         slip = slippage_bps if slippage_bps is not None else self.config.default_slippage_bps
         planned = {
             "action": "close_position",
@@ -352,8 +388,8 @@ class ArcPerpExecutor:
             "decision_id": decision_id,
         }
         logger.info(
-            "ArcPerp.close_position | {} slip={}bps decision={}",
-            symbol, slip, decision_id,
+            "ArcPerp.close_position | {} slip={}bps decision={} dry_run={}",
+            symbol, slip, decision_id, self.dry_run,
         )
 
         if self.dry_run:
@@ -364,15 +400,53 @@ class ArcPerpExecutor:
                 raw={"planned_order": planned},
             )
 
-        if not self.config.matcher_url:
-            raise NotImplementedError(
-                "ARC_PERP_MATCHER_URL is not configured. To close a perp "
-                "position via the off-chain orderbook, set ARC_PERP_MATCHER_URL "
-                "and ship the EIP-712 signing wiring (Day 3)."
-            )
-        raise NotImplementedError(
-            "EIP-712 order signing + matcher submission is Day 3 work."
+        logger.warning(
+            "ArcPerp.close_position is a no-op in --live - trading has "
+            "migrated to HyperliquidExecutor. Returning SKIPPED so the "
+            "rest of the risk-off pipeline (margin withdraw + USYC mint) "
+            "can complete.",
         )
+        return TxResult(
+            tx_id=f"noop-close-{decision_id or 'na'}",
+            state="SKIPPED",
+            sponsored=self.wallet._gas_is_sponsored(),
+            raw={
+                "planned_order": planned,
+                "skip_reason": "trading_migrated_to_hyperliquid",
+            },
+        )
+
+    async def close_all_positions(
+        self,
+        decision_id: str | None = None,
+    ) -> list[TxResult]:
+        """Close every open position the agent currently holds.
+
+        Reads the current account state and submits one close per
+        non-flat symbol. Returns the list of TxResults in submission
+        order. In dry-run we still iterate so the panel can show the
+        intended sequence.
+        """
+        account = await self.get_account_info()
+        results: list[TxResult] = []
+        open_positions = [p for p in account.positions if p.side != "flat"]
+        if not open_positions:
+            logger.info(
+                "ArcPerp.close_all_positions | no open positions "
+                "(account margin={} USD)",
+                account.equity_usd,
+            )
+            return results
+        logger.info(
+            "ArcPerp.close_all_positions | closing {} position(s) decision={}",
+            len(open_positions), decision_id,
+        )
+        for pos in open_positions:
+            res = await self.close_position(
+                symbol=pos.symbol, decision_id=decision_id
+            )
+            results.append(res)
+        return results
 
     # ------------------------------------------------------------------
     # Read-only methods (eth_call against the public Arc Testnet RPC)
@@ -495,3 +569,24 @@ class ArcPerpExecutor:
             data = p[2:] if p.startswith("0x") else p
             encoded += bytes.fromhex(data.rjust(64, "0"))
         return selector + encoded
+
+    def _noop_tx(
+        self,
+        action: str,
+        decision_id: str | None,
+        amount: Decimal,
+    ) -> TxResult:
+        """Synthetic ``TxResult`` for skipped / zero-amount operations.
+
+        Returned by :meth:`deposit_margin` / :meth:`withdraw_margin`
+        when the requested amount is zero, and by
+        :meth:`withdraw_all_margin` when the vault is already empty.
+        Lets the AllocationRouter treat "nothing to do" as success
+        without polluting the on-chain tx log.
+        """
+        return TxResult(
+            tx_id=f"noop-{action}-{decision_id or 'na'}",
+            state="DRY_RUN" if self.dry_run else "SKIPPED",
+            sponsored=self.wallet._gas_is_sponsored(),
+            raw={"action": action, "amount_usd": str(amount)},
+        )

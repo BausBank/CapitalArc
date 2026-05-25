@@ -68,7 +68,31 @@ Severity = Literal["info", "warn", "block"]
 
 @dataclass
 class Level1Reason:
-    """A single rule outcome (passed / warned / blocked)."""
+    """A single rule outcome (passed / warned / blocked).
+
+    Hard vs soft blocks (Day 5+ Level-3 override architecture)
+    ----------------------------------------------------------
+    :attr:`is_hard` declares whether a block is **immutable** (the
+    cascade MUST stop here regardless of any downstream opinion) or
+    **technical** (a rule-based veto that Level 3 is allowed to
+    audit and potentially override).
+
+    The taxonomy lives **at the source** - each L1 rule stamps its
+    own ``is_hard`` flag when it raises a :class:`Level1Reason`. The
+    decision engine reads the flag directly; there is no downstream
+    lookup table to keep in sync.
+
+    Hard blocks (``is_hard=True``):
+        * ``drawdown_breach`` - capital preservation overrides
+          opportunity.
+        * ``ohlcv_unavailable`` - no honest data means no honest
+          decision.
+
+    Soft blocks (``is_hard=False``):
+        * ``rsi_overbought`` / ``rsi_oversold`` - momentum extreme.
+        * ``atr_too_low`` / ``atr_too_high`` - volatility regime.
+        * ``trend_mixed`` - multi-timeframe disagreement.
+    """
 
     code: str          # short stable identifier, e.g. "rsi_overbought"
     severity: Severity
@@ -76,6 +100,7 @@ class Level1Reason:
     symbol: str | None = None
     timeframe: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    is_hard: bool = False
 
 
 @dataclass
@@ -154,6 +179,60 @@ class Level1Decision:
 
 
 # ---------------------------------------------------------------------------
+# Block-severity helpers (used by every soft block to enrich metadata)
+# ---------------------------------------------------------------------------
+# Marginality buckets used to qualify "how much beyond the threshold"
+# a soft block fired. Lets Level 3 (the Claude arbiter) instantly see
+# whether a block is fragile (worth overriding when on-chain evidence
+# is strong) or decisive (override would be reckless). The cuts are
+# expressed as a percentage of the threshold itself so the same
+# heuristic works for any rule (RSI, ATR%, etc.).
+_MARGIN_BUCKETS: list[tuple[float, str]] = [
+    # (upper_bound_pct, label)  -- evaluated in order; first match wins.
+    (5.0, "marginal"),    # <  5%  beyond threshold
+    (20.0, "moderate"),   # 5-20% beyond threshold
+    (float("inf"), "decisive"),  # > 20% beyond threshold
+]
+
+
+def _severity_label_from_margin_pct(margin_pct: float) -> str:
+    """Map a "% beyond threshold" value to a human-friendly bucket.
+
+    The arbiter's prompt references these labels verbatim, so do NOT
+    rename them without updating ``prompts/level3_arbiter_critical.md``.
+    """
+    abs_pct = abs(float(margin_pct))
+    for bound, label in _MARGIN_BUCKETS:
+        if abs_pct < bound:
+            return label
+    return "decisive"
+
+
+def _margin_metadata(*, value: float, threshold: float) -> dict[str, float | str]:
+    """Pre-compute the marginality block of a soft-block reason.
+
+    Surfaces the absolute distance from the threshold, that distance
+    expressed as a fraction of the threshold itself, and a label the
+    L3 arbiter can grep on (``marginal`` / ``moderate`` / ``decisive``).
+    Threshold is signed - positive for "value too high" blocks (RSI
+    overbought, ATR too high), negative for "value too low" blocks.
+    """
+    margin = float(value) - float(threshold)
+    margin_pct_of_threshold = (
+        margin / threshold * 100.0 if threshold != 0 else 0.0
+    )
+    return {
+        "value": float(value),
+        "threshold": float(threshold),
+        "margin": margin,
+        "margin_pct_of_threshold": margin_pct_of_threshold,
+        "severity_label": _severity_label_from_margin_pct(
+            margin_pct_of_threshold
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Implementation
 # ---------------------------------------------------------------------------
 
@@ -213,12 +292,21 @@ class Level1:
             r = Level1Reason(
                 code="drawdown_breach",
                 severity="block",
+                # HARD: capital preservation overrides any opportunity.
+                # No upstream L2 / L3 signal is allowed to override.
+                is_hard=True,
                 message=(
                     f"Account drawdown {drawdown_pct:.2f}% >= "
                     f"limit {self.config.max_drawdown_pct:.2f}% - "
                     "forcing flat."
                 ),
-                metadata={"drawdown_pct": drawdown_pct},
+                metadata={
+                    "drawdown_pct": drawdown_pct,
+                    "max_drawdown_pct": self.config.max_drawdown_pct,
+                    "breach_margin_pct": (
+                        drawdown_pct - self.config.max_drawdown_pct
+                    ),
+                },
             )
             account_blocks.append(r)
             reasons.append(r)
@@ -274,8 +362,7 @@ class Level1:
             score = float(min(1.0, max(0.0, avg)))
             trends = {sym: ro.trend for sym, ro in per_symbol.items()}
             rationale = (
-                f"L1 OK (primary={primary_symbol}): trends={trends}, "
-                f"avg-strength={avg:.2f}."
+                f"L1 OK (primary={primary_symbol}) avg-strength={avg:.2f}"
             )
 
         return Level1Decision(
@@ -330,6 +417,10 @@ class Level1:
                     Level1Reason(
                         code="ohlcv_unavailable",
                         severity="block",
+                        # HARD: no honest market data means no honest
+                        # decision; even the smartest arbiter cannot
+                        # opine on signals it cannot see.
+                        is_hard=True,
                         message=(
                             f"OHLCV for {symbol}@{tf} unavailable or too short "
                             "to apply technical filters" + note_hint + "."
@@ -351,19 +442,28 @@ class Level1:
             rows.append(row)
             per_tf_trend.append(row.trend)
 
-            # RSI extreme filter
+            # RSI extreme filter (SOFT - L3 may override on strong
+            # opposing on-chain evidence; marginality metadata lets
+            # the arbiter weigh how decisive the violation is).
             if row.rsi >= self.config.rsi_overbought:
                 blocking.append(
                     Level1Reason(
                         code="rsi_overbought",
                         severity="block",
+                        is_hard=False,
                         message=(
                             f"{symbol}@{tf} RSI={row.rsi:.1f} >= "
                             f"{self.config.rsi_overbought:.0f} (overbought)."
                         ),
                         symbol=symbol,
                         timeframe=tf,
-                        metadata={"rsi": row.rsi},
+                        metadata={
+                            "rsi": row.rsi,
+                            **_margin_metadata(
+                                value=row.rsi,
+                                threshold=self.config.rsi_overbought,
+                            ),
+                        },
                     )
                 )
             elif row.rsi <= self.config.rsi_oversold:
@@ -371,29 +471,50 @@ class Level1:
                     Level1Reason(
                         code="rsi_oversold",
                         severity="block",
+                        is_hard=False,
                         message=(
                             f"{symbol}@{tf} RSI={row.rsi:.1f} <= "
                             f"{self.config.rsi_oversold:.0f} (oversold)."
                         ),
                         symbol=symbol,
                         timeframe=tf,
-                        metadata={"rsi": row.rsi},
+                        metadata={
+                            "rsi": row.rsi,
+                            # For oversold the "value beyond threshold"
+                            # is the threshold-minus-value (we want
+                            # `margin > 0` to mean "deeper into the
+                            # forbidden zone").
+                            **_margin_metadata(
+                                value=self.config.rsi_oversold - row.rsi,
+                                threshold=self.config.rsi_oversold,
+                            ),
+                        },
                     )
                 )
 
-            # Volatility band filter (ATR%)
+            # Volatility band filter (ATR%) - both sides SOFT.
             if row.atr_pct < self.config.atr_pct_min:
                 blocking.append(
                     Level1Reason(
                         code="atr_too_low",
                         severity="block",
+                        is_hard=False,
                         message=(
                             f"{symbol}@{tf} ATR%={row.atr_pct:.2f}% < "
                             f"{self.config.atr_pct_min:.2f}% (market too dead)."
                         ),
                         symbol=symbol,
                         timeframe=tf,
-                        metadata={"atr_pct": row.atr_pct},
+                        metadata={
+                            "atr_pct": row.atr_pct,
+                            # For "too low" the "beyond" distance is
+                            # `floor - value` (positive = deeper into
+                            # the forbidden zone).
+                            **_margin_metadata(
+                                value=self.config.atr_pct_min - row.atr_pct,
+                                threshold=self.config.atr_pct_min,
+                            ),
+                        },
                     )
                 )
             elif row.atr_pct > self.config.atr_pct_max:
@@ -401,13 +522,20 @@ class Level1:
                     Level1Reason(
                         code="atr_too_high",
                         severity="block",
+                        is_hard=False,
                         message=(
                             f"{symbol}@{tf} ATR%={row.atr_pct:.2f}% > "
                             f"{self.config.atr_pct_max:.2f}% (volatility regime hostile)."
                         ),
                         symbol=symbol,
                         timeframe=tf,
-                        metadata={"atr_pct": row.atr_pct},
+                        metadata={
+                            "atr_pct": row.atr_pct,
+                            **_margin_metadata(
+                                value=row.atr_pct,
+                                threshold=self.config.atr_pct_max,
+                            ),
+                        },
                     )
                 )
             else:
@@ -458,17 +586,38 @@ class Level1:
                 )
             else:
                 trend_summary = "mixed"
+                # Trend-mix marginality: how many timeframes disagree
+                # with the dominant one (the one with the most votes).
+                # 1 dissenter out of 3 TFs is marginal; everyone
+                # voting differently is decisive.
+                n_tf = len(per_tf_trend) or 1
+                dominant_count = max(
+                    per_tf_trend.count(t)
+                    for t in ("up", "down", "flat")
+                )
+                n_dissenters = n_tf - dominant_count
+                dissent_pct = (n_dissenters / n_tf) * 100.0
                 blocking.append(
                     Level1Reason(
                         code="trend_mixed",
                         severity="block",
+                        is_hard=False,
                         message=(
                             f"{symbol}: trend disagrees across "
                             f"{', '.join(self.config.timeframes)} "
                             f"(per-TF: {per_tf_trend}) - skipping trade."
                         ),
                         symbol=symbol,
-                        metadata={"per_tf_trend": per_tf_trend},
+                        metadata={
+                            "per_tf_trend": per_tf_trend,
+                            "n_timeframes": n_tf,
+                            "n_dissenters": n_dissenters,
+                            "dominant_count": dominant_count,
+                            "dissent_pct": dissent_pct,
+                            "severity_label": _severity_label_from_margin_pct(
+                                dissent_pct
+                            ),
+                        },
                     )
                 )
         else:
@@ -648,6 +797,7 @@ def _reason_to_dict(reason: Level1Reason) -> dict[str, Any]:
         "symbol": reason.symbol,
         "timeframe": reason.timeframe,
         "metadata": reason.metadata,
+        "is_hard": reason.is_hard,
     }
 
 

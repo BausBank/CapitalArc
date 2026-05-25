@@ -64,6 +64,66 @@ from typing import Any
 from src.core.level1 import Level1
 from src.core.level2 import Level2
 from src.core.level3 import ArbiterBriefing, Level3
+from src.utils.logging import logger
+
+
+# ---------------------------------------------------------------------------
+# L1 block taxonomy - DEFENSIVE FALLBACK ONLY
+# ---------------------------------------------------------------------------
+# As of Day 5+, hard-vs-soft is declared at the SOURCE: each
+# :class:`Level1Reason` carries its own ``is_hard`` flag set by the
+# rule that raised it (see ``src/core/level1.py``). The engine reads
+# that flag directly; there is no longer a centralised lookup.
+#
+# This set is kept as a defensive fallback for payloads that arrive
+# WITHOUT the ``is_hard`` flag (older test fixtures, third-party
+# Level-1 implementations that bypass the dataclass). When the flag
+# is present, it ALWAYS wins.
+_LEGACY_HARD_BLOCK_CODES: frozenset[str] = frozenset(
+    {
+        "drawdown_breach",
+        "ohlcv_unavailable",
+    }
+)
+
+
+def _reason_is_hard(reason: dict[str, Any]) -> bool:
+    """Read ``is_hard`` from a serialised L1 reason, with safe fallback.
+
+    Prefer the explicit flag (set by L1 at the source); fall back to
+    the legacy code set if the flag is missing. Anything else is
+    treated as a soft block - so an unknown future block code is
+    eligible for L3 override by default, which is the right
+    permissive bias for a system designed to evolve.
+    """
+    if "is_hard" in reason:
+        return bool(reason["is_hard"])
+    return str(reason.get("code")) in _LEGACY_HARD_BLOCK_CODES
+
+
+# ---------------------------------------------------------------------------
+# Stacked-veto intensity haircut
+# ---------------------------------------------------------------------------
+# When Level 3 overrides Level 1, the engine applies a defensive cap
+# on the resulting position intensity that scales with the NUMBER of
+# soft blocks being overridden. The intuition is purely risk-mgmt:
+# three independent technical vetoes triggering simultaneously is a
+# qualitatively different setup from one. The arbiter's *conviction*
+# read is respected (we don't second-guess Claude's directional call),
+# but the *size* we put on is clamped because compound vetoes compound
+# risk.
+#
+# Cap is multiplied INTO the L3-supplied ``recommended_intensity``;
+# we never expand it. So 1 block + intensity=0.9 -> 0.9; 3 blocks +
+# intensity=0.9 -> 0.5*0.9 = 0.45. Operators can disable the
+# haircut by tuning ``L3_STACKED_VETO_CAPS`` in the engine config.
+_DEFAULT_STACKED_VETO_CAPS: dict[int, float] = {
+    1: 1.00,   # single soft block - L3 fully trusted
+    2: 0.70,   # two stacked blocks - moderate haircut
+    3: 0.50,   # three stacked blocks - sharp haircut
+    # 4 or more - keep clamping (handled by max() in the helper).
+}
+_FOUR_PLUS_BLOCKS_CAP: float = 0.35
 
 
 @dataclass
@@ -132,6 +192,27 @@ class DecisionResult:
     effective_weights: dict[str, float] = field(default_factory=dict)
     short_circuited: bool = False
     short_circuit_reason: str | None = None
+    # True when Level 1 BLOCKED the trade but Level 3 (the Claude
+    # arbiter) affirmatively overrode the veto and the engine is now
+    # opening a position on L3's authority alone. Used by the console
+    # panels to render an explicit "L1 OVERRIDDEN BY L3" badge so the
+    # operator never sees a mysterious risk_on after an L1 block.
+    l1_overridden_by_l3: bool = False
+    # Override audit trail. Populated whenever:
+    #   * L3 overrode an L1 block          -> ``status="executed"``
+    #   * L3 was invoked but declined      -> ``status="declined"``
+    #   * L3 was invoked but L1 was hard   -> ``status="hard_block_uphold"``
+    #
+    # Contents (informational, all optional):
+    #   status, n_soft_blocks, n_hard_blocks, soft_block_codes,
+    #   hard_block_codes, raw_intensity, calibrated_intensity,
+    #   stacked_veto_cap, l3_conviction, l3_direction,
+    #   l3_rationale_snippet.
+    #
+    # Lets the CLI panel render a self-explanatory override banner
+    # and lets backtests reconstruct every L3 override decision
+    # without re-running the LLM.
+    l1_override_meta: dict[str, Any] | None = None
     timestamp: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -168,6 +249,8 @@ class DecisionEngine:
         short_bias_min_strength: float = 0.35,
         strong_bias_open_strength: float = 0.6,
         redistribute_synthetic_l3_weight: bool = True,
+        allow_l3_to_override_l1: bool = True,
+        l3_override_min_conviction: float = 0.55,
     ) -> None:
         self.level1 = level1
         self.level2 = level2
@@ -197,6 +280,17 @@ class DecisionEngine:
         # have. Defaults to True; flip to False if you want to keep
         # the legacy "synthetic L3 carries its weight" behaviour.
         self.redistribute_synthetic_l3_weight = redistribute_synthetic_l3_weight
+        # When True (default) and a real Level 3 is wired, a SOFT L1
+        # block does NOT immediately short-circuit the cascade. The
+        # engine instead runs L2 + L3 with the full L1 block payload
+        # in the briefing (`l1_blocked=True`, reasons, indicators) and
+        # only short-circuits if L3 also declines the trade. HARD L1
+        # blocks (drawdown / missing data) ignore this flag entirely.
+        self.allow_l3_to_override_l1 = allow_l3_to_override_l1
+        # Minimum L3 conviction (0..1) required to actually override
+        # an L1 block. Anything below this is treated as a decline
+        # and the engine short-circuits as if L1 had been honoured.
+        self.l3_override_min_conviction = float(l3_override_min_conviction)
         self._validate_weights()
 
     def _validate_weights(self) -> None:
@@ -207,20 +301,89 @@ class DecisionEngine:
             )
 
     async def decide(self, context: dict[str, Any]) -> DecisionResult:
-        """Produce a `DecisionResult` for the given market context."""
+        """Produce a `DecisionResult` for the given market context.
+
+        Cascade (Day 5+ - "always invite L3" architecture)
+        --------------------------------------------------
+        1. Run Level 1.
+        2. ALWAYS run Level 2 + Level 3 next, regardless of L1's
+           verdict. When L1 blocked, the L3 briefing is enriched with
+           the full block reasons + marginality + per-(symbol, tf)
+           indicator table so Claude can audit the veto.
+
+           Why "always": the user's design goal is for the arbiter to
+           have full situational awareness on every cycle. Even on a
+           hard block, Claude's rationale becomes useful operator
+           context ("yes, I'm holding because drawdown 11.5% > 10%
+           limit; the on-chain mix would have favoured a long").
+
+        3. Engine-level guardrails AFTER L3 runs:
+           * **Hard block** -> short-circuit to risk-off regardless
+             of L3's verdict. Drawdown is sacred and missing data
+             means no honest signal. If L3 tried to risk_on anyway,
+             a WARNING is logged ("L3 attempted to override a hard
+             block - IGNORED") for operator visibility.
+           * **Soft block + override disabled or no real L3 client**
+             -> short-circuit. Synthetic L3 can't honestly audit L1
+             (it's a function of L1+L2); we never trust it on this
+             path.
+           * **Soft block + valid L3 override** -> bypass the
+             weighted aggregator and hand control to L3's verdict
+             directly. Intensity is calibrated by the stacked-veto
+             haircut (see ``_l3_overrode_l1``).
+           * **Soft block + L3 declined / fell back** -> short-circuit.
+
+        4. L1 passes -> weighted aggregate across all three levels
+           (legacy / steady-state path).
+        """
         l1_score = await self.level1.score(context)
+        l1_raw = l1_score.raw.get("l1", {}) or {}
+        l1_blocked = bool(l1_raw.get("passes") is False)
+        l1_block_info = self._extract_l1_block_info(l1_raw)
 
-        # ---- Short-circuit: L1 blocked -> force risk-off, skip L2/L3 ----
-        l1_blocked = bool(l1_score.raw.get("l1", {}).get("passes") is False)
         if l1_blocked:
-            return self._short_circuited(l1_score)
+            # Diagnostic only - the real branching happens in
+            # ``_resolve_l1_block`` AFTER L2/L3 have run.
+            soft_codes = sorted(
+                {
+                    r["code"]
+                    for r in l1_block_info["reasons"]
+                    if not r.get("is_hard")
+                }
+            )
+            hard_codes = sorted(
+                {
+                    r["code"]
+                    for r in l1_block_info["reasons"]
+                    if r.get("is_hard")
+                }
+            )
+            logger.info(
+                "L1 BLOCKED | hard={} soft={} -> running L2 + L3 anyway "
+                "so the arbiter receives the full briefing.",
+                hard_codes or "-",
+                soft_codes or "-",
+            )
 
-        # ---- Level 2 -----------------------------------------------------
+        # ---- Level 2 + Level 3: always run -----------------------------
+        # We invoke L2 and L3 unconditionally so the arbiter always
+        # has full situational awareness. The engine's guardrails
+        # below decide what to *do* with L3's verdict.
         l2_score = await self.level2.score(context)
+        l3_score = await self._maybe_level3(
+            l1_score, l2_score, context, l1_block_info=l1_block_info
+        )
 
-        # ---- Level 3 (optional today) -----------------------------------
-        l3_score = await self._maybe_level3(l1_score, l2_score, context)
+        # ---- L1-block guardrails (run AFTER L3 so we have its read) ----
+        if l1_blocked:
+            return self._resolve_l1_block(
+                l1_score=l1_score,
+                l2_score=l2_score,
+                l3_score=l3_score,
+                l1_block_info=l1_block_info,
+            )
 
+        # ---- Normal cascade aggregation ---------------------------------
         scores = [l1_score, l2_score, l3_score]
         effective_weights = self._effective_weights(scores)
         final_score = self._aggregate(scores, effective_weights)
@@ -252,7 +415,189 @@ class DecisionEngine:
     # Internals
     # ------------------------------------------------------------------
 
-    def _short_circuited(self, l1_score: LevelScore) -> DecisionResult:
+    # ------------------------------------------------------------------
+    # L1-block resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_l1_block(
+        self,
+        *,
+        l1_score: LevelScore,
+        l2_score: LevelScore,
+        l3_score: LevelScore,
+        l1_block_info: dict[str, Any],
+    ) -> DecisionResult:
+        """Decide what to do once L3 has weighed in on an L1 block.
+
+        Order of precedence (top wins):
+
+        1. **Hard block** -> short-circuit, regardless of L3. Log a
+           WARNING when L3 attempted a risk_on anyway so operators
+           can spot prompt-following regressions.
+        2. **Override disabled** OR **synthetic / fallback L3** ->
+           short-circuit. We never let a synthetic placeholder veto
+           a rule-based safety net.
+        3. **Valid override** -> hand control to L3 (with the
+           stacked-veto intensity haircut applied).
+        4. **L3 declined** (hold / low conviction) -> short-circuit.
+        """
+        reasons = l1_block_info["reasons"]
+        has_hard_block = any(r.get("is_hard") for r in reasons)
+        soft_codes = sorted(
+            {r["code"] for r in reasons if not r.get("is_hard")}
+        )
+        hard_codes = sorted(
+            {r["code"] for r in reasons if r.get("is_hard")}
+        )
+        l3_raw = (l3_score.raw or {}).get("l3", {}) or {}
+        l3_response = l3_raw.get("response") or {}
+
+        # --- 1. Hard block guardrail --------------------------------
+        if has_hard_block:
+            if str(l3_response.get("regime")) == "risk_on":
+                # Belt-and-braces: the prompt orders Claude to HOLD
+                # on hard blocks; if it nevertheless tried to override
+                # we shout and ignore. This makes prompt-drift loud.
+                logger.warning(
+                    "L3 attempted to override a HARD L1 block "
+                    "(hard_codes={}, l3_conv={:.2f}, l3_dir={}). "
+                    "IGNORED - hard blocks are immutable.",
+                    hard_codes,
+                    float(l3_response.get("conviction", 0.0) or 0.0),
+                    str(l3_response.get("direction", "?")),
+                )
+            override_meta = {
+                "status": "hard_block_uphold",
+                "n_soft_blocks": len(soft_codes),
+                "n_hard_blocks": len(hard_codes),
+                "soft_block_codes": soft_codes,
+                "hard_block_codes": hard_codes,
+                "l3_conviction": float(
+                    l3_response.get("conviction", 0.0) or 0.0
+                ),
+                "l3_direction": str(l3_response.get("direction", "neutral")),
+                "l3_rationale_snippet": str(
+                    l3_response.get("rationale", "")
+                )[:240],
+            }
+            return self._short_circuited(
+                l1_score,
+                l2_score=l2_score,
+                l3_score=l3_score,
+                l1_override_meta=override_meta,
+            )
+
+        # --- 2. Override disabled or synthetic / fallback L3 --------
+        if not self.allow_l3_to_override_l1 or self.level3 is None:
+            return self._short_circuited(
+                l1_score,
+                l2_score=l2_score,
+                l3_score=l3_score,
+                l1_override_meta={
+                    "status": "declined",
+                    "n_soft_blocks": len(soft_codes),
+                    "n_hard_blocks": 0,
+                    "soft_block_codes": soft_codes,
+                    "hard_block_codes": [],
+                    "decline_reason": (
+                        "override disabled in settings"
+                        if not self.allow_l3_to_override_l1
+                        else "no real L3 client wired (synthetic placeholder)"
+                    ),
+                },
+            )
+
+        # --- 3 & 4. Valid override? --------------------------------
+        override = self._evaluate_l3_override(l3_score)
+        if override is None:
+            decline_reason = self._explain_decline(l3_raw, l3_response)
+            logger.info(
+                "L3 declined to override L1 (soft={}) - {}",
+                soft_codes,
+                decline_reason,
+            )
+            return self._short_circuited(
+                l1_score,
+                l2_score=l2_score,
+                l3_score=l3_score,
+                l1_override_meta={
+                    "status": "declined",
+                    "n_soft_blocks": len(soft_codes),
+                    "n_hard_blocks": 0,
+                    "soft_block_codes": soft_codes,
+                    "hard_block_codes": [],
+                    "decline_reason": decline_reason,
+                    "l3_conviction": float(
+                        l3_response.get("conviction", 0.0) or 0.0
+                    ),
+                    "l3_direction": str(
+                        l3_response.get("direction", "neutral")
+                    ),
+                    "l3_rationale_snippet": str(
+                        l3_response.get("rationale", "")
+                    )[:240],
+                },
+            )
+        return self._l3_overrode_l1(
+            l1_score=l1_score,
+            l2_score=l2_score,
+            l3_score=l3_score,
+            override=override,
+            l1_block_info=l1_block_info,
+        )
+
+    @staticmethod
+    def _explain_decline(
+        l3_raw: dict[str, Any], l3_response: dict[str, Any]
+    ) -> str:
+        """Human-readable reason for an L3 override decline."""
+        if l3_raw.get("fallback"):
+            return "L3 arbiter fell back to safe-HOLD (LLM error)"
+        if l3_raw.get("synthetic"):
+            return "L3 is the synthetic placeholder (no real OpenRouter)"
+        regime = str(l3_response.get("regime", "hold"))
+        direction = str(l3_response.get("direction", "neutral"))
+        conviction = float(l3_response.get("conviction", 0.0) or 0.0)
+        if regime != "risk_on":
+            return f"L3 chose regime={regime!r}"
+        if direction not in {"long", "short"}:
+            return f"L3 returned neutral direction (direction={direction!r})"
+        return (
+            f"L3 conviction {conviction:.2f} below override floor"
+        )
+
+    @staticmethod
+    def _stacked_veto_cap(n_soft_blocks: int) -> float:
+        """Defensive intensity cap that scales with the number of
+        soft blocks being overridden simultaneously.
+
+        Risk-mgmt intuition: three independent technical vetoes
+        firing at once is qualitatively different from one. We
+        respect L3's conviction (its directional read), but clamp
+        the size we put on. Returns a multiplier in (0, 1].
+        """
+        if n_soft_blocks <= 0:
+            return 1.0
+        if n_soft_blocks >= 4:
+            return _FOUR_PLUS_BLOCKS_CAP
+        return _DEFAULT_STACKED_VETO_CAPS.get(n_soft_blocks, _FOUR_PLUS_BLOCKS_CAP)
+
+    def _short_circuited(
+        self,
+        l1_score: LevelScore,
+        *,
+        l2_score: LevelScore | None = None,
+        l3_score: LevelScore | None = None,
+        l1_override_meta: dict[str, Any] | None = None,
+    ) -> DecisionResult:
+        """Build the safe-HOLD result returned on any L1-driven shutdown.
+
+        When ``l2_score`` / ``l3_score`` are supplied, the engine had
+        already run those levels (e.g. on the L3-declined-to-override
+        path) and we keep their telemetry in ``level_scores`` so the
+        panels can render the full picture. Otherwise we synthesise
+        zeroed-out skipped placeholders.
+        """
         l1_block_msg = l1_score.rationale or "Level 1 blocked the trade"
         directive = ExecutionDirective(
             action="risk_off",
@@ -262,17 +607,17 @@ class DecisionEngine:
             conviction=0.0,
             direction_strength=0.0,
         )
-        # Carry an explicit zero L2 + L3 to keep DecisionResult.level_scores
-        # well-typed for downstream consumers / panels.
         scores = [
             l1_score,
-            LevelScore(
+            l2_score
+            or LevelScore(
                 level=2,
                 score=0.0,
                 rationale="skipped (L1 short-circuit)",
                 raw={"l2": {"skipped": True}},
             ),
-            LevelScore(
+            l3_score
+            or LevelScore(
                 level=3,
                 score=0.0,
                 rationale="skipped (L1 short-circuit)",
@@ -290,6 +635,225 @@ class DecisionEngine:
             effective_weights=dict(self.weights),
             short_circuited=True,
             short_circuit_reason=l1_block_msg,
+            l1_override_meta=l1_override_meta,
+        )
+
+    def _extract_l1_block_info(
+        self, l1_raw: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Distil L1's raw payload into the L3-friendly audit packet.
+
+        Returns ``{"reasons": [...], "indicators": [...]}`` where each
+        reason carries an ``is_hard`` flag (read directly from the L1
+        source via :func:`_reason_is_hard`, with a defensive legacy
+        fallback) and each indicator row is the flat dict L3 needs to
+        second-guess the technical veto.
+        """
+        if not l1_raw:
+            return {"reasons": [], "indicators": []}
+        reasons: list[dict[str, Any]] = []
+        per_symbol = l1_raw.get("per_symbol") or {}
+
+        def _normalise(r: dict[str, Any], default_symbol: str | None = None) -> dict[str, Any]:
+            return {
+                "code": r.get("code"),
+                "severity": r.get("severity"),
+                "message": r.get("message"),
+                "symbol": r.get("symbol") or default_symbol,
+                "timeframe": r.get("timeframe"),
+                "metadata": r.get("metadata") or {},
+                "is_hard": _reason_is_hard(r),
+            }
+
+        for r in l1_raw.get("reasons") or []:
+            if r.get("severity") != "block":
+                continue
+            reasons.append(_normalise(r))
+        # Deduplicate by (code, symbol, timeframe) - the per-symbol
+        # block lists already exist in `reasons` at the top level, but
+        # walk per_symbol to make sure we don't miss anything when the
+        # raw payload was assembled from a different source.
+        seen_keys = {
+            (r["code"], r.get("symbol"), r.get("timeframe"))
+            for r in reasons
+        }
+        indicators: list[dict[str, Any]] = []
+        for sym, ro in per_symbol.items():
+            for br in ro.get("blocking_reasons") or []:
+                key = (
+                    br.get("code"),
+                    br.get("symbol") or sym,
+                    br.get("timeframe"),
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                reasons.append(_normalise(br, default_symbol=sym))
+            for row in ro.get("rows") or []:
+                indicators.append(
+                    {
+                        "symbol": sym,
+                        "timeframe": row.get("timeframe"),
+                        "close": float(row.get("close", 0) or 0),
+                        "ema_fast": float(row.get("ema_fast", 0) or 0),
+                        "ema_slow": float(row.get("ema_slow", 0) or 0),
+                        "rsi": float(row.get("rsi", 0) or 0),
+                        "atr": float(row.get("atr", 0) or 0),
+                        "atr_pct": float(row.get("atr_pct", 0) or 0),
+                        "trend": row.get("trend", "?"),
+                    }
+                )
+        return {"reasons": reasons, "indicators": indicators}
+
+    def _evaluate_l3_override(
+        self, l3_score: LevelScore
+    ) -> dict[str, Any] | None:
+        """Return L3's override verdict, or ``None`` if it declined.
+
+        L3 only counts as a valid override when:
+
+        * It was a *real* arbiter call (not the synthetic placeholder
+          - which is just a function of L1+L2 and can't honestly
+          contradict an L1 block - and not the safe-HOLD fallback,
+          which means the LLM errored).
+        * It returned ``regime="risk_on"`` with a non-neutral
+          ``direction``.
+        * Its conviction cleared the operator-configured floor
+          (``l3_override_min_conviction``).
+
+        Anything else is treated as "L3 declined to override" and the
+        engine respects the L1 block.
+        """
+        l3_raw = (l3_score.raw or {}).get("l3", {}) or {}
+        if l3_raw.get("synthetic") or l3_raw.get("fallback"):
+            return None
+        response = l3_raw.get("response") or {}
+        regime = str(response.get("regime", "hold"))
+        direction = str(response.get("direction", "neutral"))
+        conviction = float(response.get("conviction", 0.0) or 0.0)
+        intensity = float(response.get("recommended_intensity", 0.0) or 0.0)
+        if regime != "risk_on":
+            return None
+        if direction not in {"long", "short"}:
+            return None
+        if conviction < self.l3_override_min_conviction:
+            return None
+        return {
+            "conviction": conviction,
+            "direction": direction,
+            "regime": regime,
+            "intensity": intensity,
+            "rationale": str(response.get("rationale", ""))[:600],
+        }
+
+    def _l3_overrode_l1(
+        self,
+        *,
+        l1_score: LevelScore,
+        l2_score: LevelScore,
+        l3_score: LevelScore,
+        override: dict[str, Any],
+        l1_block_info: dict[str, Any],
+    ) -> DecisionResult:
+        """Build the DecisionResult for the L3-overrides-L1 path.
+
+        Two design decisions worth their own paragraphs:
+
+        1. **We bypass the weighted aggregator.** L1 voted
+           ``score=0`` (it blocked!), so its 0.25 weight would drag
+           the weighted aggregate well below ``RISK_ON_THRESHOLD``
+           and the engine would refuse to open even though Claude is
+           championing the trade. On the override path we let L3
+           carry the decision directly (conviction, direction,
+           intensity all come from Claude).
+
+        2. **We apply a stacked-veto intensity haircut.** Three
+           independent technical vetoes firing at once is
+           qualitatively riskier than one - so the engine clamps
+           ``intensity`` by a multiplier that decays with
+           ``n_soft_blocks``. Conviction is NOT clamped: we trust
+           Claude's directional read but defensively size down.
+        """
+        l3_dir_sign = 1 if override["direction"] == "long" else -1
+        # The L2 panel still needs the bias/strength for the rationale
+        # tag - read it directly from L2's raw payload.
+        l2_raw = (l2_score.raw or {}).get("l2", {}) or {}
+        bias = str(l2_raw.get("market_bias", "neutral"))
+        bias_strength = float(l2_raw.get("bias_strength", 0.0) or 0.0)
+
+        soft_codes = sorted(
+            {
+                str(r["code"])
+                for r in l1_block_info["reasons"]
+                if not r.get("is_hard")
+            }
+        )
+        hard_codes = sorted(
+            {
+                str(r["code"])
+                for r in l1_block_info["reasons"]
+                if r.get("is_hard")
+            }
+        )
+        n_soft = len(soft_codes)
+        stacked_cap = self._stacked_veto_cap(n_soft)
+        raw_intensity = float(override["intensity"])
+        # ``stacked_cap`` is a MULTIPLIER in (0, 1] on Claude's
+        # intensity; we then clamp back into [0, 1] for safety.
+        calibrated_intensity = max(0.0, min(1.0, stacked_cap * raw_intensity))
+        if calibrated_intensity != raw_intensity:
+            logger.info(
+                "L3 override intensity haircut | n_soft={} cap={:.2f} "
+                "raw={:.2f} -> calibrated={:.2f}",
+                n_soft,
+                stacked_cap,
+                raw_intensity,
+                calibrated_intensity,
+            )
+
+        directive = ExecutionDirective(
+            action="risk_on",
+            side=override["direction"],
+            intensity=calibrated_intensity,
+            rationale=(
+                f"L3-OVERRIDE-L1 (soft={','.join(soft_codes) or '-'}, "
+                f"stacked_cap={stacked_cap:.2f}): {override['rationale']}"
+            ),
+            market_bias=bias,
+            bias_strength=bias_strength,
+            conviction=float(override["conviction"]),
+            direction_strength=1.0,  # L3 took full authority
+        )
+        # We DO emit effective_weights but they're cosmetic on this
+        # path; L3 is the sole decision-maker so we surface that
+        # explicitly (level3=1.0, others=0.0).
+        effective_weights = {"level1": 0.0, "level2": 0.0, "level3": 1.0}
+        override_meta = {
+            "status": "executed",
+            "n_soft_blocks": n_soft,
+            "n_hard_blocks": len(hard_codes),
+            "soft_block_codes": soft_codes,
+            "hard_block_codes": hard_codes,
+            "raw_intensity": raw_intensity,
+            "calibrated_intensity": calibrated_intensity,
+            "stacked_veto_cap": stacked_cap,
+            "l3_conviction": float(override["conviction"]),
+            "l3_direction": override["direction"],
+            "l3_rationale_snippet": str(override.get("rationale", ""))[:240],
+        }
+        return DecisionResult(
+            final_score=float(override["conviction"]),
+            regime="risk_on",
+            directive=directive,
+            level_scores=[l1_score, l2_score, l3_score],
+            weights=self.weights,
+            final_direction=l3_dir_sign,
+            direction_strength=1.0,
+            effective_weights=effective_weights,
+            short_circuited=False,
+            short_circuit_reason=None,
+            l1_overridden_by_l3=True,
+            l1_override_meta=override_meta,
         )
 
     async def _maybe_level3(
@@ -297,6 +861,8 @@ class DecisionEngine:
         l1_score: LevelScore,
         l2_score: LevelScore,
         context: dict[str, Any],
+        *,
+        l1_block_info: dict[str, Any] | None = None,
     ) -> LevelScore:
         """Build the arbiter briefing and call Level 3.
 
@@ -345,6 +911,12 @@ class DecisionEngine:
             context.get("symbol")
             or (context.get("symbols") or ["BTC-PERP"])[0]
         )
+        l1_passes = bool(l1_raw.get("passes", True))
+        # If the caller didn't pre-compute the block info we derive it
+        # on the fly - this keeps test paths simple. On the live L1-
+        # blocked path the caller will have populated it already.
+        if l1_block_info is None:
+            l1_block_info = self._extract_l1_block_info(l1_raw)
         briefing = ArbiterBriefing(
             primary_symbol=primary_symbol,
             level1_conviction=float(l1_score.score),
@@ -352,7 +924,7 @@ class DecisionEngine:
                 getattr(l1_score, "direction_sign", 0) or 0
             ),
             level1_rationale=l1_score.rationale,
-            level1_passes=bool(l1_raw.get("passes", True)),
+            level1_passes=l1_passes,
             level1_raw=l1_raw,
             level2_conviction=float(l2_score.score),
             level2_direction_sign=int(
@@ -365,6 +937,9 @@ class DecisionEngine:
             level2_regime=str(l2_raw.get("regime", "neutral")),
             level2_raw=l2_raw,
             market_snapshot=context,
+            l1_blocked=not l1_passes,
+            l1_blocked_reasons=l1_block_info["reasons"],
+            l1_indicators=l1_block_info["indicators"],
         )
         return await self.level3.score(briefing)
 

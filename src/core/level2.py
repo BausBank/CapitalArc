@@ -102,6 +102,17 @@ class Level2Config:
     # Used by the heuristic regime classifier when the Dune-side
     # `market_sentiment` query is not configured.
     risk_on_heat: float = 0.62
+    # When True AND a :class:`HyperliquidIntelligenceAdapter` is
+    # wired on ``Level2(hyperliquid_intel=...)``, the per-symbol
+    # funding / open_interest / volume / cum_funding values produced
+    # by Dune are OVERLAID with real Hyperliquid Info API readings
+    # and the corresponding ``metric_status`` entries flip from
+    # ``dune:<id>`` to ``hyperliquid:<endpoint>``. Flipping this to
+    # False is the operator's one-flag rollback to the pure-Dune
+    # behaviour, useful for A/B comparison or while debugging the HL
+    # integration. Mirrors ``HYPERLIQUID_INTELLIGENCE_ENABLED``
+    # in .env.
+    prefer_hyperliquid_for_perp_metrics: bool = True
     risk_off_heat: float = 0.38
 
 
@@ -112,10 +123,19 @@ class Level2Config:
 
 @dataclass
 class MetricStatus:
-    """Lightweight provenance carrier for a single metric."""
+    """Lightweight provenance carrier for a single metric.
+
+    ``source`` values currently in use:
+
+    * ``"dune:<query_id>"``                 - Dune MCP saved query.
+    * ``"hyperliquid:<endpoint(s)>"``       - Real perp data from the
+      Hyperliquid Info API via :class:`HyperliquidIntelligenceAdapter`
+      (e.g. ``"hyperliquid:metaAndAssetCtxs"``).
+    * ``"n/a"`` / ``"error"``               - missing config / failure.
+    """
 
     name: str
-    source: str          # "dune:<id>" | "n/a" | "error"
+    source: str          # see docstring for the enumeration
     rows: int = 0
     query_id: int | None = None
     cached: bool = False
@@ -123,7 +143,11 @@ class MetricStatus:
 
     @property
     def available(self) -> bool:
-        return self.source.startswith("dune:")
+        # ``hyperliquid:`` is treated as "available" exactly like
+        # ``dune:`` — it's a real, parameterised data source feeding
+        # the L2 metric. Anything else (``n/a`` / ``error``) is
+        # unavailable.
+        return self.source.startswith(("dune:", "hyperliquid:"))
 
 
 @dataclass
@@ -148,6 +172,15 @@ class OpenInterestSnapshot:
     delta_1h_pct: float = 0.0
     delta_4h_pct: float = 0.0
     delta_24h_pct: float = 0.0
+    # ``True`` means ``delta_1h_pct`` / ``delta_24h_pct`` are real
+    # measurements and may feed bias / heat calculations. ``False``
+    # means the deltas are unavailable (HL ring buffer warming up,
+    # spot-volume proxy denominator unreliable, etc.) and downstream
+    # voters MUST skip them entirely instead of treating zero - or an
+    # extreme placeholder value - as a directional signal. Defaults to
+    # ``True`` so the Dune-derived path (which has no warming-up
+    # concept) is unaffected.
+    oi_delta_available: bool = True
 
 
 @dataclass
@@ -259,7 +292,23 @@ class Level2Intelligence:
 
 
 class Level2:
-    """On-chain intelligence level, sourced only from Dune MCP."""
+    """On-chain intelligence level.
+
+    Reads come from TWO sources, blended per-metric so each number
+    in the L2 panel has clearly stamped provenance:
+
+    * **Hyperliquid Info API** (via
+      :class:`HyperliquidIntelligenceAdapter`) for real perp signals:
+      ``funding``, ``open_interest``, ``volume``, ``cum_funding``.
+      Pinned to mainnet by default (see ``HYPERLIQUID_DATA_API_URL``)
+      so the data plane stays honest even when execution is on
+      testnet.
+    * **Dune MCP** (saved queries against ``dex.trades``) for
+      signals Hyperliquid doesn't expose: ``long_short_ratio``,
+      ``whale_activity``, ``vault_flows``, ``market_sentiment``.
+      Also serves as the **fallback** for the HL-sourced metrics
+      whenever the adapter is disabled, errored, or warming up.
+    """
 
     LEVEL = 2
 
@@ -267,9 +316,20 @@ class Level2:
         self,
         config: Level2Config | None = None,
         dune: DuneMCPClient | None = None,
+        hyperliquid_intel: Any | None = None,
     ) -> None:
         self.config = config or Level2Config()
         self.dune = dune
+        # Optional :class:`HyperliquidIntelligenceAdapter`. When set
+        # AND ``self.config.prefer_hyperliquid_for_perp_metrics`` is
+        # True, the per-symbol funding / OI / volume / cum_funding
+        # values returned by Dune are overlaid with the live HL Info
+        # API readings, and the corresponding entries in
+        # ``metric_status`` flip from ``dune:<id>`` to
+        # ``hyperliquid:<endpoint>``. Operators can disable the
+        # overlay by setting ``HYPERLIQUID_INTELLIGENCE_ENABLED=false``
+        # in .env — Level 2 then degrades back to the pure-Dune path.
+        self.hyperliquid_intel = hyperliquid_intel
         self._cache: tuple[Level2Intelligence, float] | None = None
 
     # ------------------------------------------------------------------
@@ -368,6 +428,24 @@ class Level2:
             per_symbol[sym] = self._build_symbol_intel(sym, fetches)
         vault_flow = self._build_vault_flow(fetches["vault_flows"])
 
+        # ---- Hyperliquid overlay (Day 6+) -----------------------------
+        # If a HyperliquidIntelligenceAdapter is wired AND the operator
+        # hasn't disabled the overlay, replace the spot-DEX-derived
+        # perp proxies (funding / OI / volume / cum_funding) with real
+        # Hyperliquid Info-API data. The overlay is per-symbol and
+        # per-metric: any failure (whole HL outage, single coin
+        # missing) transparently leaves the Dune proxy in place for
+        # the affected slot. ``hl_provenance`` carries the source
+        # strings the panel will stamp into ``metric_status`` below.
+        hl_provenance: dict[str, str] = {}
+        if (
+            self.hyperliquid_intel is not None
+            and self.config.prefer_hyperliquid_for_perp_metrics
+        ):
+            hl_provenance = await self._apply_hyperliquid_overlay(
+                symbols, per_symbol
+            )
+
         # ---- regime / heat --------------------------------------------
         # Branch on whether Dune returned a row at all (not on whether heat
         # is null): if the query ran and gave us a row, the Dune result is
@@ -411,6 +489,23 @@ class Level2:
         metric_status = {
             name: _to_status(name, fetch) for name, fetch in fetches.items()
         }
+        # Stamp HL provenance on top of Dune's: any metric the HL
+        # overlay successfully provided should show up in the panel
+        # as ``hyperliquid:...`` instead of ``dune:<id>``. We preserve
+        # the original row count from the Dune fetch (it's still the
+        # underlying parameterised query the operator wired) so an
+        # operator who switches the overlay off later sees the same
+        # provenance row count.
+        for metric_name, hl_source in hl_provenance.items():
+            existing = metric_status.get(metric_name)
+            metric_status[metric_name] = MetricStatus(
+                name=metric_name,
+                source=hl_source,
+                rows=existing.rows if existing else 0,
+                query_id=existing.query_id if existing else None,
+                cached=False,
+                note="overlaid by HyperliquidIntelligenceAdapter",
+            )
 
         notes: list[str] = []
         if not dune_healthy:
@@ -560,6 +655,134 @@ class Level2:
             cum_funding=cf,
         )
 
+    # ------------------------------------------------------------------
+    # Hyperliquid intelligence overlay (Day 6+)
+    # ------------------------------------------------------------------
+
+    async def _apply_hyperliquid_overlay(
+        self,
+        symbols: list[str],
+        per_symbol: dict[str, SymbolIntel],
+    ) -> dict[str, str]:
+        """Overlay real HL Info-API readings on the Dune-derived intel.
+
+        Mutates ``per_symbol`` in-place: each symbol's ``funding``,
+        ``open_interest``, ``volume`` and ``cum_funding`` are
+        replaced with HL data whenever the adapter returned a clean
+        (non-errored) reading for that symbol. Failed symbols and
+        failed snapshots leave the Dune proxy untouched.
+
+        Returns the per-metric provenance map ("metric_name" ->
+        "hyperliquid:<endpoint>") for the L2 ``metric_status`` table.
+        Returns an empty dict when the whole HL fetch failed and
+        Level 2 should remain fully on the Dune path.
+        """
+        snap = await self.hyperliquid_intel.fetch_snapshot(symbols)
+        if snap.error:
+            # Whole-snapshot failure: leave Dune values in place and
+            # publish nothing in the provenance map so the panel
+            # keeps showing ``dune:<id>``. The operator sees the
+            # warning in the logs.
+            logger.warning(
+                "HL overlay skipped (snapshot error): {}", snap.error
+            )
+            return {}
+
+        any_symbol_overlaid = False
+        for sym in symbols:
+            hl_sym = snap.per_symbol.get(sym)
+            if hl_sym is None or hl_sym.error is not None:
+                # Per-symbol failure (no coin mapping, coin missing
+                # from HL universe, parsing error). Keep the Dune
+                # proxy for THIS symbol; HL data may still apply to
+                # the other symbol in the batch.
+                continue
+            intel = per_symbol.get(sym)
+            if intel is None:
+                continue
+            any_symbol_overlaid = True
+
+            # Funding overlay: copy HL fields onto the FundingSnapshot
+            # the L2 panel renders. We keep the same field names so
+            # downstream consumers (panel, L3 briefing, market-bias
+            # voter) don't care which source provided the number.
+            intel.funding = FundingSnapshot(
+                symbol=sym,
+                current_rate=hl_sym.funding.current_rate_8h,
+                rate_8h_change=hl_sym.funding.rate_8h_change,
+                # 24h delta of funding rates is not a standard HL
+                # metric; keep the 8h-change as a stand-in (same
+                # sign / scale) so existing bias logic still works.
+                rate_24h_change=hl_sym.funding.rate_8h_change,
+                weighted_average_24h=(
+                    hl_sym.funding.weighted_average_24h * 8.0
+                ),  # weighted_average is hourly; convert to 8h scale
+                annualised_pct=hl_sym.funding.annualised_pct,
+            )
+
+            # Open-interest overlay. ``delta_*_pct`` come from the
+            # adapter's in-process ring buffer; ``history_unavailable``
+            # = True means we don't yet have a sample old enough for
+            # this horizon (typical for the first cycle after a
+            # restart). We still publish HL data: zeroed deltas with
+            # a real current OI is more honest than a spot-derived
+            # proxy.
+            if hl_sym.open_interest.history_unavailable:
+                intel.notes.append(
+                    f"HL OI history warming up for {sym} "
+                    f"(samples={hl_sym.open_interest.history_samples})"
+                )
+            intel.open_interest = OpenInterestSnapshot(
+                symbol=sym,
+                current_contracts=hl_sym.open_interest.current_contracts,
+                current_value_usd=hl_sym.open_interest.current_notional_usd,
+                delta_1h_pct=hl_sym.open_interest.delta_1h_pct,
+                delta_4h_pct=hl_sym.open_interest.delta_4h_pct,
+                delta_24h_pct=hl_sym.open_interest.delta_24h_pct,
+                oi_delta_available=not hl_sym.open_interest.history_unavailable,
+            )
+
+            # Volume overlay. We use HL's mark price as ``last_price``
+            # (the field downstream renderers expect) and HL's
+            # 24h-vs-prev-day price change for the ``price_change_*``
+            # field. Volume-spike z-score is not a HL metric and is
+            # preserved from the Dune proxy (existing intel.volume).
+            old_spike = intel.volume.spike_detected
+            old_z = intel.volume.spike_zscore
+            old_v1h = intel.volume.volume_1h_usd
+            intel.volume = VolumeSnapshot(
+                symbol=sym,
+                last_price=hl_sym.volume.mark_price,
+                price_change_pct_24h=hl_sym.volume.price_change_pct_24h,
+                volume_24h_usd=hl_sym.volume.volume_24h_usd,
+                # HL Info doesn't expose 1h notional volume; preserve
+                # the Dune-derived value so the spike heuristic
+                # remains useful.
+                volume_1h_usd=old_v1h,
+                spike_detected=old_spike,
+                spike_zscore=old_z,
+            )
+
+            # Cumulative funding overlay - approximate (HL doesn't
+            # expose historical OI, see HLCumulativeFunding docstring).
+            intel.cum_funding = CumulativeFundingSnapshot(
+                symbol=sym,
+                longs_paid_usd=hl_sym.cum_funding.longs_paid_usd,
+                shorts_paid_usd=hl_sym.cum_funding.shorts_paid_usd,
+                net_flow_usd=hl_sym.cum_funding.net_flow_usd,
+                window_hours=hl_sym.cum_funding.window_hours,
+            )
+
+        if not any_symbol_overlaid:
+            # The fetch succeeded but every symbol was missing /
+            # un-mappable - report no provenance so the L2 panel
+            # transparently keeps Dune attribution.
+            logger.warning(
+                "HL overlay produced no usable symbol data; staying on Dune."
+            )
+            return {}
+        return dict(snap.sources)
+
     def _extract_funding(
         self, symbol: str, fetch: MetricFetch
     ) -> FundingSnapshot:
@@ -655,7 +878,13 @@ class Level2:
     ) -> WhaleSnapshot:
         row = self._row_for_symbol(fetch.rows, symbol)
         if row is None:
-            # Fallback: derive whale flag from OI 1h delta.
+            # Fallback: derive whale flag from OI 1h delta. Skip
+            # entirely when the OI delta is not a real measurement
+            # (warming up / unreliable proxy) - otherwise an extreme
+            # placeholder like -99% would manufacture a phantom whale
+            # vote.
+            if not oi.oi_delta_available:
+                return WhaleSnapshot(symbol=symbol)
             thresh = self.config.whale_oi_delta_pct
             if abs(oi.delta_1h_pct) < thresh:
                 return WhaleSnapshot(symbol=symbol)
@@ -761,7 +990,11 @@ class Level2:
         for intel in per_symbol.values():
             base = 0.5
             base += max(-0.10, min(0.10, intel.funding.current_rate * 20))
-            base += max(-0.10, min(0.10, intel.open_interest.delta_1h_pct / 100.0 * 2))
+            if intel.open_interest.oi_delta_available:
+                base += max(
+                    -0.10,
+                    min(0.10, intel.open_interest.delta_1h_pct / 100.0 * 2),
+                )
             base += max(
                 -0.15,
                 min(0.15, intel.volume.price_change_pct_24h / 100.0),
@@ -845,12 +1078,17 @@ class Level2:
                 bear_hits.append(f"{sym} fund={funding*100:.4f}%")
 
             # --- OI 1h delta: > +1% = capital flowing into perps quickly.
-            if oi_1h > 1.0:
-                bull_votes += min(1.0, oi_1h / 5.0)
-                bull_hits.append(f"{sym} OI(1h)=+{oi_1h:.2f}%")
-            elif oi_1h < -1.0:
-                bear_votes += min(1.0, -oi_1h / 5.0)
-                bear_hits.append(f"{sym} OI(1h)={oi_1h:.2f}%")
+            # Skip the OI vote entirely when the delta is not a real
+            # measurement (HL ring buffer warming up, Dune spot-volume
+            # denominator unreliable, etc.) - we can't tell a flat OI
+            # from "no data yet" or from a -99% placeholder.
+            if intel.open_interest.oi_delta_available:
+                if oi_1h > 1.0:
+                    bull_votes += min(1.0, oi_1h / 5.0)
+                    bull_hits.append(f"{sym} OI(1h)=+{oi_1h:.2f}%")
+                elif oi_1h < -1.0:
+                    bear_votes += min(1.0, -oi_1h / 5.0)
+                    bear_hits.append(f"{sym} OI(1h)={oi_1h:.2f}%")
 
             # --- 24h price change is the tape itself.
             if price_change > 0.5:
@@ -878,10 +1116,13 @@ class Level2:
                     bear_hits.append(f"{sym} whales=distrib")
 
             # --- 24h OI delta (smaller weight than 1h - confirms regime).
-            if oi_24h > 2.0:
-                bull_votes += min(0.5, oi_24h / 20.0)
-            elif oi_24h < -2.0:
-                bear_votes += min(0.5, -oi_24h / 20.0)
+            # Same availability guard as the 1h block: skip when the
+            # underlying OI delta isn't a real measurement.
+            if intel.open_interest.oi_delta_available:
+                if oi_24h > 2.0:
+                    bull_votes += min(0.5, oi_24h / 20.0)
+                elif oi_24h < -2.0:
+                    bear_votes += min(0.5, -oi_24h / 20.0)
 
         # --- Market heat extremes are a tie-breaker.
         if market_heat >= 0.6:
@@ -1052,6 +1293,7 @@ def _intel_to_dict(intel: Level2Intelligence) -> dict[str, Any]:
                     "delta_1h_pct": s.open_interest.delta_1h_pct,
                     "delta_4h_pct": s.open_interest.delta_4h_pct,
                     "delta_24h_pct": s.open_interest.delta_24h_pct,
+                    "oi_delta_available": s.open_interest.oi_delta_available,
                 },
                 "volume": {
                     "last_price": s.volume.last_price,

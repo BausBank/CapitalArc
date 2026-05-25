@@ -283,7 +283,21 @@ class CircleWallet:
         poll_seconds: float = 2.0,
         timeout_seconds: float = 180.0,
     ) -> TxResult:
-        """Poll a Circle transaction until terminal state or timeout."""
+        """Poll a Circle transaction until terminal state or timeout.
+
+        Failure modes are split into two classes so the operator
+        never has to watch a 90-second WARNING storm:
+
+        * **Client errors (HTTP 4xx)** — the request itself is wrong:
+          malformed id, unknown id, unauthorized. Retrying cannot
+          fix that. We log ONCE at error level and return
+          immediately with ``state="FAILED"``. The most common
+          trigger is calling ``wait_for_tx`` with a non-Circle id
+          (e.g. a Hyperliquid order id) — the caller is supposed to
+          filter those upstream, but we double-check here.
+        * **Transient errors (HTTP 5xx / network)** — keep polling
+          on the assumption Circle will recover.
+        """
         if tx_id.startswith("dryrun-"):
             return TxResult(tx_id=tx_id, state="DRY_RUN")
 
@@ -302,7 +316,29 @@ class CircleWallet:
                         tx_hash=data.get("txHash"),
                         raw=data,
                     )
+            except httpx.HTTPStatusError as exc:
+                # 4xx: client-side error, retrying is pointless.
+                # The most common cause is a non-Circle tx id; the
+                # caller should be filtering those out, but we fail
+                # fast here as a defence-in-depth.
+                status = exc.response.status_code
+                if 400 <= status < 500:
+                    logger.error(
+                        "wait_for_tx aborted on HTTP {} for {} - "
+                        "Circle rejected the request (likely a "
+                        "non-Circle tx id); not retrying.",
+                        status, tx_id,
+                    )
+                    return TxResult(tx_id=tx_id, state="FAILED")
+                logger.warning(
+                    "wait_for_tx transient HTTP {} for {}: {}",
+                    status, tx_id, exc,
+                )
             except httpx.HTTPError as exc:
+                # Network blip / timeout - log once per cycle and
+                # keep polling. (httpx raises subclasses of
+                # HTTPError; HTTPStatusError is handled above so
+                # this branch is for connect / read / pool errors.)
                 logger.warning("wait_for_tx poll error: {}", exc)
             await asyncio.sleep(poll_seconds)
             elapsed += poll_seconds

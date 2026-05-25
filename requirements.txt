@@ -20,6 +20,14 @@ web3==6.20.1
 eth-account==0.11.3
 eth-abi==5.1.0
 
+# --- Primary trading venue: Hyperliquid Testnet ---
+# Hyperliquid uses a non-standard EIP-712 signing scheme (msgpack-encoded
+# "action" payload + L1 phantom-agent address). Rolling our own would be
+# fragile, so we lean on the official SDK which is maintained by the
+# Hyperliquid team. The SDK pulls in eth-account/web3 which are already
+# pinned above; no other transitive surprises.
+hyperliquid-python-sdk==0.16.0
+
 # --- Circle Developer-Controlled Wallets SDK (scripts/setup) ---
 # Pinned to 9.0.0: version 9.1.0 reorganised modules (`circle.web3.utils`
 # was removed) and introduced an unmet `lazy_imports` dep. Do not bump

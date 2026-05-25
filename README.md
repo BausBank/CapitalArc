@@ -16,10 +16,10 @@
 
 **CapitalArc** is a fully on-chain AI agent that reads the market regime in real time and reallocates capital autonomously:
 
-- 📈 **Risk-on regime** — the agent opens **long or short** leveraged perp positions on the **Arc Perp DEX**, sized by a vol-targeted risk budget.
-- 🛡️ **Risk-off regime** — capital rotates into **USYC** (yield-bearing tokenized USDC), preserving value with native institutional yield while waiting for the next setup.
+- 📈 **Risk-on regime** — the agent opens **long or short** leveraged perp positions on **Hyperliquid Testnet**, sized by a vol-targeted risk budget and supervised by a per-position **TP / SL / trailing-stop / side-flip** manager.
+- 🛡️ **Risk-off regime** — perps are flattened on Hyperliquid, margin is withdrawn back, and the freed USDC rotates into **USYC** on Arc (yield-bearing tokenized USDC), preserving value with native institutional yield while waiting for the next setup.
 
-Decisions come from a **cascading three-level engine** (technicals → on-chain intelligence → LLM arbiter) that separates **conviction** ("do we act?") from **direction** ("which side?"). Execution rides the full **Circle** stack — CCTP for liquidity, Developer-Controlled Wallets for non-custodial signing, Circle Paymaster for gasless UX, USYC for the yield leg — on **Arc**.
+Decisions come from a **cascading three-level engine** (technicals → on-chain intelligence → LLM arbiter) that separates **conviction** ("do we act?") from **direction** ("which side?"). Trading rides **Hyperliquid Testnet** via the official `hyperliquid-python-sdk` (EIP-712 L1 actions over the phantom-agent domain). The treasury & yield leg keeps using the full **Circle** stack on **Arc** — CCTP for liquidity, Developer-Controlled Wallets for non-custodial signing, Circle Paymaster for gasless UX, USYC for yield.
 
 > Built for the **Agora Agents Hackathon (Canteen × Circle on Arc)**, request **RFB 04 — Adaptive Portfolio Manager**.
 
@@ -29,15 +29,21 @@ Decisions come from a **cascading three-level engine** (technicals → on-chain 
 
 - 🧠 **Three-level cascading decision engine** — fast deterministic technicals (L1) → on-chain intelligence (L2) → Claude Sonnet 4.6 final arbiter (L3, via OpenRouter) with strict JSON verdict + Pydantic-validated safe-HOLD fallback.
 - ⚖️ **Decoupled conviction & direction** — the engine separates "how strongly do we want to act?" from "which way?", so a high-conviction bearish setup correctly opens a **SHORT**, not a confused close. _(See [Architecture](#-architecture) below.)_
+- 🎯 **Hyperliquid Testnet as the trading venue** — real long/short perp positions signed via the official `hyperliquid-python-sdk` (EIP-712 L1 actions). Hard caps `HYPERLIQUID_MAX_LEVERAGE` / `HYPERLIQUID_MAX_POSITION_USD` enforced in the executor before any SDK call. Two independent API URLs (`HYPERLIQUID_API_URL` = testnet execution, `HYPERLIQUID_DATA_API_URL` = mainnet market data) so the data plane stays honest even when execution runs on testnet.
+- 🛠️ **`PositionManager` — Two-Tier (Fast Path + Smart Path)** — runs every cycle BEFORE the regime dispatch. The **Fast Path** (always-on, deterministic, ATR-aware) handles a 9-trigger priority ladder: `daily_dd_guard > stop_loss > vol_spike_close > time_exit > take_profit > partial_take_profit > trailing_stop > side_flip > re_evaluation`, with state-only advisory verbs (`breakeven_arm`, `vol_spike_warn`). The **Smart Path** (Claude Sonnet 4.6, event-triggered) fires ONLY on material change (price ≥ 1.5×ATR, funding spike, whale activity, OI delta, or scheduled refresh) and can override the Fast Path verdict. Per-asset ATR caps (BTC ≤ 3%, ETH ≤ 4% on 1h) gate new opens; a portfolio-wide daily-DD kill switch flattens everything and refuses new opens on session loss. "HOLD must be earned" — pure logic, the router owns the actual close call.
+- 🔁 **Auto-allocation pipeline** — risk-on opens on Hyperliquid (redeeming USYC first if Arc cash is short); risk-off flattens perps, withdraws margin, and mints USYC with the leftover USDC (bounded by configurable reserve + min/max rotation amounts). The USYC leg is optional via `USYC_ENABLED=false` for clean perp-only live tests.
 - 📊 **Volatility-targeted sizing** — `size = equity × target_risk_pct / (stop_atr_mult × ATR%/100)`. The Kelly-fraction-style recipe used by every systematic CTA shop.
 - 🛟 **Gradient drawdown haircut** — intensity smoothly decays as drawdown grows (`× max(0, 1 − (dd/max_dd)^exponent)`), no cliff-edge stops.
-- 🔄 **L1 short-circuit** — any blocking L1 rule (RSI extreme, ATR out-of-band, trend mixed, drawdown breach) bypasses L2/L3 immediately. Saves API budget, stays honest.
-- 🔗 **Dune MCP as the single source of truth** — every signal (L1 OHLCV + 8 L2 metrics) reads through saved Dune queries with per-metric provenance. No CEX feeds. No RPC market-data scraping.
-- 🪞 **Chain-portable** — `DUNE_CHAIN=ethereum|base|arbitrum` is a one-line switch; SQL templates are parameterised by chain + token addresses.
-- ⛽ **Gasless on-chain execution** — Circle DCW + Paymaster, RSA-OAEP-SHA256-encrypted entity secret, sponsored tx on Arc Testnet.
-- 🎛️ **Seven-panel rich CLI** — every cycle prints market context, L1, L2, **L3 Claude verdict** (provider, model, latency, active `Mode` badge, section-coloured structured rationale, bulleted key factors), final decision, execution plan and on-chain results with conviction/direction/sizing breakdown.
-- 🧑‍⚖️ **Two L3 personas via `L3_MODE`** — `critical` (default; independent senior-risk-manager persona with veto authority and a mandatory 5-section rationale `Market Context → Key Signals Analysis → Contradictions & Risks → My Independent View → Final Recommendation`) or `standard` (concise trader voice, 1-2 sentence rationale). One-line `.env` swap; nothing else changes.
-- 🧪 **Offline scenario tester** — `python main.py --test-bias bearish --test-conviction 0.52` exercises the live decision branch with synthetic inputs, no Dune/Circle calls required.
+- 🛂 **L1 hard/soft block taxonomy with L3 override** — L1 reasons carry an explicit `is_hard` flag plus marginality metadata (`marginal / moderate / decisive`). Hard blocks (`drawdown_breach`, `ohlcv_unavailable`) always short-circuit. Soft blocks (RSI / ATR / trend-mixed) are eligible for L3 audit & override, with a **stacked-veto intensity haircut** (1 block → ×1.0, 2 → ×0.7, 3 → ×0.5, 4+ → ×0.35) so overriding compound vetoes shrinks position size proportionally. Every override is auditable via `DecisionResult.l1_override_meta` and rendered as an `L1 OVERRIDDEN BY L3` console banner.
+- 🌐 **Real perp data via `HyperliquidIntelligenceAdapter`** — Level 2's funding / OI / volume / cum-funding metrics are pulled live from Hyperliquid's `metaAndAssetCtxs` + `fundingHistory` Info endpoints (an in-process ring buffer fills in the 1h/4h/24h OI deltas the API doesn't natively expose), overlaying the Dune spot-derived proxies. The provenance map keeps `dune:<id>` vs `hyperliquid:<endpoint>` visible per metric.
+- 🔗 **Dune MCP as the analytical backbone** — L1 OHLCV + the on-chain L2 metrics (whales, vault flows, L/S, market sentiment) still read through saved Dune queries with per-metric provenance. No CEX feeds. No RPC market-data scraping.
+- 🪞 **Chain-portable analytics** — `DUNE_CHAIN=ethereum|base|arbitrum` is a one-line switch; SQL templates are parameterised by chain + token addresses.
+- ⛽ **Gasless treasury on Arc** — Circle DCW + Paymaster, RSA-OAEP-SHA256-encrypted entity secret, sponsored tx on Arc Testnet for the USYC / CCTP legs.
+- 🎛️ **Eight-panel rich CLI** — every cycle prints market context, L1, L2, **L3 Claude verdict** (provider, model, latency, `Mode` badge, `Aggression` badge, section-coloured rationale, bulleted key factors, raw → calibrated breakdown when calibration changed the verdict), final decision (incl. `L1 OVERRIDDEN BY L3` banner when applicable), execution plan with sizing pipeline, **Position Review** (TP/SL/trailing prices vs live mid + per-position trigger badges) and on-chain results.
+- 🧑‍⚖️ **Two L3 personas via `L3_MODE`** — `critical` (default; independent senior-risk-manager persona with veto authority, a Day-6 decision matrix, per-asset ATR caps, STRICT RESPONSE LENGTH RULES, and a mandatory 5-section rationale `Market Context → Key Signals Analysis → Contradictions & Risks → My Independent View → Final Recommendation`) or `standard` (concise trader voice, 1-2 sentence rationale). One-line `.env` swap; nothing else changes.
+- 🎚️ **L3 aggression calibration (`L3_AGGRESSION`)** — `conservative` / `balanced` (default) / `aggressive` post-validation knob with a `HOLD-rescue` rule under `aggressive`: when Claude returns HOLD but L1 passes AND L2 conviction ≥ `L3_HOLD_RESCUE_L2_MIN`, the engine flips to a low-intensity OPEN. In-process `_L3Telemetry` counter tracks the held / opened / rescued mix so operators can spot over-conservatism in live runs.
+- ⏰ **Configurable loop cadence** — `DECISION_INTERVAL_SECONDS=600` (10-minute default) bounds OpenRouter and Dune API costs in `--loop` mode without missing meaningful moves on the L1 15m/1h timeframes. `0` removes the sleep for back-to-back replay runs.
+- 🧪 **Offline scenario testers** — `python main.py --test-bias bearish --test-conviction 0.52` exercises the live decision branch with synthetic inputs; `python main.py --test-allocation take_profit` (and `stop_loss` / `side_flip` / `re_evaluation`) exercises each `PositionManager` trigger without any Dune / Circle / SDK calls.
 
 ---
 
@@ -46,28 +52,40 @@ Decisions come from a **cascading three-level engine** (technicals → on-chain 
 ### Three-level decision engine
 
 ```
-                +-----------------------------------------------------+
-                |                  Decision Engine                    |
-                |  +--------+   +--------+   +----------------------+ |
-   Market  ---> |  | L1 TA  |  | L2 OnC |  | L3 Claude Sonnet 4.6 | | ---> (conviction, direction)
-   Data         |  | rules  |  | (Dune) |  |    (final arbiter)   | |
-                |  +--------+   +--------+   +----------------------+ |
-                +-----------------------------------------------------+
+                +-------------------------------------------------------+
+                |                  Decision Engine                      |
+                |  +--------+   +--------+   +----------------------+   |
+   Market  ---> |  | L1 TA  |  | L2 OnC |  | L3 Claude Sonnet 4.6 |     | ---> (conviction, direction)
+   Data         |  | rules  |  | (Dune) |  |    (final arbiter)   |     |
+                |  +--------+   +--------+   +----------------------+   |
+                +-------------------------------------------------------+
                                        |
                                        v
-                +-----------------------------------------------------+
-                |                Allocation Router                    |
-                |  conviction >= RISK_ON + direction != 0 -> Arc Perp |
-                |  conviction <= RISK_OFF                  -> USYC    |
-                |  mid-band + strong direction             -> open    |
-                |  mid-band + neutral                      -> hold    |
-                +-----------------------------------------------------+
+                +-------------------------------------------------------+
+                |  Position Manager  (two-tier, runs first per cycle)   |
+                |  Fast Path : daily-DD / dyn-SL / vol-spike / time     |
+                |              dyn-TP / partial-TP / trail / flip       |
+                |              re-eval / breakeven-arm (state)          |
+                |  Smart Path: Claude on material change ONLY           |
+                |              (price>=1.5xATR | funding | whales | OI) |
+                |              can override Fast Path verdict           |
+                +-------------------------------------------------------+
                                        |
                                        v
-                +-----------------------------------------------------+
-                |  Execution: Circle DCW + Paymaster + Vol-targeted   |
-                |  sizing + Gradient drawdown haircut                 |
-                +-----------------------------------------------------+
+                +-------------------------------------------------------+
+                |                Allocation Router                      |
+                |  conviction >= RISK_ON + direction != 0 -> Hyperliquid|
+                |  conviction <= RISK_OFF                  -> USYC      |
+                |  mid-band + strong direction             -> open      |
+                |  mid-band + neutral                      -> hold      |
+                +-------------------------------------------------------+
+                                       |
+                                       v
+                +-------------------------------------------------------+
+                |  Vol-targeted sizing  +  Gradient drawdown haircut    |
+                | TRADING:  Hyperliquid Testnet (hyperliquid-python-sdk)|
+                | TREASURY: Arc + Circle DCW + Paymaster + USYC + CCTP  |
+                +-------------------------------------------------------+
 ```
 
 | Level | Signal source                          | Role                                              | Default weight |
@@ -97,11 +115,11 @@ Direction votes are weighted by their **own conviction**, so a wishy-washy level
 
 ### Per-level mechanics
 
-| Level | Conviction formula                                              | Direction sign                      |
-|-------|-----------------------------------------------------------------|-------------------------------------|
-| L1    | `avg(per-symbol trend strength)` — no `0.5` floor              | Sign of primary symbol's trend      |
+| Level | Conviction formula                                              | Direction sign                                  |
+|-------|-----------------------------------------------------------------|-------------------------------------            |
+| L1    | `avg(per-symbol trend strength)` — no `0.5` floor               | Sign of primary symbol's trend                  |
 | L2    | `max(2 × |heat − 0.5|, bias_strength)`                          | Sign of `market_bias` (bullish/bearish/neutral) |
-| L3    | Claude Sonnet 4.6 `conviction ∈ [0, 1]` (strict JSON)            | Claude `direction ∈ {long, short, neutral}` |
+| L3    | Claude Sonnet 4.6 `conviction ∈ [0, 1]` (strict JSON)           | Claude `direction ∈ {long, short, neutral}`     |
 
 > 💡 **Why `max(2·|heat-0.5|, bias_strength)` for L2?** Heat alone is directional (0.85 = bullish, 0.15 = bearish), so it makes a bad *conviction* signal — both extremes are equally decisive on-chain. The `2·|heat-0.5|` term folds heat into a symmetric conviction; the `max(..., bias_strength)` term catches the case where heat sits near neutral but on-chain signals (funding, OI, whales) point decisively one way.
 
@@ -115,7 +133,16 @@ mid-band AND direction_strength ≥ STRONG_BIAS_OPEN →  open at reduced intens
 mid-band AND direction_strength < STRONG_BIAS_OPEN →  hold
 ```
 
-The L1 short-circuit always wins: any blocking L1 rule sets `final_conviction = 0`, skips L2/L3, and forces risk-off.
+### Cascade — "always invite L3" (Day 5+)
+
+The cascade no longer short-circuits at L1. **L2 and L3 are always invoked**, so Claude is given full situational awareness on every cycle — including the per-`(symbol, timeframe)` indicator snapshot L1 actually saw and a marginality-labelled list of the blocking reasons. The short-circuit logic moved to AFTER L3:
+
+- **Hard L1 block** (`drawdown_breach`, `ohlcv_unavailable`) → forced risk-off. If L3 tried to risk_on anyway, a WARNING logs that the override was IGNORED. Drawdown and missing data are sacred.
+- **Soft L1 block + real L3 with `conviction ≥ L3_OVERRIDE_MIN_CONVICTION` (0.55 default)** → engine bypasses the weighted aggregator and hands control to L3's verdict. Intensity is haircut by the **stacked-veto cap** (1 block → ×1.0, 2 → ×0.7, 3 → ×0.5, 4+ → ×0.35) so overriding multiple stacked vetoes shrinks position size proportionally.
+- **Soft L1 block + L3 declined / synthetic L3** → short-circuit as if L1 had been honoured. Synthetic L3 (no `OPENROUTER_API_KEY`) is a function of L1+L2 and cannot honestly audit L1.
+- **L1 passes** → normal weighted aggregation across L1/L2/L3.
+
+Every override (executed, declined, or hard-block upheld) is logged into `DecisionResult.l1_override_meta` and rendered as an `L1 OVERRIDDEN BY L3` banner above the Final Decision panel so operators never see a mysterious risk_on after an L1 block.
 
 ### Position sizing pipeline
 
@@ -132,36 +159,41 @@ Every plan stamps a full `sizing` breakdown onto the Execution Plan panel so the
 
 ```
 CapitalArc/
-├── main.py                       # Entry point: --dry-run / --live / --loop / --test-bias
+├── main.py                       # Entry point: --dry-run / --live / --loop / --test-bias / --test-allocation
 ├── src/
 │   ├── core/
-│   │   ├── decision_engine.py    # Cascading L1→L2→L3, conviction+direction aggregation
-│   │   ├── level1.py             # Technical hard rules + per-symbol direction
-│   │   ├── level2.py             # On-chain intelligence (Dune MCP only)
-│   │   └── level3.py             # Claude Sonnet 4.6 final arbiter (L3_MODE-aware)
+│   │   ├── decision_engine.py    # Always-invite-L3 cascade + L1 override + stacked-veto haircut
+│   │   ├── level1.py             # Technical rules + hard/soft taxonomy + marginality metadata
+│   │   ├── level2.py             # On-chain intelligence (Dune MCP + optional Hyperliquid overlay)
+│   │   └── level3.py             # Claude Sonnet 4.6 final arbiter (L3_MODE + L3_AGGRESSION + telemetry)
 │   ├── data/
-│   │   ├── dune_mcp.py           # DuneMCPClient — single source of truth
-│   │   ├── dune_market_data.py   # OHLCV adapter on dex.trades (L1 feed)
-│   │   └── arc_onchain.py        # Arc RPC reader (account state only)
+│   │   ├── dune_mcp.py                  # DuneMCPClient — Dune analytics backbone
+│   │   ├── dune_market_data.py          # OHLCV adapter on dex.trades (L1 feed)
+│   │   ├── hyperliquid_intelligence.py  # Real perp metrics from HL Info API (L2 overlay)
+│   │   └── arc_onchain.py               # Arc RPC reader (account state only)
 │   ├── execution/
-│   │   ├── arc_perp_executor.py  # Arc Perp DEX: margin, positions, ledger reads
-│   │   └── circle_wallet.py      # Circle DCW + Paymaster + RSA-OAEP signing
+│   │   ├── hyperliquid_executor.py  # PRIMARY trading venue — EIP-712 via hyperliquid-python-sdk
+│   │   │                            #   dual Info clients: exec (testnet) + data (mainnet)
+│   │   ├── position_manager.py      # TP / SL / trailing / side-flip / re-evaluation
+│   │   ├── usyc_executor.py         # USYC mint / redeem (yield leg, optional via USYC_ENABLED)
+│   │   ├── circle_wallet.py         # Circle DCW + Paymaster + RSA-OAEP; wait_for_tx 4xx fail-fast
+│   │   └── arc_perp_executor.py     # Legacy — treasury moves + dry-run telemetry only
 │   ├── allocation/
-│   │   └── allocation_router.py  # Vol-targeted sizing + DD haircut + side routing
+│   │   └── allocation_router.py  # Vol-targeted sizing + DD haircut + USYC rotation + position-review hook
 │   ├── llm/
 │   │   └── openrouter_client.py  # OpenRouter HTTP client (Level 3)
 │   └── utils/
 │       ├── config.py             # Pydantic settings (sole .env reader)
-│       ├── console.py            # Six-panel rich renderer
+│       ├── console.py            # Eight-panel rich renderer (incl. L1-override banner, Position Review)
 │       └── logging.py            # Loguru sinks
 ├── dune/
 │   ├── README.md                 # SQL templates + column contracts (deep dive)
 │   └── queries/                  # ohlcv.sql, funding_rates.sql, ... (9 templates)
 ├── prompts/                      # Level 3 arbiter system prompts
-│   ├── level3_arbiter_critical.md   # Default — independent risk-manager voice
+│   ├── level3_arbiter_critical.md   # Default — independent risk-manager voice + Day-6 decision matrix
 │   └── level3_arbiter_standard.md   # Concise trader voice
 ├── scripts/                      # One-off ops (Circle wallet creation, etc.)
-├── tests/                        # pytest + pytest-asyncio
+├── tests/                        # pytest + pytest-asyncio (110+ tests; HL exec test currently excluded)
 ├── .env.example                  # Documented template — never commit real keys
 ├── requirements.txt
 ├── AGENTS.md                     # Internal agent spec (source of truth)
@@ -251,11 +283,58 @@ CapitalArc now talks to **Anthropic Claude Sonnet 4.6** as the cascade's final a
 
 - **End-to-end smoke.** `python main.py --test-bias bearish --test-bias-strength 0.86 --test-final-score 0.52 --real-sonnet` runs the live OpenRouter round-trip with a coherent synthetic briefing — Claude (in critical mode) produces a full 5-section rationale, can independently nudge conviction up or down vs L1/L2's suggestion, flags contradictions explicitly, and returns descriptive `key_factors`.
 
-### 🚧 Day 5 — Planned
+### ✅ Day 5 — Trading-venue pivot + position manager + auto-allocation
 
-- **EIP-712 `OrderTypes.Order` signing** + matcher POST (`ARC_PERP_MATCHER_URL`) for full `open_position` on `--live`.
-- **USYC rotation** on risk-off: withdraw vault margin → USYC mint.
-- **JSONL decision log** for replay / backtest.
+The headline change: the agent now opens real long/short positions on **Hyperliquid Testnet**, while Arc + Circle keep the treasury & yield leg. The Arc Perp DEX matcher / EIP-712 `OrderTypes.Order` spec was never published, so building live trading against it was blocked indefinitely — Hyperliquid gives us a public testnet + faucet + maintained Python SDK + clean REST API and lets the rest of the architecture stay untouched.
+
+- **`HyperliquidExecutor`** (`src/execution/hyperliquid_executor.py`)
+  - EIP-712 L1 actions signed by the official [`hyperliquid-python-sdk`](https://github.com/hyperliquid-dex/hyperliquid-python-sdk) (msgpack-encoded action + phantom-agent domain). The agent never rolls its own crypto.
+  - Single signer key (`HYPERLIQUID_PRIVATE_KEY`); agent-wallet mode via `HYPERLIQUID_ACCOUNT_ADDRESS`, vault mode via `HYPERLIQUID_VAULT_ADDRESS`.
+  - Hard caps applied in the executor BEFORE the SDK call: `HYPERLIQUID_MAX_LEVERAGE` (5x), `HYPERLIQUID_MAX_POSITION_USD` ($10k), `HYPERLIQUID_DEFAULT_SLIPPAGE_BPS` (50bp). `use_market_orders=True` (default) routes through `market_open / market_close`; flip to `False` for limit orders at mid ± slippage.
+  - Surface matches the legacy `ArcPerpExecutor` (`open_position / close_position / close_all_positions / get_position / get_account_info / get_pnl / get_margin / set_leverage / update_take_profit_stop_loss / get_mid_price`) so the router swaps venues via duck-typing (`PerpExecutorProtocol`).
+  - Startup banner `Hyperliquid executor configured | api=... sdk=ready key_set=True signer_addr=0x... max_lev=5x max_pos=10000` printed in every mode (`--dry-run` / `--live` / `--test-allocation`).
+
+- **`PositionManager` — Two-Tier (Fast Path + Smart Path)** (`src/execution/position_manager.py`)
+  - **Fast Path** (always-on, deterministic, ATR-aware, runs every cycle). Priority ladder (first match wins): `daily_dd_guard > stop_loss > vol_spike_close > time_exit > take_profit > partial_take_profit > trailing_stop > side_flip > re_evaluation`. Plus state-only verbs (`breakeven_arm`, `vol_spike_warn`) that mutate per-position state without closing.
+  - **Smart Path** (Claude Sonnet 4.6 via OpenRouter, event-triggered). Fires ONLY on material change: price moved ≥ `L3_REVIEW_TRIGGER_PRICE_ATR_MULT × ATR` since last check, `|funding| ≥ L3_REVIEW_TRIGGER_FUNDING_RATE`, `n_whales ≥ L3_REVIEW_TRIGGER_WHALE_COUNT`, `|oi_delta_1h_pct| ≥ L3_REVIEW_TRIGGER_OI_DELTA_PCT`, or scheduled refresh every `L3_REVIEW_MAX_INTERVAL_MINUTES`. Throttled by `L3_REVIEW_MIN_INTERVAL_MINUTES`. Returns a `SmartPathVerdict` (`hold` / `close_full` / `close_partial` / `tighten_stop` / `raise_target`) that **overrides** the Fast Path when `L3_CAN_OVERRIDE_FAST_PATH=true`.
+  - **Dynamic ATR-based TP/SL** (`USE_DYNAMIC_ATR_TPSL=true`, default): TP / SL / trailing distances are multiples of the **live** ATR snapshot recomputed every cycle. Defaults: `SL_ATR_MULT=1.2`, `TP_ATR_MULT=3.0` (≈ 2.5:1 R:R), `TRAIL_ATR_MULT=1.5`. Falls back to fixed `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` when L1 ATR% is unavailable for that cycle — no silent failure.
+  - **Partial take-profit** (`ENABLE_PARTIAL_TAKE_PROFIT=true`): scales out `PARTIAL_TP_FRACTION=0.50` (half) of the position at `PARTIAL_TP_ATR_MULT=1.5` × ATR, once per position lifetime. Combines well with breakeven + trailing on the residual.
+  - **Breakeven arming** (`ENABLE_BREAKEVEN=true`): once profit ≥ `BREAKEVEN_TRIGGER_ATR_MULT=1.0` × ATR, lifts the effective SL to `entry ± BREAKEVEN_BUFFER_PCT=0.05%`. One-way: SL only tightens, never widens.
+  - **Volatility filter** (`ENABLE_VOL_FILTER=true`): compares live ATR% vs the entry-time ATR snapshot; on `≥ VOL_SPIKE_MULT=1.8x` either closes (`VOL_SPIKE_ACTION=close`) or just tightens the next SL pass (`VOL_SPIKE_ACTION=tighten_stop`, default).
+  - **Time-based exit** (`ENABLE_TIME_EXIT=true`): forces close after `MAX_POSITION_HOLD_HOURS=24` so stale ideas don't pile up.
+  - **Daily-DD kill switch** (`ENABLE_DAILY_DD_GUARD=true`): tracks PnL since UTC midnight; on session loss ≥ `DAILY_LOSS_LIMIT_PCT=5%`, flattens everything, runs USYC rotation, and refuses ALL new opens until process restart. Portfolio-level state — persists across positions becoming flat.
+  - **Per-asset ATR caps** (`PER_ASSET_ATR_CAP_BTC_1H=3.0`, `PER_ASSET_ATR_CAP_ETH_1H=4.0`, default `3.0`): router refuses new opens when live ATR% exceeds the per-asset 1h ceiling; the L3 critical-mode prompt enforces the same gate independently.
+  - **Per-position state** (`_PositionState`): keeps `opened_at`, `entry_atr_pct/abs`, `peak_pnl_pct`, `breakeven_armed`, `partial_tp_done`, `last_l3_check_at/price`, `last_smart_verdict` per `(symbol, side)`. Garbage-collected every cycle when the key is no longer in the open-positions list.
+  - **"HOLD must be earned"**: a `hold` verdict is a *conscious* outcome — the manager iterates every priority, considers Smart Path overrides, and only lands on `hold` when no trigger fired AND no override was warranted. Panel labels source (`FAST` / `SMART`) so operators can audit which tier authored the call.
+  - **Tests.** `tests/test_position_manager.py` covers 40+ scenarios across the legacy ladder, the new dynamic-ATR ladder, daily-DD persistence, per-asset ATR cap surfacing, and Smart-Path gating + override.
+
+- **`AllocationRouter` — full auto-allocation pipeline.**
+  - Risk-on: redeem just enough USYC if Arc cash is short → `HyperliquidExecutor.open_position(...)` → stamp directive + sizing + (optional) reduce-only TP/SL orders.
+  - Risk-off: `close_all_positions(...)` → withdraw margin → mint USYC with the leftover USDC (bounded by `[USYC_MIN_ROTATION_AMOUNT, USYC_MAX_ROTATION_AMOUNT]` and gated by `USYC_USDC_RESERVE_USD`).
+  - USYC leg is **optional** — when the contracts aren't configured the router stamps `rotation_skipped` on the plan and still closes perps.
+  - All hard overrides (drawdown breach, stale data, leverage cap, max-position cap) apply identically to longs and shorts.
+
+- **Eighth rich CLI panel — `Position Review` (extended in Day-5+).** TP / SL / trailing-stop prices vs live mid, current PnL %, peak PnL %, **live ATR% vs per-asset cap**, **position age**, **per-position flags** (`BE` once breakeven armed, `pTP` once partial fired, `L3:hold|close|partial|tighten` once Smart Path ran), source-tagged trigger badges (`FAST` / `SMART`), and a **daily-DD banner** showing the session loss vs the configured limit with a `BREACHED` indicator when the kill switch is active.
+
+- **Tests.** `tests/test_hyperliquid_executor.py` (fake SDK clients exercise open/close/get_position/get_mid_price/get_account_info on all paths) + `tests/test_position_manager.py` (all five triggers, peak-PnL reset, symmetric long/short, `from_settings` rounding).
+
+### 🟡 Day 5.x — Live-test follow-ups (in progress)
+
+Day 5 closed the architecture; the follow-up tickets cover what we learned running the agent **`--live --loop` on Hyperliquid Testnet** end-to-end with real Claude Sonnet 4.6 in critical mode. The day is **not** marked fully done — there are still calibration items pending.
+
+- **Live test snapshot.** Agent opened several long BTC-PERP positions which Hyperliquid (a netting venue) collapsed into one per-account position with accumulated size. The operator manually flattened from the Hyperliquid UI to bound balance burn while L3's behaviour was still being calibrated. `PositionManager` ran each cycle as designed; `HyperliquidIntelligenceAdapter` produced real OI / funding / whale-activity reads; USYC was off for the duration.
+
+- **L1 → L3 override architecture.** `Level1Reason.is_hard` flag declared at the source; per-reason marginality buckets (`marginal / moderate / decisive`) so L3 can tell "RSI at 70.2" from "RSI at 84". `DecisionEngine` now always invokes L2 and L3 even on an L1 block, enriches `ArbiterBriefing` with `l1_blocked_reasons` + `l1_indicators`, and only short-circuits AFTER L3 has spoken. Soft blocks are overrideable via `ALLOW_L3_TO_OVERRIDE_L1=true` + `L3_OVERRIDE_MIN_CONVICTION=0.55`; hard blocks (`drawdown_breach`, `ohlcv_unavailable`) are never overrideable. **Stacked-veto intensity haircut** caps L3-driven opens at `×1.0 / ×0.7 / ×0.5 / ×0.35` for 1 / 2 / 3 / 4+ stacked soft blocks. `DecisionResult.l1_override_meta` carries the full audit trail; the Final Decision panel renders an `L1 OVERRIDDEN BY L3` banner.
+
+- **L3 calibration (Day-6 prompt rewrite + post-validation layer).** `ArbiterResponse.rationale` ceiling raised `4000` → `8000` chars after observing 6.8k-char rationales tripping safe-HOLD for a length-only reason. **STRICT RESPONSE LENGTH RULES** added at the top of the critical-mode prompt (≤ 3500 chars target). The "skeptical by default" principle was replaced with a concrete **default-action matrix** + **per-asset ATR caps** (cross-asset ATR no longer a veto) + **whale activity below `n<5` = noise** + **flat OI = neutral in continuation** + **`history_unavailable` is ignored**, not bearish. Post-validation `L3_AGGRESSION ∈ {conservative, balanced (default), aggressive}` multiplier scales `conviction` / `intensity` AFTER Pydantic validation; the `aggressive` mode adds a **HOLD-rescue rule** (flips a HOLD to a low-intensity OPEN when L1 passes AND L2 conviction ≥ `L3_HOLD_RESCUE_L2_MIN=0.65`). In-process `_L3Telemetry` counter tracks `total / held / opened / rescued_holds / raw_holds` per session.
+
+- **`HyperliquidIntelligenceAdapter`** (`src/data/hyperliquid_intelligence.py`). Replaces the spot-derived L2 proxies for funding / OI / volume / cum-funding with real perp data from Hyperliquid's `meta_and_asset_ctxs` + `funding_history` Info endpoints. OI history isn't natively exposed, so the adapter maintains an in-process ring buffer per coin for `delta_1h / 4h / 24h` (warming-up horizons surface as `history_unavailable` rather than zero). Failures degrade gracefully per metric — the Dune proxy fills in any field the HL call couldn't produce — and provenance flips between `dune:<id>` and `hyperliquid:<endpoint>` per metric in the L2 panel. The adapter reads from **`HYPERLIQUID_DATA_API_URL` (mainnet by default)** — kept deliberately separate from the testnet execution venue so the data plane stays honest.
+
+- **Operational knobs.** `DECISION_INTERVAL_SECONDS=600` (10-minute `--loop` cadence — tuned to bound OpenRouter and Dune API costs without missing meaningful moves on the 15m/1h L1 timeframes; set to `0` for back-to-back replay). `USYC_ENABLED=false` activates **perp-only mode** — `--live` pre-flight stops requiring the USYC addresses; risk-off still closes perps but skips the USDC → USYC mint; startup emits a clear `USYC leg disabled - running perp-only mode on Hyperliquid Testnet` INFO line. **Testing-loosened L1 defaults** clearly labelled "TESTING ONLY" in `.env`: `L1_ATR_PCT_MIN=0.05` (was 0.15), `L1_ATR_PCT_MAX=12.0` (was 6.0), `L1_REQUIRE_TF_AGREEMENT=false` (was true) — tighten back before mainnet.
+
+- **Circle DCW noisy-poll fix.** After every Hyperliquid open, `main.py`'s post-cycle wait loop was calling `CircleWallet.wait_for_tx(<hyperliquid_order_id>)` and Circle returned 400 — the old code then retried for ~90 s spamming WARNINGs. Fixed at two layers: (1) `main.py` `_is_circle_tx_id` UUID discriminator + extended skip set covering already-terminal states like `CONFIRMED` / `COMPLETE`; (2) `CircleWallet.wait_for_tx` now fails fast on HTTP 4xx with a single ERROR line. Covered by `tests/test_circle_wallet_wait.py` (8 regression tests).
+
+- **What's still pending in 5.x.** Calibration of `L3_AGGRESSION` defaults from live-test telemetry; durable trailing-stop state across restarts; per-symbol routing so multiple symbols don't net into one position; mainnet roll-out plan.
 
 ---
 
@@ -286,13 +365,46 @@ Save the SQL templates from [`dune/queries/`](./dune/queries) to your Dune works
 # 🟢 Dry-run (default — no on-chain tx, just logs the would-be calls):
 python main.py
 
-# 🔁 Loop every DECISION_INTERVAL_SECONDS:
+# 🔁 Loop every DECISION_INTERVAL_SECONDS (default 600 s / 10 min):
 python main.py --loop
 
-# 🔴 Live execution (requires CIRCLE_API_KEY + CIRCLE_ENTITY_SECRET +
-#                    CIRCLE_AGENT_WALLET_ID + ARC_PERP_ROUTER_ADDRESS):
+# 🔴 Live execution. Requires HYPERLIQUID_PRIVATE_KEY (testnet, fauceted from
+#    https://app.hyperliquid-testnet.xyz) + Circle DCW (CIRCLE_API_KEY,
+#    CIRCLE_ENTITY_SECRET, CIRCLE_AGENT_WALLET_ID). USYC addresses are only
+#    required when USYC_ENABLED=true (set USYC_ENABLED=false for clean
+#    perp-only live testing):
 python main.py --live
+
+# 🔴🔁 Most common live setup: continuous trading with the 10-min cadence.
+python main.py --live --loop
 ```
+
+> ⚠️ **Operator note from the Day-5 live test.** Hyperliquid is a **netting
+> venue** — consecutive same-side opens collapse into one accumulated
+> position per `(symbol, side)`, they do NOT stack as separate positions.
+> Always keep an eye on the position in the [Hyperliquid Testnet
+> dashboard](https://app.hyperliquid-testnet.xyz) when running `--live --loop`;
+> the operator can manually flatten any position from the UI at any
+> moment without confusing the agent (next cycle will simply see "no open
+> positions" and either hold or re-enter based on fresh signals).
+
+### 3a. Important env knobs
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DECISION_INTERVAL_SECONDS` | `600` | Sleep between cycles in `--loop` mode. `0` removes the sleep (back-to-back replay). |
+| `USYC_ENABLED` | `true` in code; `false` in checked-in `.env` for current testing | When `false`, the USYC mint/redeem leg is skipped and `--live` pre-flight no longer requires the USYC addresses. |
+| `HYPERLIQUID_API_URL` | `https://api.hyperliquid-testnet.xyz` | Execution venue + own-account state. |
+| `HYPERLIQUID_DATA_API_URL` | `https://api.hyperliquid.xyz` (**mainnet**) | Market-wide intelligence (asset universe, OI, funding) for the L2 overlay. Kept independent so the data plane stays honest when execution is testnet. |
+| `HYPERLIQUID_INTELLIGENCE_ENABLED` | `true` | Master switch for the `HyperliquidIntelligenceAdapter` overlay on L2. Flip to `false` for a pure-Dune A/B comparison. |
+| `L3_MODE` | `critical` | `critical` (5-section structured rationale) or `standard` (concise trader voice). |
+| `L3_AGGRESSION` | `balanced` | `conservative` / `balanced` / `aggressive`. `aggressive` enables the HOLD-rescue rule. |
+| `L3_HOLD_RESCUE_L2_MIN` | `0.65` | Minimum L2 conviction needed for HOLD-rescue to fire (only under `aggressive`). |
+| `L3_HOLD_RESCUE_INTENSITY` | `0.30` | Position intensity used when HOLD-rescue flips a HOLD to OPEN. |
+| `ALLOW_L3_TO_OVERRIDE_L1` | `true` | Master switch for letting L3 audit & override soft L1 blocks. |
+| `L3_OVERRIDE_MIN_CONVICTION` | `0.55` | Minimum Claude conviction needed to override an L1 soft block. |
+| `L1_ATR_PCT_MIN` / `L1_ATR_PCT_MAX` | `0.05` / `12.0` (**TESTING ONLY**; production = `0.15` / `6.0`) | Soft block band on ATR%. Loosened for the Day-5 live test; tighten back before mainnet. |
+| `L1_REQUIRE_TF_AGREEMENT` | `false` (**TESTING ONLY**; production = `true`) | Require 15m + 1h trend agreement. Loosened to allow trading on currently-quiet markets during testing. |
 
 ### 4. Offline scenario tester (`--test-bias`)
 
@@ -315,6 +427,26 @@ python main.py --test-bias bearish --test-bias-strength 0.86 --test-conviction 0
 ```
 
 Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, configured-vs-effective weights), the **Level 3** panel (with the active `Mode` badge — `CRITICAL` or `STANDARD` — and section-coloured rationale when real Claude is wired) and the **DECISION** panel (action, side, aggregate direction, final conviction, intensity, plain-English `why`).
+
+### 4b. Offline `PositionManager` tester (`--test-allocation`)
+
+Probe the position manager's trigger ladder against synthetic open positions — no Dune, no Circle, no Hyperliquid SDK calls. Pick a scenario:
+
+```bash
+# Position with +5% PnL — TAKE_PROFIT fires
+python main.py --test-allocation take_profit
+
+# Position with -3% PnL — STOP_LOSS fires
+python main.py --test-allocation stop_loss
+
+# Open long while engine emits a SHORT directive — SIDE_FLIP fires
+python main.py --test-allocation side_flip
+
+# Mildly profitable position, conviction collapses below MIN_CONVICTION_TO_HOLD
+python main.py --test-allocation re_evaluation
+```
+
+Every scenario prints the new Position Review panel with the live trigger badge so you can verify TP / SL / trailing prices are computed correctly before sending real orders to Hyperliquid.
 
 ### 5. What a live cycle looks like
 
@@ -356,11 +488,17 @@ Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, c
 │  decision_id, action, symbol, size,    │
 │  leverage, conviction, sizing pipeline │
 │  (vol-target → intensity → DD haircut  │
-│  → final).                             │
+│  → final) + USYC rotation legs.        │
+└────────────────────────────────────────┘
+┌── Position Review (PositionManager) ───┐
+│  per open position: side, size, PnL%,  │
+│  peak PnL, TP/SL/trailing prices vs    │
+│  live mid, trigger badge (HOLD / SL /  │
+│  TP / TRAILING / FLIP / RE-EVAL).      │
 └────────────────────────────────────────┘
 ┌── On-chain Result ─────────────────────┐
 │  tx_id, state, hash, sponsored,        │
-│  Arcscan explorer link.                │
+│  Hyperliquid + Arc explorer links.     │
 └────────────────────────────────────────┘
 ```
 
@@ -373,31 +511,34 @@ Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, c
 | **Day 1** | ✅ | Scaffolding, secret hygiene, 3-level interfaces |
 | **Day 2** | ✅ | Circle DCW + Paymaster live; Arc Perp DEX margin moves on Testnet |
 | **Day 3** | ✅ | L1 + L2 wired to Dune MCP (9/9 queries live); conviction/direction split; vol-targeted sizing; gradient drawdown haircut |
-| **Day 4** | ✅ | Real Claude Sonnet 4.6 L3 arbiter via OpenRouter; two `L3_MODE` personas (`critical` default with 5-section rationale + veto authority, `standard` for trader-voice); strict JSON verdict + Pydantic; safe HOLD fallback; seventh rich panel with mode badge; 34 smoke tests |
-| **Day 5** | 🚧 | EIP-712 perp orders; USYC rotation; JSONL decision log |
-| **Post-hack** | 💡 | Per-symbol routing (open BTC long while ETH is flat); on-chain DSL for declaring strategies; arc-native Dune dataset when indexed |
+| **Day 4** | ✅ | Real Claude Sonnet 4.6 L3 arbiter via OpenRouter; two `L3_MODE` personas (`critical` default with 5-section rationale + veto authority, `standard` for trader-voice); strict JSON verdict + Pydantic; safe HOLD fallback; seventh rich panel with mode badge |
+| **Day 5** | ✅ | **Trading-venue pivot to Hyperliquid Testnet** (`HyperliquidExecutor` via official `hyperliquid-python-sdk`); **`PositionManager`** (TP / SL / trailing / side-flip / re-evaluation); **auto-allocation pipeline** (risk-on opens on Hyperliquid + USYC redeem if cash-short; risk-off closes perps + withdraws margin + mints USYC); **eighth Position Review CLI panel**; Arc + Circle retained as treasury & yield leg |
+| **Day 5.x** | 🟡 | **Live-test follow-ups (in progress).** L1 → L3 override architecture with hard/soft taxonomy + marginality + stacked-veto haircut + `L1 OVERRIDDEN BY L3` banner; L3 calibration (rationale ceiling `4000 → 8000`, STRICT LENGTH RULES, decision matrix, per-asset ATR caps, `L3_AGGRESSION` + HOLD-rescue + telemetry); `HyperliquidIntelligenceAdapter` (real perp data from `metaAndAssetCtxs` + `fundingHistory`); operational knobs (`DECISION_INTERVAL_SECONDS=600`, `USYC_ENABLED=false` perp-only mode, testing-loosened L1 defaults); Circle DCW `wait_for_tx` 4xx fail-fast + UUID discriminator |
+| **Day 6+** | 🚧 | Calibration of `L3_AGGRESSION` defaults from live telemetry; mainnet roll-out plan; per-symbol routing (open BTC long while ETH stays flat); durable trailing-stop state across restarts; JSONL decision log for replay / backtest; arc-native Dune dataset once Arc Testnet is indexed |
 
 ---
 
 ## 🧰 Tech Stack
 
-**Chain & infrastructure**
-- 🏗️ **Arc** stablechain (Testnet today, mainnet on launch)
-- 🎯 **Arc Perp DEX** — `ClearingHouse` + `USDCCollateralVault` + `MarketRegistry` + `PositionLedger`
+**Trading venue**
+- 🎯 **Hyperliquid Testnet** — primary perp venue for real long/short positions, signed via the official [`hyperliquid-python-sdk`](https://github.com/hyperliquid-dex/hyperliquid-python-sdk) (EIP-712 L1 actions over the phantom-agent domain, `POST /exchange` + `POST /info`)
 
-**Circle stack**
-- 🌉 **CCTP v2** — cross-chain USDC routing
-- 🔐 **Developer-Controlled Wallets** — non-custodial programmable signing
-- ⛽ **Circle Paymaster** — gasless / sponsored transactions
-- 🪙 **USYC** — yield-bearing tokenized USDC (risk-off leg)
+**Treasury & yield (Arc + Circle)**
+- 🏗️ **Arc** stablechain (Testnet today, mainnet on launch) — settlement layer for the yield leg
+- 🌉 **CCTP v2** — cross-chain USDC routing (Arc ⇄ Arbitrum / Base when funding / defunding Hyperliquid margin)
+- 🔐 **Developer-Controlled Wallets** — non-custodial programmable signing on Arc
+- ⛽ **Circle Paymaster** — gasless / sponsored transactions on Arc
+- 🪙 **USYC** — yield-bearing tokenized USDC (risk-off leg via `USYCExecutor`)
+- 🏛️ **Arc Perp DEX contracts** (`ClearingHouse` / `USDCCollateralVault` / `MarketRegistry` / `PositionLedger`) — retained for treasury moves and dry-run telemetry only; production routing is on Hyperliquid
 
 **Intelligence & data**
 - 🔭 **Dune MCP** — single source of truth for L1 OHLCV + L2 on-chain intelligence (Ethereum / Base / Arbitrum supported out of the box)
-- 🧱 **Arc RPC** — account state only (wallet, vault TVL, agent margin)
+- 🧱 **Arc RPC** — account state only (wallet, vault TVL, agent margin on Arc)
 - 🤖 **Claude Sonnet 4.6** (via **OpenRouter**) — Level 3 final arbiter with strict-JSON verdict (Pydantic-validated)
 
 **Backend**
 - 🐍 Python 3.10+
+- `hyperliquid-python-sdk` — Hyperliquid EIP-712 signing + REST client (hard runtime dependency)
 - `web3.py`, `eth-account`, `eth-abi` — chain interaction
 - `httpx`, `aiohttp`, `tenacity` — async HTTP with rate-limit retries
 - `pydantic`, `pydantic-settings` — strongly-typed config
@@ -405,7 +546,7 @@ Each invocation prints the **INPUTS** panel (per-level conviction, thresholds, c
 - `mcp`, `dune-client` — L2 on-chain data
 - `httpx` (above) — L3 OpenRouter HTTP client
 - `loguru` — structured logging
-- `rich` — seven-panel terminal UI
+- `rich` — eight-panel terminal UI (incl. Position Review)
 - `apscheduler` — loop scheduling
 
 ---
