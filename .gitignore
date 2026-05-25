@@ -94,3 +94,10 @@ README-RFB1.md
 demo_clean_output.txt
 demo_*.txt
 *.demo.txt
+
+# --- Final hackathon-submission cleanup ---
+prompts/
+AGENTS.md
+diagrams/
+CONTEXT.md
+pytest.ini
