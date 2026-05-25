@@ -1,7 +1,7 @@
 ```text
 === CapitalArc — Autonomous AI Agent on Arc ===
 - - - - - - - - - - - - - - - - - - - - - - - -
-  Smart capital management on Perp DEX & Arc
+  Smart capital management on Arc & Perp DEX 
 ```
 
 [![Agora Agents Hackathon](https://img.shields.io/badge/Agora-Agents%20Hackathon-blueviolet)](https://www.canteen.xyz/)
