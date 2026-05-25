@@ -132,7 +132,7 @@ def test_arbiter_response_validates_and_exposes_direction_sign() -> None:
         direction="short",
         regime="risk_on",
         recommended_intensity=0.6,
-        rationale="L2 явный медвежий bias.",
+        rationale="L2 shows a clear bearish bias.",
         key_factors=["bearish bias", "negative funding"],
     )
     assert r.direction_sign == -1
@@ -237,7 +237,7 @@ async def test_level3_uses_arbiter_response_when_client_returns_valid_json() -> 
         "direction": "short",
         "regime": "risk_on",
         "recommended_intensity": 0.6,
-        "rationale": "L2 однозначно медвежий, funding отрицательный.",
+        "rationale": "L2 is decisively bearish, funding is negative.",
         "key_factors": ["bearish bias", "negative funding"],
     }
     client = _mock_openrouter_client(payload)
@@ -307,7 +307,7 @@ def test_system_prompt_loads_from_disk_when_present() -> None:
     prompt = arbiter._load_system_prompt()
     # Either the on-disk prompt or the inline fallback must be present
     # and mention the agent's purpose.
-    assert "CapitalArc" in prompt or "арбитр" in prompt.lower()
+    assert "CapitalArc" in prompt or "arbiter" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +603,7 @@ async def test_cascade_with_real_l3_aggregates_all_three_levels() -> None:
         "direction": "long",
         "regime": "risk_on",
         "recommended_intensity": 0.8,
-        "rationale": "Сильный bullish сетап.",
+        "rationale": "Strong bullish setup.",
         "key_factors": ["L1 trend up", "L2 bullish bias"],
     }
     level3 = Level3(client=_mock_openrouter_client(payload))

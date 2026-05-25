@@ -49,6 +49,7 @@ logs/
 runs/
 artifacts/
 checkpoints/
+recovery/
 *.sqlite
 *.db
 
@@ -62,8 +63,9 @@ Thumbs.db
 desktop.ini
 
 # --- Editors / IDEs ---
-.idea/
+.cursor/
 .vscode/
+.idea/
 *.swp
 *.swo
 *~
@@ -80,5 +82,15 @@ temp/
 *.tmp
 *.bak
 
-# --- External / vendored docs cloned at root level ---
+# --- Internal / non-public project assets ---
+# Internal design docs (the public README embeds the diagrams already)
+/diagrams/
+# Sensitive prompt templates (kept locally, not for public mirror)
+/prompts/
+# Internal context, handoffs and working notes
 /docs/
+CONTEXT.md
+README-RFB1.md
+demo_clean_output.txt
+demo_*.txt
+*.demo.txt

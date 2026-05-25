@@ -1,4 +1,4 @@
-"""Level 1 - fast deterministic technical rules ("защита от дурака").
+"""Level 1 - fast deterministic technical rules (idiot-proof guardrails).
 
 Level 1 is the *gate* in front of the decision engine. It does not
 predict the market; it refuses to let the agent trade in obviously

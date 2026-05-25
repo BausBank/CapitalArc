@@ -19,7 +19,7 @@ SQL column contracts).
 1. [High-level model](#1-high-level-model)
 2. [Decision engine](#2-decision-engine)
    - [2.1 Cascade order](#21-cascade-order--always-invite-l3)
-   - [2.2 Level 1 — Technical hard rules](#22-level-1--technical-hard-rules-защита-от-дурака)
+   - [2.2 Level 1 — Technical hard rules](#22-level-1--technical-hard-rules)
    - [2.3 Level 2 — On-chain intelligence](#23-level-2--on-chain-intelligence)
    - [2.4 Level 3 — Claude Sonnet 4.6](#24-level-3--claude-sonnet-46-final-arbiter)
    - [2.5 Conviction vs Direction split](#25-conviction-vs-direction-split)
@@ -146,9 +146,9 @@ L1 + L2 in aggregation. Synthetic L3 is never used to override an L1 block.
 
 ---
 
-### 2.2 Level 1 — Technical hard rules ("защита от дурака")
+### 2.2 Level 1 — Technical hard rules
 
-> Full detail: [docs/agents-detailed-levels.md §2.2](./docs/agents-detailed-levels.md#22-level-1--technical-hard-rules-защита-от-дурака)
+> Full detail: [docs/agents-detailed-levels.md §2.2](./docs/agents-detailed-levels.md#22-level-1--technical-hard-rules)
 
 OHLCV on `15m` and `1h` for `BTC-PERP` / `ETH-PERP` via `DuneMarketData`.
 No other market-data path.
