@@ -102,3 +102,20 @@ diagrams/
 CONTEXT.md
 pytest.ini
 tests/
+
+# --- Internal modules (kept locally, hidden from public mirror) ---
+src/execution/arc_perp_executor.py
+src/execution/usyc_executor.py
+src/data/dune_market_data.py
+src/utils/logging.py
+
+# Subpackage __init__.py files (only the top-level src/__init__.py
+# is part of the public mirror; internal subpackage initializers
+# stay on disk for local imports but are hidden from the repo).
+src/agents/
+src/allocation/__init__.py
+src/core/__init__.py
+src/data/__init__.py
+src/execution/__init__.py
+src/llm/__init__.py
+src/utils/__init__.py
