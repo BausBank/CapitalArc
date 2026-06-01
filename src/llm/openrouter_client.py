@@ -219,6 +219,8 @@ class OpenRouterClient:
         self,
         system_prompt: str,
         user_prompt: str,
+        *,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         """Send a structured chat prompt to OpenRouter and return parsed JSON.
 
@@ -242,6 +244,11 @@ class OpenRouterClient:
         user_prompt
             Per-call payload (the structured briefing) sent as the
             ``user`` message.
+        temperature
+            Optional per-call override of the configured sampling
+            temperature. Used by the Level-3 self-consistency feature
+            to draw additional samples at a higher temperature than the
+            deterministic primary call. ``None`` keeps the config value.
 
         Returns
         -------
@@ -275,7 +282,9 @@ class OpenRouterClient:
                     ),
                 },
             ],
-            "temperature": float(self.config.temperature),
+            "temperature": float(
+                self.config.temperature if temperature is None else temperature
+            ),
             "max_tokens": int(self.config.max_tokens),
             # Disable OpenRouter's middle-out compression - we want the
             # arbiter to see the full briefing without summarisation.

@@ -80,6 +80,7 @@ one-line ``.env`` change.
 
 from __future__ import annotations
 
+import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +97,13 @@ if TYPE_CHECKING:
 
 L3Mode = Literal["critical", "standard"]
 L3Aggression = Literal["conservative", "balanced", "aggressive"]
+
+# Hard cap on the number of LLM samples the self-consistency feature
+# may draw in a single arbitration, regardless of operator config.
+# Protects the per-cycle / per-hour LLM budget: even a misconfigured
+# ``L3_SELF_CONSISTENCY_SAMPLES=50`` can never blow the budget because
+# the arbiter clamps it here AND only resamples on borderline cycles.
+_SELF_CONSISTENCY_MAX: int = 3
 
 
 def _clamp01(value: float) -> float:
@@ -205,6 +213,23 @@ class Level3Config:
     aggression: L3Aggression = "balanced"
     hold_rescue_l2_min: float = 0.65
     hold_rescue_intensity: float = 0.30
+
+    # ---- Day-3 multi-sample self-consistency (borderline only) ------
+    # When enabled, the arbiter draws additional LLM samples ONLY when
+    # the first sample's conviction lands in the borderline band
+    # ``[sc_borderline_low, sc_borderline_high]`` (i.e. the decision is
+    # genuinely on the fence). It then takes the majority direction and
+    # median conviction / intensity across all samples, and records the
+    # sample agreement so the EntryQualityGate can downgrade contested
+    # opens. Disabled by default (samples=1) to protect the LLM budget;
+    # ``samples`` is hard-capped at 3 (see ``_SELF_CONSISTENCY_MAX``).
+    self_consistency_enabled: bool = False
+    self_consistency_samples: int = 1
+    sc_borderline_low: float = 0.50
+    sc_borderline_high: float = 0.65
+    # Higher temperature for the extra samples so they actually vary
+    # (the primary call stays at the deterministic ``temperature``).
+    sc_temperature: float = 0.50
 
     def resolved_prompt_path(self) -> Path:
         """Return the system-prompt path to load for this config."""
@@ -468,6 +493,18 @@ class Level3Arbiter:
                 user_prompt=user_prompt,
             )
             raw_response = ArbiterResponse.model_validate(raw_dict)
+
+            # ---- Day-3 borderline self-consistency ----------------
+            # Only resamples when the primary verdict's conviction is
+            # on the fence; otherwise this is a no-op (one call). Takes
+            # the majority direction + median conviction / intensity
+            # across samples and records the sample agreement.
+            raw_response, sc_meta = await self._maybe_self_consistency(
+                raw_response,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
             elapsed_ms = (time.time() - started) * 1000.0
 
             # ---- Day-6 post-validation calibration ----------------
@@ -497,6 +534,7 @@ class Level3Arbiter:
                 "raw_response_validated": raw_response.model_dump(),
                 "response": response.model_dump(),
                 "calibration": calibration,
+                "self_consistency": sc_meta,
             }
             return response, payload
         except ValidationError as exc:
@@ -538,6 +576,131 @@ class Level3Arbiter:
                 errors=str(exc)[:500],
             )
             return response, payload
+
+    # ------------------------------------------------------------------
+    # Day-3 borderline self-consistency
+    # ------------------------------------------------------------------
+
+    async def _maybe_self_consistency(
+        self,
+        primary: ArbiterResponse,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> tuple[ArbiterResponse, dict[str, Any]]:
+        """Optionally resample the arbiter on borderline conviction.
+
+        Returns ``(aggregated_response, sc_meta)``. When the feature is
+        off, the primary verdict is non-borderline, or every extra
+        sample failed, this is a no-op: it returns ``primary`` with
+        ``sc_meta["applied"] = False`` (agreement 1.0).
+
+        Aggregation across the valid samples:
+          * direction - majority vote (ties keep the primary's side).
+          * conviction / recommended_intensity - median.
+          * regime - majority vote (ties keep the primary's regime).
+          * rationale / key_factors - taken from the primary, with a
+            short self-consistency note appended to the rationale.
+        """
+        cfg = self.config
+        n_samples = min(int(cfg.self_consistency_samples), _SELF_CONSISTENCY_MAX)
+        sc_meta: dict[str, Any] = {"applied": False, "direction_agreement": 1.0}
+        if (
+            not cfg.self_consistency_enabled
+            or n_samples <= 1
+            or self.client is None
+        ):
+            return primary, sc_meta
+        # Only resample when the primary verdict is genuinely on the
+        # fence - this is the budget-protection gate.
+        if not (
+            cfg.sc_borderline_low <= primary.conviction <= cfg.sc_borderline_high
+        ):
+            sc_meta["reason"] = "primary conviction outside borderline band"
+            return primary, sc_meta
+
+        samples: list[ArbiterResponse] = [primary]
+        for i in range(n_samples - 1):
+            try:
+                extra_dict = await self.client.generate_json(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=cfg.sc_temperature,
+                )
+                samples.append(ArbiterResponse.model_validate(extra_dict))
+            except Exception as exc:  # noqa: BLE001 - extra samples are best-effort
+                logger.warning(
+                    "L3 self-consistency extra sample {}/{} failed: {} "
+                    "(continuing with fewer samples)",
+                    i + 2, n_samples, exc,
+                )
+
+        if len(samples) <= 1:
+            sc_meta["reason"] = "no valid extra samples"
+            return primary, sc_meta
+
+        directions = [s.direction for s in samples]
+        convictions = [s.conviction for s in samples]
+        intensities = [s.recommended_intensity for s in samples]
+        regimes = [s.regime for s in samples]
+
+        majority_direction = self._majority(directions, fallback=primary.direction)
+        majority_regime = self._majority(regimes, fallback=primary.regime)
+        median_conviction = float(statistics.median(convictions))
+        median_intensity = float(statistics.median(intensities))
+        agreement = directions.count(majority_direction) / len(directions)
+
+        aggregated = ArbiterResponse(
+            conviction=median_conviction,
+            direction=majority_direction,
+            regime=majority_regime,
+            recommended_intensity=median_intensity,
+            rationale=(
+                primary.rationale
+                + f"\n\n[Self-consistency: {len(samples)} samples, "
+                f"direction agreement {agreement:.0%}, "
+                f"median conviction {median_conviction:.2f}.]"
+            ),
+            key_factors=list(primary.key_factors),
+        )
+        sc_meta = {
+            "applied": True,
+            "n_samples": len(samples),
+            "directions": directions,
+            "convictions": [round(c, 3) for c in convictions],
+            "regimes": regimes,
+            "majority_direction": majority_direction,
+            "majority_regime": majority_regime,
+            "median_conviction": round(median_conviction, 3),
+            "median_intensity": round(median_intensity, 3),
+            "direction_agreement": round(agreement, 3),
+            "conviction_spread": round(
+                max(convictions) - min(convictions), 3
+            ),
+        }
+        logger.info(
+            "L3 self-consistency | {} samples, dir-agreement {:.0%}, "
+            "median conv {:.2f} (primary dir={} conv={:.2f})",
+            len(samples), agreement, median_conviction,
+            primary.direction, primary.conviction,
+        )
+        return aggregated, sc_meta
+
+    @staticmethod
+    def _majority(values: list[Any], *, fallback: Any) -> Any:
+        """Return the most common value; ``fallback`` on an empty tie."""
+        if not values:
+            return fallback
+        counts: dict[Any, int] = {}
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        top = max(counts.values())
+        winners = [v for v, c in counts.items() if c == top]
+        if len(winners) == 1:
+            return winners[0]
+        # Tie - prefer the fallback (the primary verdict) if it's among
+        # the winners, otherwise the first sample's value.
+        return fallback if fallback in winners else winners[0]
 
     # ------------------------------------------------------------------
     # Prompt rendering

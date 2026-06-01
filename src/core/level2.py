@@ -99,6 +99,15 @@ class Level2Config:
     usdc_address: str | None = None
     # Address watched by `vault_flows` for USDC deposits / withdrawals.
     vault_address: str | None = None
+    # ---- Stage 7: bull-bias offset --------------------------------
+    # Spot-DEX funding proxies and positive 24h drift give the bias
+    # voter a structural LONG lean in trending-up regimes (funding is
+    # positive most of the time, tape drifts up). This offset is
+    # subtracted from the accumulated ``bull_votes`` before the
+    # bull/bear margin is computed, de-biasing the voter toward
+    # neutral/short. 0.0 = no-op (default); ~0.5-1.0 corrects a mild
+    # persistent long lean observed in the live logs.
+    bull_bias_offset: float = 0.0
     # Used by the heuristic regime classifier when the Dune-side
     # `market_sentiment` query is not configured.
     risk_on_heat: float = 0.62
@@ -1131,6 +1140,17 @@ class Level2:
         elif market_heat <= 0.4:
             bear_votes += (0.5 - market_heat) * 2.0
             bear_hits.append(f"heat={market_heat:.2f}")
+
+        # --- Stage 7: bull-bias offset (de-bias structural long lean).
+        # Applied AFTER all raw votes are tallied and BEFORE the
+        # bull/bear balance is computed, so it shifts the verdict
+        # toward neutral/short without touching individual signals.
+        offset = float(getattr(self.config, "bull_bias_offset", 0.0) or 0.0)
+        if offset > 0.0 and bull_votes > 0.0:
+            adjusted = max(0.0, bull_votes - offset)
+            if adjusted != bull_votes:
+                bull_hits.append(f"bull_bias_offset -{offset:.2f}")
+            bull_votes = adjusted
 
         total = bull_votes + bear_votes
         if total <= 1e-6:

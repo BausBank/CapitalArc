@@ -888,6 +888,32 @@ def final_decision_panel(decision: Any) -> Panel:
             f"[bold red]YES[/] - {decision.short_circuit_reason or 'L1 block'}",
         )
 
+    # ---- Day-3 entry-quality badge --------------------------------------
+    # Retro status tag for the EntryQualityGate verdict on a would-be
+    # open. Only shown when the gate actually evaluated a risk_on
+    # directive (meta is None for holds / risk-offs and on the
+    # L3-overrides-L1 path, which is exempt from the gate).
+    eq_meta = getattr(decision, "entry_quality_meta", None) or {}
+    eq_status = eq_meta.get("status")
+    if eq_status:
+        if eq_status == "block":
+            badge = "[bold black on red] [ENTRY:BLOCK] [/]"
+        elif eq_status == "downgrade":
+            badge = (
+                "[bold black on orange1] [ENTRY:DOWNGRADE x"
+                f"{eq_meta.get('intensity_mult', 1.0):.2f}] [/]"
+            )
+        else:
+            badge = "[bold black on bright_green] [ENTRY:OK] [/]"
+        agreement = eq_meta.get("agreement")
+        agree_str = (
+            f"  agreement={agreement:.2f}" if isinstance(agreement, (int, float))
+            else ""
+        )
+        reasons = eq_meta.get("reasons") or []
+        reason_str = f"  {reasons[0]}" if reasons else ""
+        summary.add_row("Entry quality", f"{badge}{agree_str}{reason_str}")
+
     # ---- L1 override audit trail ----------------------------------------
     # Render a dedicated banner whenever the L1 block path produced a
     # noteworthy decision: an actual L3 override, a hard-block uphold,

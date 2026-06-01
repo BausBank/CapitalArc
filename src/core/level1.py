@@ -61,6 +61,19 @@ class Level1Config:
     atr_pct_max: float = 6.0
     max_drawdown_pct: float = 10.0
     require_tf_agreement: bool = True
+    # ---- Stage 5: flat-market (chop) detector -----------------------
+    # When True, a market that is *agreed flat* across all timeframes
+    # AND whose mean EMA9/EMA21 separation (in ATR units) is below
+    # ``flat_ema_sep_atr_max`` raises a SOFT ``flat_market`` block
+    # instead of the generic ``trend_mixed``. Chop is where the agent
+    # bleeds fees on whipsaws; refusing it cleanly (with L3 still able
+    # to override) improves entry quality. Disabled by default so the
+    # drop-in changes nothing until the operator opts in.
+    flat_market_detect: bool = False
+    # Mean |EMA9 - EMA21| / ATR at or below which an all-flat tape is
+    # treated as genuine chop. ~0.15 ATR of EMA separation is "the
+    # fast and slow MAs are basically glued together".
+    flat_ema_sep_atr_max: float = 0.15
 
 
 Severity = Literal["info", "warn", "block"]
@@ -584,6 +597,45 @@ class Level1:
                         symbol=symbol,
                     )
                 )
+            elif (
+                self.config.flat_market_detect
+                and per_tf_trend
+                and all(t == "flat" for t in per_tf_trend)
+                and self._mean_ema_sep_atr(rows)
+                <= self.config.flat_ema_sep_atr_max
+            ):
+                # Stage 5: genuine chop - all timeframes flat AND the
+                # fast/slow EMAs are glued together. SOFT block (L3 may
+                # still override on a decisive on-chain thrust).
+                trend_summary = "flat"
+                mean_sep = self._mean_ema_sep_atr(rows)
+                blocking.append(
+                    Level1Reason(
+                        code="flat_market",
+                        severity="block",
+                        is_hard=False,
+                        message=(
+                            f"{symbol}: flat/ranging on "
+                            f"{', '.join(self.config.timeframes)} "
+                            f"(mean EMA9/21 separation {mean_sep:.3f} ATR <= "
+                            f"{self.config.flat_ema_sep_atr_max:.3f}) - "
+                            "no edge in chop, skipping trade."
+                        ),
+                        symbol=symbol,
+                        metadata={
+                            "mean_ema_sep_atr": mean_sep,
+                            "per_tf_trend": per_tf_trend,
+                            # "Beyond" distance: how far below the flat
+                            # ceiling we are (positive = deeper chop).
+                            **_margin_metadata(
+                                value=(
+                                    self.config.flat_ema_sep_atr_max - mean_sep
+                                ),
+                                threshold=self.config.flat_ema_sep_atr_max,
+                            ),
+                        },
+                    )
+                )
             else:
                 trend_summary = "mixed"
                 # Trend-mix marginality: how many timeframes disagree
@@ -641,6 +693,24 @@ class Level1:
             blocking_reasons=blocking,
             informational_reasons=informational,
         )
+
+    @staticmethod
+    def _mean_ema_sep_atr(rows: list[IndicatorRow]) -> float:
+        """Mean |EMA9 - EMA21| / ATR across timeframes (chop metric).
+
+        Small values mean the fast and slow EMAs are glued together -
+        the hallmark of a ranging market. Rows with non-positive ATR
+        are skipped; returns ``inf`` when no usable row exists so the
+        flat detector never fires on degenerate data.
+        """
+        seps: list[float] = []
+        for r in rows:
+            if r.atr <= 0:
+                continue
+            seps.append(abs(r.ema_fast - r.ema_slow) / r.atr)
+        if not seps:
+            return float("inf")
+        return float(sum(seps) / len(seps))
 
     # ------------------------------------------------------------------
     # Indicator math

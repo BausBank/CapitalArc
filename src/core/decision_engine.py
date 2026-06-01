@@ -61,6 +61,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from src.core.entry_quality import EntryQualityGate
 from src.core.level1 import Level1
 from src.core.level2 import Level2
 from src.core.level3 import ArbiterBriefing, Level3
@@ -213,6 +214,15 @@ class DecisionResult:
     # and lets backtests reconstruct every L3 override decision
     # without re-running the LLM.
     l1_override_meta: dict[str, Any] | None = None
+    # Entry-quality audit trail (Day 3). Populated whenever the
+    # EntryQualityGate evaluated a would-be ``risk_on`` open. Contents:
+    # ``status`` (pass / downgrade / block), ``intensity_mult``,
+    # ``reasons``, ``agreement`` and any gate metadata. ``None`` when
+    # the directive was never a risk_on (hold / risk_off) or the gate
+    # was not wired. Lets the CLI render an entry-quality badge and
+    # lets post-mortems reconstruct why a borderline open was trimmed
+    # or held without re-running the engine.
+    entry_quality_meta: dict[str, Any] | None = None
     timestamp: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -252,6 +262,7 @@ class DecisionEngine:
         redistribute_synthetic_l3_weight: bool = True,
         allow_l3_to_override_l1: bool = True,
         l3_override_min_conviction: float = 0.55,
+        entry_quality_gate: EntryQualityGate | None = None,
     ) -> None:
         self.level1 = level1
         self.level2 = level2
@@ -309,6 +320,13 @@ class DecisionEngine:
         # an L1 block. Anything below this is treated as a decline
         # and the engine short-circuits as if L1 had been honoured.
         self.l3_override_min_conviction = float(l3_override_min_conviction)
+        # Day-3 entry-quality gate. Optional and fully no-op on its
+        # default config, so the engine behaves identically when it is
+        # not wired. Runs on the normal cascade path AFTER
+        # `_build_directive`; the L3-overrides-L1 path is intentionally
+        # exempt (Claude already took explicit authority there and the
+        # stacked-veto haircut already clamps intensity).
+        self.entry_quality_gate = entry_quality_gate
         self._validate_weights()
 
     def _validate_weights(self) -> None:
@@ -414,6 +432,14 @@ class DecisionEngine:
             direction_strength,
             scores,
         )
+        entry_quality_meta = self._apply_entry_quality_gate(
+            directive,
+            final_score=final_score,
+            final_direction=final_direction,
+            direction_strength=direction_strength,
+            scores=scores,
+            effective_weights=effective_weights,
+        )
         regime = (
             l2_score.raw.get("l2", {}).get("regime")
             or directive.action.replace("_", "-")
@@ -427,11 +453,105 @@ class DecisionEngine:
             final_direction=final_direction,
             direction_strength=direction_strength,
             effective_weights=effective_weights,
+            entry_quality_meta=entry_quality_meta,
         )
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Entry-quality gate (Day 3)
+    # ------------------------------------------------------------------
+
+    def _apply_entry_quality_gate(
+        self,
+        directive: ExecutionDirective,
+        *,
+        final_score: float,
+        final_direction: int,
+        direction_strength: float,
+        scores: list[LevelScore],
+        effective_weights: dict[str, float],
+    ) -> dict[str, Any] | None:
+        """Run the entry-quality gate over a would-be ``risk_on`` open.
+
+        Mutates ``directive`` in place:
+
+        * ``block``     -> rewrite to a HOLD (side cleared, intensity 0).
+        * ``downgrade`` -> multiply intensity by the gate's multiplier.
+        * ``pass``      -> untouched.
+
+        Returns the audit metadata for ``DecisionResult.entry_quality_meta``
+        (``None`` when the gate is not wired or the directive was never
+        a risk_on open - holds / risk-offs are not entry decisions).
+        """
+        if self.entry_quality_gate is None:
+            return None
+        if directive.action != "risk_on":
+            return None
+
+        l3_sc = self._extract_l3_self_consistency(scores)
+        verdict = self.entry_quality_gate.evaluate(
+            conviction=final_score,
+            direction=final_direction,
+            direction_strength=direction_strength,
+            level_scores=scores,
+            effective_weights=effective_weights,
+            l3_self_consistency=l3_sc,
+        )
+        meta: dict[str, Any] = {
+            "status": verdict.status,
+            "intensity_mult": verdict.intensity_mult,
+            "reasons": list(verdict.reasons),
+            "agreement": verdict.agreement,
+            "original_intensity": directive.intensity,
+            **verdict.metadata,
+        }
+        if verdict.status == "block":
+            reason_txt = "; ".join(verdict.reasons) or "entry-quality block"
+            logger.info(
+                "Entry-quality gate BLOCKED a risk_on open -> HOLD ({})",
+                reason_txt,
+            )
+            directive.action = "hold"
+            directive.side = None
+            directive.intensity = 0.0
+            directive.rationale = (
+                f"ENTRY-QUALITY BLOCK ({reason_txt}) | {directive.rationale}"
+            )
+        elif verdict.status == "downgrade":
+            new_intensity = float(
+                max(0.0, min(1.0, directive.intensity * verdict.intensity_mult))
+            )
+            meta["downgraded_intensity"] = new_intensity
+            reason_txt = "; ".join(verdict.reasons) or "entry-quality downgrade"
+            logger.info(
+                "Entry-quality gate DOWNGRADED a risk_on open | intensity "
+                "{:.3f} -> {:.3f} ({})",
+                directive.intensity, new_intensity, reason_txt,
+            )
+            directive.intensity = new_intensity
+            directive.rationale = (
+                f"ENTRY-QUALITY DOWNGRADE ({reason_txt}) | "
+                f"{directive.rationale}"
+            )
+        return meta
+
+    @staticmethod
+    def _extract_l3_self_consistency(
+        scores: list[LevelScore],
+    ) -> dict[str, Any] | None:
+        """Pull the optional L3 multi-sample self-consistency block."""
+        for s in scores:
+            if s.level != 3:
+                continue
+            l3 = (s.raw or {}).get("l3", {}) or {}
+            sc = l3.get("self_consistency")
+            if isinstance(sc, dict):
+                return sc
+            return None
+        return None
 
     # ------------------------------------------------------------------
     # L1-block resolution

@@ -325,6 +325,22 @@ class Settings(BaseSettings):
     L1_TIMEFRAMES: str = "15m,1h"
     L1_KLINES_LIMIT: int = 150
     L1_REQUIRE_TF_AGREEMENT: bool = False  # was True (TESTING ONLY)
+    # ---------- Stage 5: flat-market (chop) detector ----------
+    # When True, an all-timeframes-flat tape whose mean EMA9/EMA21
+    # separation is <= L1_FLAT_EMA_SEP_ATR_MAX (in ATR units) raises a
+    # SOFT ``flat_market`` block instead of the generic ``trend_mixed``.
+    # Refuses chop cleanly (L3 may still override on a decisive on-chain
+    # thrust). Off by default -> no behaviour change until enabled.
+    L1_FLAT_MARKET_DETECT: bool = False
+    L1_FLAT_EMA_SEP_ATR_MAX: float = 0.15
+
+    # ---------- Stage 7: Level 2 bull-bias offset ----------
+    # Subtracted from the accumulated bull_votes in Level 2's market-
+    # bias voter before the bull/bear margin is computed, correcting a
+    # structural LONG lean (positive funding proxy + upward drift in
+    # trending-up regimes). 0.0 = no-op (default); ~0.5-1.0 trims a
+    # mild persistent long bias seen in live logs.
+    L2_BULL_BIAS_OFFSET: float = 0.0
 
     # ---------- OpenRouter (Level 3 final arbiter) ----------
     # OpenRouter is the LLM gateway in front of Level 3. Setting
@@ -412,6 +428,36 @@ class Settings(BaseSettings):
     # the recommended floor (above the 0.25 flat/mixed plateau but
     # below the typical 0.5-1.0 trend-confirmed band).
     STRONG_DIRECTION_L1_CORROBORATION_MIN: float = 0.40
+
+    # ---------- Day-3 Entry-Quality Gate ----------
+    # Final entry-quality filter over a would-be risk_on open (runs
+    # after the engine builds the directive, on the normal cascade
+    # path only - the L3-overrides-L1 path is exempt). All floors
+    # default to a NO-OP so the gate is invisible until tuned.
+    #   * ENTRY_MIN_CONVICTION_TO_OPEN - aggregated conviction floor to
+    #     open (0.0 = off; raise to e.g. 0.6 to refuse sub-threshold
+    #     opens - note this would also kill mid-band STRONG-DIRECTION
+    #     probes, so keep 0.0 unless that is intended).
+    #   * ENTRY_MIN_DIRECTION_STRENGTH_TO_OPEN - directional-strength
+    #     floor to open (0.0 = off; the conviction-direction decoupler).
+    #   * ENTRY_MIN_LEVEL_AGREEMENT - minimum fraction of the
+    #     directional (weight x conviction) mass that must agree with
+    #     the final direction (0.0 = off). Below it -> downgrade.
+    #   * ENTRY_BLOCK_BELOW_AGREEMENT - hard-block below this agreement
+    #     (0.0 = never hard-block on dissent; must be <= the floor).
+    #   * ENTRY_DISSENT_INTENSITY_MULT - intensity multiplier applied
+    #     on a dissent downgrade (1.0 = no-op; 0.5 = halve a contested
+    #     open).
+    #   * L3_SC_MIN_AGREEMENT - minimum L3 multi-sample agreement before
+    #     a contested open is downgraded (0.0 = off; pairs with the L3
+    #     self-consistency feature below).
+    ENTRY_QUALITY_ENABLED: bool = True
+    ENTRY_MIN_CONVICTION_TO_OPEN: float = 0.0
+    ENTRY_MIN_DIRECTION_STRENGTH_TO_OPEN: float = 0.0
+    ENTRY_MIN_LEVEL_AGREEMENT: float = 0.0
+    ENTRY_BLOCK_BELOW_AGREEMENT: float = 0.0
+    ENTRY_DISSENT_INTENSITY_MULT: float = 1.0
+    L3_SC_MIN_AGREEMENT: float = 0.0
     # When True (default), a synthetic L3 score (no real Gemini wiring
     # yet) gets its weight redistributed proportionally to L1 + L2 in
     # the aggregation, so the placeholder doesn't silently dilute the
@@ -481,6 +527,22 @@ class Settings(BaseSettings):
     # small - we're overriding Claude's judgement, so size
     # conservatively.
     L3_HOLD_RESCUE_INTENSITY: float = 0.30
+
+    # ---------- Day-3 L3 multi-sample self-consistency ----------
+    # When enabled, the arbiter draws extra LLM samples ONLY when the
+    # primary verdict's conviction lands in the borderline band
+    # [L3_SC_BORDERLINE_LOW, L3_SC_BORDERLINE_HIGH], then takes the
+    # majority direction + median conviction/intensity across samples
+    # and records the sample agreement (consumed by L3_SC_MIN_AGREEMENT
+    # in the entry-quality gate). Off by default (samples=1) to protect
+    # the LLM budget; samples is hard-capped at 3 in code.
+    L3_SELF_CONSISTENCY_ENABLED: bool = False
+    L3_SELF_CONSISTENCY_SAMPLES: int = 1
+    L3_SC_BORDERLINE_LOW: float = 0.50
+    L3_SC_BORDERLINE_HIGH: float = 0.65
+    # Temperature for the extra samples (the primary call stays at
+    # OPENROUTER_TEMPERATURE) so the resamples actually vary.
+    L3_SC_TEMPERATURE: float = 0.50
 
     # ---------- Short-selling controls ----------
     # When True, shorts use the same sizing pipeline as longs

@@ -57,6 +57,7 @@ from rich.text import Text
 from src.allocation.allocation_router import AllocationConfig, AllocationRouter
 from src.allocation.risk_engine import RiskEngine
 from src.core.decision_engine import DecisionEngine, LevelScore
+from src.core.entry_quality import EntryQualityGate
 from src.core.level1 import Level1, Level1Config
 from src.core.level2 import Level2, Level2Config
 from src.core.level3 import ArbiterBriefing, Level3, Level3Config
@@ -380,6 +381,22 @@ def _build_level3(settings: Settings) -> tuple[Level3 | None, OpenRouterClient |
             aggression=settings.L3_AGGRESSION,
             hold_rescue_l2_min=settings.L3_HOLD_RESCUE_L2_MIN,
             hold_rescue_intensity=settings.L3_HOLD_RESCUE_INTENSITY,
+            # Day-3 borderline multi-sample self-consistency.
+            self_consistency_enabled=bool(
+                getattr(settings, "L3_SELF_CONSISTENCY_ENABLED", False)
+            ),
+            self_consistency_samples=int(
+                getattr(settings, "L3_SELF_CONSISTENCY_SAMPLES", 1)
+            ),
+            sc_borderline_low=float(
+                getattr(settings, "L3_SC_BORDERLINE_LOW", 0.50)
+            ),
+            sc_borderline_high=float(
+                getattr(settings, "L3_SC_BORDERLINE_HIGH", 0.65)
+            ),
+            sc_temperature=float(
+                getattr(settings, "L3_SC_TEMPERATURE", 0.50)
+            ),
         ),
     )
     return level3, client
@@ -406,6 +423,13 @@ def _build_engine(
             atr_pct_max=settings.L1_ATR_PCT_MAX,
             max_drawdown_pct=settings.MAX_DRAWDOWN_PCT,
             require_tf_agreement=settings.L1_REQUIRE_TF_AGREEMENT,
+            # Stage 5: flat-market (chop) detector.
+            flat_market_detect=bool(
+                getattr(settings, "L1_FLAT_MARKET_DETECT", False)
+            ),
+            flat_ema_sep_atr_max=float(
+                getattr(settings, "L1_FLAT_EMA_SEP_ATR_MAX", 0.15)
+            ),
         ),
         market_data=market_data,
     )
@@ -435,9 +459,22 @@ def _build_engine(
             prefer_hyperliquid_for_perp_metrics=(
                 hyperliquid_intel is not None
             ),
+            # Stage 7: de-bias Level 2's structural long lean.
+            bull_bias_offset=float(
+                getattr(settings, "L2_BULL_BIAS_OFFSET", 0.0)
+            ),
         ),
         dune=dune,
         hyperliquid_intel=hyperliquid_intel,
+    )
+    entry_quality_gate = EntryQualityGate.from_settings(settings)
+    logger.info(
+        "Entry-quality gate wired | enabled={} min_conv={} min_dir={} "
+        "min_agreement={}",
+        getattr(settings, "ENTRY_QUALITY_ENABLED", True),
+        getattr(settings, "ENTRY_MIN_CONVICTION_TO_OPEN", 0.0),
+        getattr(settings, "ENTRY_MIN_DIRECTION_STRENGTH_TO_OPEN", 0.0),
+        getattr(settings, "ENTRY_MIN_LEVEL_AGREEMENT", 0.0),
     )
     return DecisionEngine(
         level1=level1,
@@ -456,6 +493,7 @@ def _build_engine(
         redistribute_synthetic_l3_weight=settings.REDISTRIBUTE_SYNTHETIC_L3_WEIGHT,
         allow_l3_to_override_l1=settings.ALLOW_L3_TO_OVERRIDE_L1,
         l3_override_min_conviction=settings.L3_OVERRIDE_MIN_CONVICTION,
+        entry_quality_gate=entry_quality_gate,
     )
 
 
