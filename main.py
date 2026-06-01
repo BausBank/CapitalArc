@@ -55,6 +55,7 @@ from rich.table import Table
 from rich.text import Text
 
 from src.allocation.allocation_router import AllocationConfig, AllocationRouter
+from src.allocation.risk_engine import RiskEngine
 from src.core.decision_engine import DecisionEngine, LevelScore
 from src.core.level1 import Level1, Level1Config
 from src.core.level2 import Level2, Level2Config
@@ -553,12 +554,29 @@ def _build_router(
     position_manager = PositionManager.from_settings(
         settings, executor=executor, position_arbiter=position_arbiter,
     )
+    # Day-2 Risk Engine: portfolio-level controls (equity gate, post-loss
+    # warm-up, correlated-exposure cap, pre-trade EV filter, per-asset
+    # position caps) layered over the per-trade sizing pipeline. Built
+    # from the operator-friendly .env surface; all-no-op until tuned.
+    risk_engine = RiskEngine.from_settings(settings)
+    logger.info(
+        "RiskEngine | min_equity=${} warmup={}m x{} corr_cap={}% "
+        "ev_filter={}(>={}x@{}bp)",
+        settings.MIN_EQUITY_TO_TRADE_USD,
+        settings.WARMUP_AFTER_LOSS_MINUTES,
+        settings.WARMUP_SIZE_MULT,
+        settings.MAX_CORRELATED_EXPOSURE_PCT,
+        settings.ENABLE_PRETRADE_EV_FILTER,
+        settings.EV_MIN_REWARD_TO_COST,
+        settings.ROUND_TRIP_COST_BPS,
+    )
     return AllocationRouter(
         executor=executor,
         config=cfg,
         dry_run=dry_run,
         usyc_executor=usyc_executor,
         position_manager=position_manager,
+        risk_engine=risk_engine,
     )
 
 

@@ -863,6 +863,61 @@ class Settings(BaseSettings):
     ENABLE_POST_STOP_COOLDOWN: bool = True
     POST_STOP_COOLDOWN_MINUTES: float = 30.0
 
+    # ============================================================
+    # Day-2 Risk Engine - portfolio-level risk controls
+    # ============================================================
+    # These knobs feed :class:`src.allocation.risk_engine.RiskEngine`,
+    # which layers portfolio-level controls on top of the per-trade
+    # sizing pipeline. All defaults are chosen so the engine is a
+    # NO-OP on a flat account until the operator tightens them.
+
+    # ---- (Stage 6a) Minimum-equity-to-trade gate ----
+    # Below this equity the router refuses NEW risk-on opens and holds
+    # cash / USYC instead of churning a sub-scale account through fees.
+    # 0 disables the gate. Example: 200 parks a sub-$200 testnet
+    # account rather than bleeding it on round-trip costs.
+    MIN_EQUITY_TO_TRADE_USD: float = 0.0
+
+    # ---- Post-loss warm-up ramp ----
+    # After a realised loss (stop-out, daily-DD flatten, or any close
+    # whose loss clears WARMUP_TRIGGER_LOSS_PCT of equity) the engine
+    # shrinks EVERY new entry to WARMUP_SIZE_MULT and ramps it back to
+    # 1.0 linearly over WARMUP_AFTER_LOSS_MINUTES. Complements the
+    # per-symbol post-stop cooldown: the cooldown blocks re-entry on the
+    # stopped symbol; the warm-up de-risks the whole book for a while
+    # because a fresh loss is evidence the regime is hostile.
+    ENABLE_LOSS_WARMUP: bool = True
+    WARMUP_AFTER_LOSS_MINUTES: float = 60.0
+    WARMUP_SIZE_MULT: float = 0.5
+    WARMUP_TRIGGER_LOSS_PCT: float = 1.0
+
+    # ---- Correlated-exposure cap ----
+    # Caps aggregate SAME-SIDE notional across a correlation group
+    # (BTC + ETH move together) as a % of equity, shrinking or refusing
+    # a new open that would breach it. Stops the agent from taking the
+    # same directional bet twice under two tickers. 150% with 5x
+    # leverage still leaves head-room; lower it to decorrelate harder.
+    ENABLE_CORRELATION_CAP: bool = True
+    MAX_CORRELATED_EXPOSURE_PCT: float = 150.0
+
+    # ---- (Stage 6b) Pre-trade expected-value (EV) filter ----
+    # Refuses opens whose take-profit reward can't beat the round-trip
+    # cost (fees + slippage, both legs) by EV_MIN_REWARD_TO_COST. Kills
+    # "scalp a 0.05% ATR range" entries that can't pay for themselves.
+    # Pairs with the per-asset ATR cap (which rejects vol that's too
+    # HOT) to bound the tradeable ATR band from both ends.
+    ENABLE_PRETRADE_EV_FILTER: bool = True
+    ROUND_TRIP_COST_BPS: float = 12.0
+    EV_MIN_REWARD_TO_COST: float = 2.0
+
+    # ---- Per-asset max position caps ----
+    # Per-symbol-head hard cap on notional (USD) on top of the global
+    # MAX_POSITION_USD. 0 => use the global cap for that asset. Lets BTC
+    # run bigger than an ALT under one config.
+    MAX_POSITION_USD_BTC: float = 0.0
+    MAX_POSITION_USD_ETH: float = 0.0
+    MAX_POSITION_USD_DEFAULT: float = 0.0
+
     @field_validator("*", mode="before")
     @classmethod
     def _empty_string_to_none(cls, value: Any) -> Any:

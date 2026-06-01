@@ -77,6 +77,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
+from src.allocation.risk_engine import RiskEngine
 from src.core.decision_engine import DecisionResult, ExecutionDirective
 from src.execution.arc_perp_executor import AccountInfo, Position
 from src.execution.circle_wallet import TxResult
@@ -336,6 +337,7 @@ class AllocationRouter:
         dry_run: bool = True,
         usyc_executor: USYCExecutor | None = None,
         position_manager: PositionManager | None = None,
+        risk_engine: RiskEngine | None = None,
     ) -> None:
         # Duck-typed: works with HyperliquidExecutor (production),
         # ArcPerpExecutor (legacy / dry-run telemetry) and any fake
@@ -357,6 +359,12 @@ class AllocationRouter:
                 executor=executor,
             )
         self.position_manager = position_manager
+        # Portfolio-level risk brain (Day-2). Layers equity gate,
+        # post-loss warm-up, correlated-exposure cap, pre-trade EV
+        # filter and per-asset position caps on top of the per-trade
+        # sizing pipeline. Defaults to an all-no-op engine so the
+        # router behaves identically until the operator tunes limits.
+        self.risk_engine = risk_engine or RiskEngine()
         # Surfaces the most recent review so the console panel can
         # paint the FULL set of open positions (not only the ones
         # that triggered) on every cycle.
@@ -450,13 +458,39 @@ class AllocationRouter:
         # whose existing exposure has already crossed one of the
         # stewardship thresholds.
         managed = await self._apply_position_review(
-            review=review, directive=directive, decision=decision
+            review=review, directive=directive, decision=decision,
+            account=account,
         )
         if managed is not None:
             return managed
 
         # ---- Dispatch on engine directive -------------------------------
         if directive.action == "risk_on":
+            # ---- Minimum-equity-to-trade gate (Stage 6a) --------------
+            # Below a configurable equity floor we refuse new opens and
+            # hold cash / USYC rather than churn a sub-scale account
+            # through fees. Owned by the RiskEngine; off by default.
+            equity_block = self.risk_engine.equity_gate(account.equity_usd)
+            if equity_block is not None:
+                logger.info("Router: skip risk_on - {}", equity_block)
+                plan = ExecutionPlan(
+                    decision_id=decision_id,
+                    action="hold",
+                    symbol=self.config.perp_symbol,
+                    size_usd=Decimal("0"),
+                    leverage=Decimal("0"),
+                    rationale=f"min_equity_gate: {equity_block}",
+                    extra={
+                        "guard": "min_equity_gate",
+                        "equity_usd": float(account.equity_usd),
+                        "min_equity_to_trade_usd": float(
+                            self.risk_engine.config.min_equity_to_trade_usd
+                        ),
+                    },
+                )
+                self._attach_position_review(plan, review)
+                return plan
+
             # ---- Post-stop-out cooldown guard (Stage 4) ---------------
             # After a stop_loss close on this symbol, refuse a fresh
             # entry for ``POST_STOP_COOLDOWN_MINUTES``. This breaks the
@@ -566,6 +600,34 @@ class AllocationRouter:
                 plan = self._deny(decision_id, f"per-asset ATR cap: {cap_block}")
                 self._attach_position_review(plan, review)
                 return plan
+
+            # ---- Pre-trade expected-value (EV) filter (Stage 6b) ------
+            # Refuse opens whose take-profit reward can't beat the
+            # round-trip cost by the configured ratio. Pairs with the
+            # per-asset ATR cap above: the cap rejects vol that's too
+            # HOT, the EV filter rejects vol that's too COLD to pay for
+            # a round trip. Together they bound the tradeable ATR band.
+            tp_reward_pct = self._estimate_tp_reward_pct(decision)
+            ev_ok, ev_info = self.risk_engine.ev_ok(tp_reward_pct=tp_reward_pct)
+            if not ev_ok:
+                logger.info(
+                    "Router: skip risk_on - EV filter (TP {:.1f}bp < "
+                    "required {:.1f}bp).",
+                    ev_info.get("tp_reward_bps", 0.0),
+                    ev_info.get("required_bps", 0.0),
+                )
+                plan = self._deny(
+                    decision_id,
+                    "pre-trade EV filter: take-profit reward "
+                    f"{ev_info.get('tp_reward_bps', 0.0):.1f}bp < required "
+                    f"{ev_info.get('required_bps', 0.0):.1f}bp "
+                    f"({self.risk_engine.config.ev_min_reward_to_cost:.1f}x "
+                    f"round-trip cost). Trade can't pay for itself.",
+                )
+                plan.extra["guard"] = "pretrade_ev_filter"
+                plan.extra["ev"] = ev_info
+                self._attach_position_review(plan, review)
+                return plan
             return await self._do_risk_on(
                 decision_id,
                 directive,
@@ -619,6 +681,35 @@ class AllocationRouter:
         # on-chain code path.
         sizing = self._compute_size(directive, account, decision)
         size_usd = sizing["size_usd"]
+
+        # ---- Portfolio risk-control floor -------------------------------
+        # A portfolio control (correlated-exposure cap) can legitimately
+        # shrink the new open to $0 when the group is already at its
+        # exposure limit. Opening a $0 position is meaningless on a
+        # netting venue, so we convert it into an explicit HOLD with the
+        # blocking reason surfaced for the panel / post-mortem.
+        if size_usd <= 0:
+            corr = sizing.get("correlation") or {}
+            reason = (
+                "correlated-exposure cap left no room for a new "
+                f"{directive.side or 'long'} {self.config.perp_symbol} "
+                f"(group={corr.get('group')}, existing same-side "
+                f"${corr.get('existing_same_side_usd', 0):.2f} >= cap "
+                f"${corr.get('cap_usd', 0):.2f})."
+            )
+            logger.info("Router: skip risk_on - {}", reason)
+            plan = ExecutionPlan(
+                decision_id=decision_id,
+                action="hold",
+                symbol=self.config.perp_symbol,
+                size_usd=Decimal("0"),
+                leverage=Decimal("0"),
+                rationale=f"correlation_cap: {reason}",
+                extra={"guard": "correlation_cap", "sizing": sizing},
+            )
+            self._attach_position_review(plan, self.last_position_review)
+            return plan
+
         leverage = self._leverage_from_directive(directive)
         side = directive.side or "long"
         if side == "short" and not self.config.symmetric_short_sizing:
@@ -841,6 +932,21 @@ class AllocationRouter:
                 "starting_pnl_usd": str(account.total_unrealized_pnl_usd),
                 "risk_off_withdraw": self.config.risk_off_withdraw,
             },
+        )
+
+        # ---- Post-loss warm-up bookkeeping ------------------------------
+        # A risk-off flatten that realises a loss feeds the warm-up
+        # ramp. Label daily-DD kill-switch fires explicitly so they
+        # always arm the warm-up (a "we were wrong" event), while a
+        # routine risk-off only arms it when the loss clears the
+        # configured threshold.
+        warmup_trigger = (
+            "daily_dd_guard" if "daily-DD" in (reason or "") else "risk_off_close"
+        )
+        self.risk_engine.note_close_event(
+            trigger=warmup_trigger,
+            pnl_usd=account.total_unrealized_pnl_usd,
+            equity_usd=account.equity_usd,
         )
 
         # ---- 1. Close perp position(s) ----------------------------------
@@ -1127,6 +1233,7 @@ class AllocationRouter:
         review: PositionReview,
         directive: ExecutionDirective,
         decision: DecisionResult,
+        account: AccountInfo | None = None,
     ) -> ExecutionPlan | None:
         """Translate a :class:`PositionReview` into an ExecutionPlan.
 
@@ -1173,6 +1280,13 @@ class AllocationRouter:
                 # Stash on the review so the panel can render the
                 # advisory; we DON'T return - the cycle continues.
                 continue
+
+            # ---- Post-loss warm-up bookkeeping -----------------------
+            # Any realised close feeds the RiskEngine's warm-up ramp;
+            # it self-filters to only arm on a genuine loss (stop_loss /
+            # daily_dd / loss beyond threshold). Done here so EVERY
+            # close verb (partial, full, flip) is accounted for.
+            self._note_close_for_warmup(action, account)
 
             # ---- Partial close ---------------------------------------
             if action.action == "partial_close":
@@ -1249,6 +1363,29 @@ class AllocationRouter:
             return plan
 
         return None
+
+    def _note_close_for_warmup(
+        self,
+        action: Any,
+        account: AccountInfo | None,
+    ) -> None:
+        """Feed a realised close to the RiskEngine's post-loss warm-up.
+
+        Best-effort: the RiskEngine self-filters to arm only on a real
+        loss (``stop_loss`` / ``daily_dd_guard`` trigger or a loss
+        beyond the configured threshold). Needs equity for the
+        loss-as-%-of-equity test; silently skips when it's unavailable.
+        """
+        if account is None:
+            return
+        try:
+            self.risk_engine.note_close_event(
+                trigger=getattr(action, "trigger", "close"),
+                pnl_usd=getattr(action, "pnl_usd", Decimal("0")),
+                equity_usd=account.equity_usd,
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break routing
+            logger.debug("warm-up note_close_event failed: {}", exc)
 
     @staticmethod
     def _position_manager_extra(action: Any) -> dict[str, Any]:
@@ -1602,6 +1739,7 @@ class AllocationRouter:
                 size_usd=sized,
                 cap_hit=sized >= self.config.max_position_usd,
             )
+            self._apply_portfolio_risk_controls(breakdown, directive, account)
             return breakdown
 
         atr_pct = self._primary_atr_pct(decision)
@@ -1651,7 +1789,65 @@ class AllocationRouter:
         sized = Decimal(str(round(capped, 2)))
         breakdown["size_usd"] = sized
         breakdown["cap_hit"] = sized >= self.config.max_position_usd
+        self._apply_portfolio_risk_controls(breakdown, directive, account)
         return breakdown
+
+    def _apply_portfolio_risk_controls(
+        self,
+        breakdown: dict[str, Any],
+        directive: ExecutionDirective,
+        account: AccountInfo,
+    ) -> None:
+        """Layer the RiskEngine's portfolio controls over the base size.
+
+        Applied to BOTH the vol-targeted and the directive-override
+        sizing paths so the engine can never bypass portfolio safety
+        by handing the router an explicit ``target_size_usd``.
+
+        Order (each tightens, never loosens):
+          1. **Warm-up ramp** - shrink after a recent realised loss.
+          2. **Per-asset cap** - clip to this symbol's notional ceiling.
+          3. **Correlated-exposure cap** - clip so aggregate same-side
+             notional across the correlation group stays under the
+             equity-scaled limit (may reach $0 -> the router converts
+             that into a HOLD).
+
+        The full attribution is stamped into ``breakdown`` so the
+        Execution Plan panel shows every adjustment.
+        """
+        sized = breakdown.get("size_usd")
+        if not isinstance(sized, Decimal):
+            sized = Decimal(str(sized or "0"))
+
+        # (1) Post-loss warm-up ramp.
+        warmup_mult = self.risk_engine.warmup_multiplier()
+        breakdown["warmup_mult"] = round(warmup_mult, 4)
+        if warmup_mult < 1.0:
+            sized = (sized * Decimal(str(warmup_mult))).quantize(Decimal("0.01"))
+        breakdown["after_warmup_size_usd"] = float(sized)
+
+        # (2) Per-asset notional cap.
+        sized, asset_cap = self.risk_engine.apply_per_asset_cap(
+            symbol=self.config.perp_symbol,
+            size_usd=sized,
+            global_max_usd=self.config.max_position_usd,
+        )
+        breakdown["per_asset_cap_usd"] = float(asset_cap)
+
+        # (3) Correlated-exposure cap.
+        side = directive.side or "long"
+        adjusted, corr_info = self.risk_engine.correlation_adjust(
+            symbol=self.config.perp_symbol,
+            side=side,
+            proposed_size_usd=sized,
+            open_positions=list(account.positions),
+            equity_usd=account.equity_usd,
+        )
+        breakdown["correlation"] = corr_info
+        sized = adjusted
+
+        breakdown["size_usd"] = sized
+        breakdown["cap_hit"] = sized >= self.config.max_position_usd
 
     def _atr_cap_block_reason(
         self, decision: DecisionResult
@@ -1704,6 +1900,33 @@ class AllocationRouter:
         if symbol in per:
             return float(per[symbol])
         return self.config.risk_multiplier_default
+
+    def _estimate_tp_reward_pct(
+        self, decision: DecisionResult
+    ) -> float | None:
+        """Estimate the take-profit reward (% of entry) for the EV filter.
+
+        Mirrors the venue-side TP pricing precedence so the EV gate
+        judges the SAME reward the trade will actually rest its target
+        at:
+          * dynamic ATR (preferred): ``tp_atr_mult * live ATR%``;
+          * fixed-pct fallback: ``take_profit_pct * 100``.
+
+        Returns ``None`` when no take-profit reward can be estimated
+        (TP disabled, or dynamic mode with no ATR) - the EV gate then
+        fails open and lets other guards decide.
+        """
+        pm_cfg = self.position_manager.config
+        if not getattr(pm_cfg, "enable_take_profit", True):
+            return None
+        if getattr(pm_cfg, "use_dynamic_atr_tpsl", False):
+            atr_pct = self._primary_atr_pct(decision)
+            if atr_pct is not None and atr_pct > 0:
+                return float(pm_cfg.tp_atr_mult) * float(atr_pct)
+        tp_pct = getattr(pm_cfg, "take_profit_pct", None)
+        if tp_pct is not None and tp_pct > 0:
+            return float(tp_pct) * 100.0
+        return None
 
     def _primary_atr_pct(self, decision: DecisionResult) -> float | None:
         """Pull the primary symbol's average ATR% out of L1's raw payload."""
