@@ -400,6 +400,18 @@ class Settings(BaseSettings):
     # and open a *reduced-size* position. Raise to 0.8 to fire almost
     # never; lower to 0.5 for more frequent opens.
     STRONG_BIAS_OPEN_STRENGTH: float = 0.6
+    # ---------- STRONG-DIRECTION L1 corroboration (Day-6+) ----------
+    # When the mid-band STRONG-DIRECTION override fires, it normally
+    # only checks the conviction-weighted direction vote. In ranging
+    # markets L1 outputs ``strength=0.25`` (hard-coded for flat/mixed
+    # trend) which contributes near-zero to the direction vote -
+    # meaning L2 + L3 alone can swing the engine into a LONG even
+    # when the technical picture says "I have no opinion". This gate
+    # demands that L1's conviction CLEARS this floor before the
+    # mid-band override is allowed. Set to 0.0 to disable; 0.40 is
+    # the recommended floor (above the 0.25 flat/mixed plateau but
+    # below the typical 0.5-1.0 trend-confirmed band).
+    STRONG_DIRECTION_L1_CORROBORATION_MIN: float = 0.40
     # When True (default), a synthetic L3 score (no real Gemini wiring
     # yet) gets its weight redistributed proportionally to L1 + L2 in
     # the aggregation, so the placeholder doesn't silently dilute the
@@ -810,6 +822,23 @@ class Settings(BaseSettings):
     # zeroing out its threshold (keeps panel telemetry intact).
     ENABLE_TRAILING_STOP: bool = True
     ENABLE_RE_EVALUATION: bool = True
+
+    # ============================================================
+    # Day-6+ Anti-overlap / anti-chop router guards
+    # ============================================================
+    # Hyperliquid is a *netting* venue: a second ``open_position`` on
+    # an already-open ``(symbol, side)`` ADDS notional to the existing
+    # position rather than opening a separate one. In ranging markets
+    # the agent can issue ``risk_on long`` on every full cycle while
+    # the previous long is still alive, silently stacking exposure
+    # and amplifying every adverse tick. When True (default), the
+    # AllocationRouter pre-empts the regime dispatch with a HOLD
+    # whenever the surviving review snapshot already contains a
+    # same-side position. The PositionManager keeps stewardship; the
+    # router never doubles down. Flip to False ONLY to restore the
+    # legacy "always add" behaviour (e.g. for averaging-down strategies
+    # under a different risk model).
+    BLOCK_DUPLICATE_SAME_SIDE_OPENS: bool = True
 
     @field_validator("*", mode="before")
     @classmethod

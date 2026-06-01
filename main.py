@@ -447,6 +447,11 @@ def _build_engine(
         risk_off_threshold=settings.RISK_OFF_THRESHOLD,
         short_bias_min_strength=settings.SHORT_BIAS_MIN_STRENGTH,
         strong_bias_open_strength=settings.STRONG_BIAS_OPEN_STRENGTH,
+        # Day-6+ anti-chop: require L1 to corroborate STRONG-DIRECTION
+        # mid-band overrides (L1 must clear the 0.25 flat/mixed plateau).
+        strong_direction_l1_corroboration_min=float(
+            getattr(settings, "STRONG_DIRECTION_L1_CORROBORATION_MIN", 0.40)
+        ),
         redistribute_synthetic_l3_weight=settings.REDISTRIBUTE_SYNTHETIC_L3_WEIGHT,
         allow_l3_to_override_l1=settings.ALLOW_L3_TO_OVERRIDE_L1,
         l3_override_min_conviction=settings.L3_OVERRIDE_MIN_CONVICTION,
@@ -503,6 +508,12 @@ def _build_router(
         usyc_enabled=settings.USYC_ENABLED,
         usdc_reserve_usd=Decimal(str(settings.USYC_USDC_RESERVE_USD)),
         risk_off_withdraw=settings.RISK_OFF_WITHDRAW,
+        # Day-6+ anti-overlap guard: refuse same-side opens when an
+        # existing position survives the cycle's PositionReview.
+        # See src/utils/config.py::BLOCK_DUPLICATE_SAME_SIDE_OPENS.
+        block_duplicate_same_side_opens=bool(
+            getattr(settings, "BLOCK_DUPLICATE_SAME_SIDE_OPENS", True)
+        ),
     )
     logger.info(
         "Sizing | risk={:.2f}% stop={}xATR mults BTC={} ETH={} default={}",
@@ -1877,6 +1888,9 @@ def _build_decision_from_scenario(
         risk_off_threshold=settings.RISK_OFF_THRESHOLD,
         short_bias_min_strength=settings.SHORT_BIAS_MIN_STRENGTH,
         strong_bias_open_strength=settings.STRONG_BIAS_OPEN_STRENGTH,
+        strong_direction_l1_corroboration_min=float(
+            getattr(settings, "STRONG_DIRECTION_L1_CORROBORATION_MIN", 0.40)
+        ),
         redistribute_synthetic_l3_weight=settings.REDISTRIBUTE_SYNTHETIC_L3_WEIGHT,
     )
     effective = engine._effective_weights(scores)
@@ -2135,6 +2149,9 @@ async def run_test_bias(
         risk_off_threshold=settings.RISK_OFF_THRESHOLD,
         short_bias_min_strength=settings.SHORT_BIAS_MIN_STRENGTH,
         strong_bias_open_strength=settings.STRONG_BIAS_OPEN_STRENGTH,
+        strong_direction_l1_corroboration_min=float(
+            getattr(settings, "STRONG_DIRECTION_L1_CORROBORATION_MIN", 0.40)
+        ),
         redistribute_synthetic_l3_weight=settings.REDISTRIBUTE_SYNTHETIC_L3_WEIGHT,
     )
 

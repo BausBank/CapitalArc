@@ -83,6 +83,7 @@ from src.execution.circle_wallet import TxResult
 from src.execution.position_manager import (
     PositionManager,
     PositionReview,
+    PositionSnapshot,
 )
 from src.execution.usyc_executor import USYCExecutor, USYCSnapshot
 from src.utils.logging import logger
@@ -250,6 +251,18 @@ class AllocationConfig:
     # is the Fast-Path complement to the per-asset volatility rule
     # in the LLM prompt - the gate runs even when L3 is offline.
     enforce_per_asset_atr_cap: bool = True
+    # ------------- Anti-overlap (HL netting) guard -------------
+    # Hyperliquid nets same-side opens into the existing position
+    # (one slot per ``(symbol, side)``). Without an explicit gate,
+    # every full cycle that re-affirms ``risk_on`` on a side we
+    # already hold will SILENTLY add notional - which in chop is
+    # exactly the "stack into a doomed LONG every 10 min" failure
+    # mode we observed in live testing on 2026-05-26. When True
+    # (default), the router pre-empts the regime dispatch with a
+    # HOLD as soon as a surviving same-side position exists in the
+    # cycle's PositionReview snapshot. Stewardship still belongs to
+    # the PositionManager; the router simply refuses to double down.
+    block_duplicate_same_side_opens: bool = True
 
 
 @dataclass
@@ -444,6 +457,53 @@ class AllocationRouter:
 
         # ---- Dispatch on engine directive -------------------------------
         if directive.action == "risk_on":
+            # ---- Anti-overlap guard (HL netting safety) ---------------
+            # If we already hold a position on the *same* side that
+            # survived this cycle's PositionReview (i.e. it didn't get
+            # closed/flipped by the Fast Path), DO NOT issue another
+            # ``open_position`` - on a netting venue that would silently
+            # ADD notional to the existing position. Stewardship belongs
+            # to the PositionManager (TP/SL/trail/time-exit run on every
+            # cycle); the router's job is to OPEN, not to stack.
+            duplicate_block = self._already_in_same_side(
+                review=review, side=directive.side or "long",
+            )
+            if duplicate_block is not None:
+                logger.info(
+                    "Router: skip risk_on - already {} on {} "
+                    "(size={}, age={:.0f}m). Stewardship belongs to "
+                    "PositionManager; no duplicate stacking.",
+                    duplicate_block.side, duplicate_block.symbol,
+                    duplicate_block.size_usd,
+                    duplicate_block.age_minutes or 0.0,
+                )
+                plan = ExecutionPlan(
+                    decision_id=decision_id,
+                    action="hold",
+                    symbol=self.config.perp_symbol,
+                    size_usd=Decimal("0"),
+                    leverage=Decimal("0"),
+                    rationale=(
+                        f"duplicate_open_blocked: already {duplicate_block.side} "
+                        f"{duplicate_block.symbol} (size=${duplicate_block.size_usd}, "
+                        f"PnL%={duplicate_block.pnl_pct:+.2f}, "
+                        f"age={duplicate_block.age_minutes or 0.0:.0f}m). "
+                        "Router refuses to stack on a netting venue."
+                    ),
+                    extra={
+                        "guard": "duplicate_open_blocked",
+                        "existing_side": duplicate_block.side,
+                        "existing_size_usd": float(duplicate_block.size_usd),
+                        "existing_pnl_pct": duplicate_block.pnl_pct,
+                        "existing_age_minutes": duplicate_block.age_minutes,
+                        "directive_side": directive.side,
+                        "directive_intensity": directive.intensity,
+                        "directive_conviction": directive.conviction,
+                    },
+                )
+                self._attach_position_review(plan, review)
+                return plan
+
             # Per-asset ATR cap gate (Fast-Path complement to the L3
             # critical-mode per-asset volatility rule). When the
             # primary symbol's live ATR% on 1h exceeds the cap, refuse
@@ -887,6 +947,46 @@ class AllocationRouter:
             leverage=Decimal("0"),
             rationale=reason,
         )
+
+    def _already_in_same_side(
+        self,
+        review: PositionReview | None,
+        side: str,
+    ) -> PositionSnapshot | None:
+        """Return a surviving same-side snapshot, or None.
+
+        A *surviving* snapshot is one that was NOT closed/flipped by
+        the Fast Path this cycle - i.e. its ``action`` is ``"hold"``
+        or a state-only verb (``"arm_breakeven"`` / ``"tighten_stop"``).
+        ``"close"`` / ``"partial_close"`` / ``"side_flip"`` are excluded
+        so a close-then-open chain on a flip can still execute the
+        new open after the existing slot has been emptied.
+
+        The check is gated on
+        :attr:`AllocationConfig.block_duplicate_same_side_opens`
+        so operators can fall back to the legacy "always add" behaviour
+        without ripping out the guard.
+        """
+        if not self.config.block_duplicate_same_side_opens:
+            return None
+        if review is None or not review.snapshots:
+            return None
+        symbol = self.config.perp_symbol
+        side_norm = (side or "").lower()
+        # Verbs that mean "this position will NOT exist after the cycle":
+        closing_verbs = {"close", "partial_close", "side_flip"}
+        for snap in review.snapshots:
+            if snap.symbol != symbol:
+                continue
+            if (snap.side or "").lower() != side_norm:
+                continue
+            # ``partial_close`` shrinks but doesn't eliminate the slot;
+            # we still want to block stacking on top of a partial.
+            if snap.action == "close" or snap.action == "side_flip":
+                continue
+            # Surviving same-side position - block the new open.
+            return snap
+        return None
 
     def _mk_decision_id(self, decision: DecisionResult) -> str:
         ts = int(decision.timestamp.timestamp())

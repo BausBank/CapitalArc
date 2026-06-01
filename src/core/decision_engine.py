@@ -248,6 +248,7 @@ class DecisionEngine:
         risk_off_threshold: float = 0.4,
         short_bias_min_strength: float = 0.35,
         strong_bias_open_strength: float = 0.6,
+        strong_direction_l1_corroboration_min: float = 0.40,
         redistribute_synthetic_l3_weight: bool = True,
         allow_l3_to_override_l1: bool = True,
         l3_override_min_conviction: float = 0.55,
@@ -272,6 +273,23 @@ class DecisionEngine:
         # trades on ambiguous heat; higher => only the cleanest
         # directional setups override hold.
         self.strong_bias_open_strength = strong_bias_open_strength
+        # ---------- STRONG-DIRECTION L1 corroboration floor ----------
+        # In ranging markets L1 emits a HARD-CODED conviction of 0.25
+        # for ``trend in {flat, mixed}`` (level1.py:148-154). That is
+        # not a real signal - it just means "I am not blocking, but
+        # I have no opinion." Without this floor, L2 + L3 alone can
+        # drag the mid-band STRONG-DIRECTION override into a LONG
+        # entry on flat tape just because positive funding + mild
+        # up-drift skew bullish (Day-6 anti-chop diagnosis).
+        # When set to a value > 0.25, a mid-band STRONG-DIRECTION
+        # entry requires L1 to have moved OFF the flat/mixed plateau
+        # (i.e. trend is actually up/down with measurable strength).
+        # Default 0.40 is comfortably above the 0.25 plateau but
+        # below the typical 0.5-1.0 trend-confirmed band, so a real
+        # but weak trend still qualifies. Set to 0.0 to disable.
+        self.strong_direction_l1_corroboration_min = float(
+            strong_direction_l1_corroboration_min
+        )
         # When True and L3 is the synthetic placeholder (no real
         # Gemini wiring), redistribute L3's weight proportionally to
         # L1 + L2 in `_aggregate`. Without this, the placeholder L3
@@ -1104,10 +1122,40 @@ class DecisionEngine:
         # unanimous directional vote can justify a *reduced-size*
         # entry rather than sitting idle. Intensity is deliberately
         # conservative: `0.5 * conviction * direction_strength`.
+        #
+        # Day-6+ L1-corroboration gate (anti-chop):
+        #   L1 emits hard-coded conviction = 0.25 for trend in
+        #   {flat, mixed}. Without a corroboration floor, L2 + L3 alone
+        #   can swing this override into a LONG on flat tape (positive
+        #   funding + mild up-drift bias L2 bull). We require L1 to
+        #   have moved OFF that plateau (default >= 0.40) before
+        #   allowing the override - so a real but weak trend qualifies
+        #   while pure chop is held.
         if (
             side_from_dir is not None
             and direction_strength >= self.strong_bias_open_strength
         ):
+            l1_score_value = next(
+                (s.score for s in scores if s.level == 1), 0.0
+            )
+            l1_floor = self.strong_direction_l1_corroboration_min
+            if l1_score_value < l1_floor:
+                # L1 has no opinion (flat/mixed plateau). Refuse the
+                # mid-band override even though L2 + L3 lean.
+                return ExecutionDirective(
+                    action="hold",
+                    side=None,
+                    intensity=0.0,
+                    rationale=(
+                        f"STRONG-DIRECTION suppressed: L1 conv "
+                        f"{l1_score_value:.2f} < floor {l1_floor:.2f} "
+                        f"({dir_tag}, mid-band hold) | {rationale}"
+                    ),
+                    market_bias=bias,
+                    bias_strength=bias_strength,
+                    conviction=final_score,
+                    direction_strength=direction_strength,
+                )
             intensity = float(
                 min(1.0, 0.5 * final_score * direction_strength)
             )
@@ -1116,8 +1164,9 @@ class DecisionEngine:
                 side=side_from_dir,
                 intensity=intensity,
                 rationale=(
-                    f"STRONG-DIRECTION override {dir_tag} mid-band | "
-                    f"{rationale}"
+                    f"STRONG-DIRECTION override (L1 corroborated "
+                    f"conv={l1_score_value:.2f}>=floor{l1_floor:.2f}) "
+                    f"{dir_tag} mid-band | {rationale}"
                 ),
                 market_bias=bias,
                 bias_strength=bias_strength,
