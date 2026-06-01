@@ -263,6 +263,20 @@ class PositionManagerConfig:
     enable_daily_dd_guard: bool = True
     daily_loss_limit_pct: float = 5.0
 
+    # ---- Post-stop-out cooldown (Stage 4 / Day-1) ----
+    # After a ``stop_loss`` close fires on a symbol, the manager arms
+    # a per-symbol cooldown. While it is active the AllocationRouter
+    # refuses a fresh risk-on open on that symbol, breaking the
+    # "stop -> instant re-entry -> stop again" chop loop. The cooldown
+    # is PER-SYMBOL (not per ``(symbol, side)``): a long stop-out also
+    # suppresses an immediate short re-entry, because what we distrust
+    # after a stop is the symbol's near-term regime, not one side of
+    # it. Bookkeeping lives in :attr:`PositionManager._stop_out_cooldowns`
+    # which SURVIVES the per-position state GC (the position is, by
+    # definition, already closed when the cooldown starts).
+    enable_post_stop_cooldown: bool = True
+    post_stop_cooldown_minutes: float = 30.0
+
     # ---- Per-asset ATR caps ----
     atr_caps: PerAssetATRCaps = field(default_factory=PerAssetATRCaps)
 
@@ -786,6 +800,14 @@ class _LLMCallStats:
     resync_recovered_missing: int = 0
     resync_phantom_in_snapshot: int = 0
     resync_fallbacks_to_snapshot: int = 0
+    # Post-stop-out cooldown (Stage 4). ``stop_out_cooldowns_armed``
+    # counts how many times a stop_loss close armed a per-symbol
+    # cooldown; ``stop_out_cooldown_blocks`` counts how many risk-on
+    # opens the router refused because a cooldown was still active.
+    # Both surface on the panel so the operator can see the gate is
+    # actually breaking re-entry loops (not silently inert).
+    stop_out_cooldowns_armed: int = 0
+    stop_out_cooldown_blocks: int = 0
 
     @property
     def llm_call_rate(self) -> float:
@@ -1073,6 +1095,15 @@ class PositionManager:
             position_arbiter is not None and position_arbiter is not _null_arbiter
         )
         self._states: dict[tuple[str, str], _PositionState] = {}
+        # Post-stop-out cooldown (Stage 4). Keyed by SYMBOL (not
+        # ``(symbol, side)``) so a stop-out on either side suppresses
+        # re-entry on the whole symbol. Maps symbol -> UTC timestamp
+        # of the stop_loss close that armed the cooldown. Intentionally
+        # NOT part of ``_states`` (which is GC'd the moment a position
+        # closes) - the cooldown must outlive the position it came
+        # from. Expired entries are pruned lazily on query and
+        # eagerly each cycle in :meth:`_gc_stop_out_cooldowns`.
+        self._stop_out_cooldowns: dict[str, datetime] = {}
         self._daily_dd = _DailyDDTracker()
         # Soft block for the "daily DD breached" kill switch - the
         # router reads this to refuse new opens until the operator
@@ -1172,6 +1203,9 @@ class PositionManager:
         # Garbage-collect state for positions that no longer exist
         # (so the in-memory dict doesn't grow unbounded across cycles).
         self._gc_states(open_positions)
+        # Prune expired post-stop-out cooldowns so the dict stays
+        # bounded even for symbols the router never re-queries.
+        self._gc_stop_out_cooldowns()
 
         if not open_positions:
             review.notes.append("no open positions to manage")
@@ -1339,6 +1373,13 @@ class PositionManager:
                 final_actions.append(fa)
             else:
                 final_actions.append(fa)
+
+        # ---- Arm post-stop-out cooldowns ----------------------------
+        # Done AFTER the merge so a Smart-Path veto of a Fast-Path
+        # stop_loss (downgrade close -> hold) correctly does NOT arm
+        # the cooldown: we key off the FINAL action the router will
+        # actually execute, not the raw Fast-Path verdict.
+        self._record_stop_out_cooldowns(final_actions)
 
         # ---- Render snapshots ---------------------------------------
         for pos, action, fa in zip(open_positions, final_actions, fast_actions):
@@ -2936,6 +2977,100 @@ class PositionManager:
             if key not in live_keys:
                 self._states.pop(key, None)
 
+    # ------------------------------------------------------------------
+    # Post-stop-out cooldown (Stage 4 / Day-1)
+    # ------------------------------------------------------------------
+
+    def _record_stop_out_cooldowns(
+        self,
+        actions: list[PositionAction],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Arm a per-symbol cooldown for every ``stop_loss`` close.
+
+        Called once per cycle on the FINAL (post-merge) action list so
+        a Smart-Path veto of a Fast-Path stop_loss does not arm the
+        cooldown. Only the ``stop_loss`` trigger arms it: a
+        ``take_profit`` / ``time_exit`` / ``side_flip`` / ``daily_dd_guard``
+        close is a different event and must not suppress re-entry.
+
+        No-op when the feature is disabled or the configured window is
+        non-positive (so the query side can short-circuit cheaply).
+        """
+        if not self.config.enable_post_stop_cooldown:
+            return
+        if self.config.post_stop_cooldown_minutes <= 0:
+            return
+        stamp = now or datetime.now(timezone.utc)
+        for action in actions:
+            if action.action == "close" and action.trigger == "stop_loss":
+                self._stop_out_cooldowns[action.symbol] = stamp
+                self.stats.stop_out_cooldowns_armed += 1
+                logger.info(
+                    "Post-stop-out cooldown ARMED for {} | {:.0f}m no "
+                    "re-entry (stop_loss close; pnl={:.2f}%).",
+                    action.symbol,
+                    self.config.post_stop_cooldown_minutes,
+                    action.pnl_pct * 100,
+                )
+
+    def stop_out_cooldown_remaining_minutes(
+        self,
+        symbol: str,
+        *,
+        now: datetime | None = None,
+    ) -> float | None:
+        """Minutes left in ``symbol``'s post-stop-out cooldown, or None.
+
+        Returns ``None`` when the feature is off, the window is
+        non-positive, the symbol was never stopped out, or the
+        cooldown has already elapsed. An elapsed cooldown is pruned
+        from the map as a side-effect so the dict stays small.
+        """
+        if not self.config.enable_post_stop_cooldown:
+            return None
+        if self.config.post_stop_cooldown_minutes <= 0:
+            return None
+        started = self._stop_out_cooldowns.get(symbol)
+        if started is None:
+            return None
+        stamp = now or datetime.now(timezone.utc)
+        elapsed_min = (stamp - started).total_seconds() / 60.0
+        remaining = self.config.post_stop_cooldown_minutes - elapsed_min
+        if remaining <= 0.0:
+            # Expired - prune lazily so a never-re-queried symbol
+            # doesn't linger in the map forever.
+            self._stop_out_cooldowns.pop(symbol, None)
+            return None
+        return remaining
+
+    def in_stop_out_cooldown(
+        self,
+        symbol: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """True when ``symbol`` is inside an active post-stop-out cooldown."""
+        return (
+            self.stop_out_cooldown_remaining_minutes(symbol, now=now)
+            is not None
+        )
+
+    def _gc_stop_out_cooldowns(self, *, now: datetime | None = None) -> None:
+        """Drop cooldown entries whose window has fully elapsed."""
+        if not self._stop_out_cooldowns:
+            return
+        stamp = now or datetime.now(timezone.utc)
+        window = self.config.post_stop_cooldown_minutes
+        if window <= 0:
+            self._stop_out_cooldowns.clear()
+            return
+        for symbol in list(self._stop_out_cooldowns):
+            started = self._stop_out_cooldowns[symbol]
+            if (stamp - started).total_seconds() / 60.0 >= window:
+                self._stop_out_cooldowns.pop(symbol, None)
+
     def _vol_spike_ratio(
         self,
         state: _PositionState,
@@ -3393,6 +3528,13 @@ class PositionManager:
             ),
             daily_loss_limit_pct=float(
                 getattr(settings, "DAILY_LOSS_LIMIT_PCT", 5.0)
+            ),
+            # ---- Post-stop-out cooldown (Stage 4 / Day-1) ----
+            enable_post_stop_cooldown=bool(
+                getattr(settings, "ENABLE_POST_STOP_COOLDOWN", True)
+            ),
+            post_stop_cooldown_minutes=float(
+                getattr(settings, "POST_STOP_COOLDOWN_MINUTES", 30.0)
             ),
             atr_caps=atr_caps,
             # ---- Smart Path ----

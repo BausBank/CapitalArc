@@ -457,6 +457,56 @@ class AllocationRouter:
 
         # ---- Dispatch on engine directive -------------------------------
         if directive.action == "risk_on":
+            # ---- Post-stop-out cooldown guard (Stage 4) ---------------
+            # After a stop_loss close on this symbol, refuse a fresh
+            # entry for ``POST_STOP_COOLDOWN_MINUTES``. This breaks the
+            # "stop -> instant re-entry -> stop again" chop loop. The
+            # cooldown is owned by the PositionManager (which knows a
+            # stop_loss fired) and merely queried here, so there is a
+            # single source of truth. An in-progress side_flip on this
+            # symbol is exempt (the flip's close+reopen must complete).
+            cooldown_remaining = self._stop_out_cooldown_block(review=review)
+            if cooldown_remaining is not None:
+                logger.info(
+                    "Router: skip risk_on - {} in post-stop-out cooldown "
+                    "({:.0f}m remaining). Refusing re-entry to break the "
+                    "stop->re-entry loop.",
+                    self.config.perp_symbol, cooldown_remaining,
+                )
+                pm_stats = getattr(self.position_manager, "stats", None)
+                if pm_stats is not None and hasattr(
+                    pm_stats, "stop_out_cooldown_blocks"
+                ):
+                    pm_stats.stop_out_cooldown_blocks += 1
+                total = self.position_manager.config.post_stop_cooldown_minutes
+                plan = ExecutionPlan(
+                    decision_id=decision_id,
+                    action="hold",
+                    symbol=self.config.perp_symbol,
+                    size_usd=Decimal("0"),
+                    leverage=Decimal("0"),
+                    rationale=(
+                        f"post_stop_cooldown: {self.config.perp_symbol} was "
+                        f"stopped out recently; {cooldown_remaining:.0f}m of "
+                        f"{total:.0f}m cooldown remaining before re-entry is "
+                        "allowed. Refusing risk_on to break the "
+                        "stop->re-entry chop loop."
+                    ),
+                    extra={
+                        "guard": "post_stop_cooldown",
+                        "symbol": self.config.perp_symbol,
+                        "cooldown_remaining_minutes": round(
+                            cooldown_remaining, 2
+                        ),
+                        "cooldown_total_minutes": total,
+                        "directive_side": directive.side,
+                        "directive_intensity": directive.intensity,
+                        "directive_conviction": directive.conviction,
+                    },
+                )
+                self._attach_position_review(plan, review)
+                return plan
+
             # ---- Anti-overlap guard (HL netting safety) ---------------
             # If we already hold a position on the *same* side that
             # survived this cycle's PositionReview (i.e. it didn't get
@@ -987,6 +1037,58 @@ class AllocationRouter:
             # Surviving same-side position - block the new open.
             return snap
         return None
+
+    def _stop_out_cooldown_block(
+        self,
+        review: PositionReview | None,
+    ) -> float | None:
+        """Return remaining cooldown minutes if a fresh open must be blocked.
+
+        Queries the PositionManager's per-symbol post-stop-out cooldown
+        for :attr:`AllocationConfig.perp_symbol`. Returns the remaining
+        minutes when a fresh risk-on open should be refused, or ``None``
+        when the symbol is free to trade.
+
+        The PositionManager owns the cooldown bookkeeping (it is the
+        component that detects a stop_loss close), so the router never
+        duplicates the timer - it only enforces it. Legacy / test
+        managers without the ``stop_out_cooldown_remaining_minutes``
+        method degrade transparently to "no cooldown".
+
+        An in-progress ``side_flip`` on this symbol is exempt: a flip
+        is a close-then-reopen chain owned by the PositionManager, and
+        blocking its reopen would leave the position half-flipped. In
+        practice an active cooldown and a live position cannot co-exist
+        (the cooldown starts only when a position closes, and the guard
+        would have blocked any subsequent open), but the exemption is
+        kept as a defensive invariant.
+        """
+        pm = self.position_manager
+        remaining_fn = getattr(
+            pm, "stop_out_cooldown_remaining_minutes", None
+        )
+        if remaining_fn is None:
+            return None
+        symbol = self.config.perp_symbol
+        remaining = remaining_fn(symbol)
+        if remaining is None:
+            return None
+        if self._review_has_side_flip(review, symbol):
+            return None
+        return remaining
+
+    @staticmethod
+    def _review_has_side_flip(
+        review: PositionReview | None,
+        symbol: str,
+    ) -> bool:
+        """True when this cycle's review is flipping ``symbol``'s side."""
+        if review is None:
+            return False
+        return any(
+            a.symbol == symbol and a.trigger == "side_flip"
+            for a in review.actions
+        )
 
     def _mk_decision_id(self, decision: DecisionResult) -> str:
         ts = int(decision.timestamp.timestamp())

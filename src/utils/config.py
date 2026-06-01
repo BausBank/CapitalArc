@@ -840,6 +840,29 @@ class Settings(BaseSettings):
     # under a different risk model).
     BLOCK_DUPLICATE_SAME_SIDE_OPENS: bool = True
 
+    # ---------- Post-stop-out cooldown (Stage 4 / Day-1) ----------
+    # After a ``stop_loss`` close, the agent refuses a fresh entry on
+    # the SAME symbol for ``POST_STOP_COOLDOWN_MINUTES``. This closes
+    # the "stop -> instant re-entry -> stop again" chop loop observed
+    # in live testing on 2026-05-26 (20+ stop-outs on a chopping BTC
+    # long). The cooldown is PER-SYMBOL (a long stop-out also blocks
+    # an immediate short re-entry on the same symbol) because the
+    # thing we distrust after a stop is the *symbol's* near-term
+    # regime, not one side of it. Stewardship of OPEN positions stays
+    # with the PositionManager; this gate only suppresses NEW opens.
+    #
+    # The cooldown is owned by the PositionManager (it is the
+    # component that knows a stop_loss close fired) and queried by the
+    # AllocationRouter before every risk-on open - a single source of
+    # truth, no duplicated bookkeeping. An in-progress ``side_flip``
+    # is exempt so a flip's close+reopen chain can still complete.
+    #
+    # Set ENABLE_POST_STOP_COOLDOWN=false or POST_STOP_COOLDOWN_MINUTES
+    # =0 to disable (e.g. for a mean-reversion strategy that *wants*
+    # to re-enter quickly).
+    ENABLE_POST_STOP_COOLDOWN: bool = True
+    POST_STOP_COOLDOWN_MINUTES: float = 30.0
+
     @field_validator("*", mode="before")
     @classmethod
     def _empty_string_to_none(cls, value: Any) -> Any:
