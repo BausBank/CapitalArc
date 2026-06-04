@@ -53,6 +53,9 @@ recovery/
 *.sqlite
 *.db
 
+# --- Backtest data + results (raw market data blobs + strategy metrics) ---
+backtest_data/
+
 # --- Jupyter ---
 .ipynb_checkpoints/
 *.ipynb
@@ -112,3 +115,7 @@ src/execution/usyc_executor.py
 src/utils/logging.py
 # Placeholder package not used on the public surface.
 src/agents/
+# Backtest scenario config = tuned strategy parameter values (KEEP PRIVATE).
+# The framework modules (costs/metrics/walkforward/...) are public; the
+# numbers that make the strategy live only on disk, like prompts/ and .env.
+core/backtest/config.py
